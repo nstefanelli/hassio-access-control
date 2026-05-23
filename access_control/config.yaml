@@ -8,7 +8,6 @@ description: >-
   Aqara/Z-Wave/Zigbee locks via HA, scheduled groups, visitor PINs, and
   resilient WebSocket event paths.
 url: https://github.com/nstefanelli/hassio-access-control
-codenotary: notary@home-assistant.io
 arch:
   - amd64
   - aarch64
