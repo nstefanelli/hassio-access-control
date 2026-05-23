@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+
+{% block title %}Groups — Access Control{% endblock %}
+
+{% block content %}
+<div class="p-4 sm:p-6 space-y-6">
+
+  <h1 class="text-xl font-bold text-gray-100">Groups</h1>
+
+  {% if error %}
+  <div class="card border border-red-900/50 bg-red-950/30 text-red-200 text-sm">
+    {{ error }}
+  </div>
+  {% endif %}
+
+  <!-- Groups list -->
+  {% if groups %}
+  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+    {% for g in groups %}
+    <a href="/groups/{{ g.id }}" class="card hover:bg-gray-800/60 transition-colors block space-y-2">
+      <div class="flex items-start justify-between gap-2">
+        <div>
+          <div class="font-semibold text-gray-100">{{ g.name }}</div>
+          {% if g.description %}
+          <div class="text-sm text-gray-400 mt-0.5">{{ g.description }}</div>
+          {% endif %}
+        </div>
+        <div class="flex flex-wrap gap-1">
+          {% if g.all_locks %}
+          <span class="text-xs bg-blue-900/40 text-blue-300 px-2 py-0.5 rounded-full">All Locks</span>
+          {% endif %}
+          {% if g.can_disarm %}
+          <span class="text-xs bg-green-900/40 text-green-300 px-2 py-0.5 rounded-full">Disarm</span>
+          {% endif %}
+          {% if g.blocked_when_armed_away %}
+          <span class="text-xs bg-red-900/40 text-red-300 px-2 py-0.5 rounded-full">Block Away</span>
+          {% endif %}
+          {% if g.blocked_when_armed_home %}
+          <span class="text-xs bg-yellow-900/40 text-yellow-300 px-2 py-0.5 rounded-full">Block Home</span>
+          {% endif %}
+          {% if g.schedule_enabled %}
+          <span class="text-xs bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded-full">Scheduled</span>
+          {% endif %}
+        </div>
+      </div>
+      <div class="text-xs text-gray-500">{{ g.member_count }} member{{ 's' if g.member_count != 1 else '' }}</div>
+    </a>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="card text-center text-gray-500 text-sm py-8">No groups yet.</div>
+  {% endif %}
+
+  <!-- Create group -->
+  <details class="card">
+    <summary class="text-sm font-semibold text-gray-300 uppercase tracking-wider cursor-pointer hover:text-gray-100">Create Group</summary>
+    <form method="post" action="/groups/create" class="space-y-3 mt-3">
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Name</label>
+          <input name="name" type="text" required class="input w-full" placeholder="e.g. Family" />
+        </div>
+        <div>
+          <label class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Description</label>
+          <input name="description" type="text" class="input w-full" placeholder="Optional" />
+        </div>
+      </div>
+      <div class="space-y-2">
+        <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+          <input type="checkbox" name="all_locks" value="1" class="rounded bg-gray-800 border-gray-700" />
+          Grant access to all locks
+        </label>
+        <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+          <input type="checkbox" name="can_disarm" value="1" checked class="rounded bg-gray-800 border-gray-700" />
+          Can disarm alarm on unlock
+        </label>
+        <div class="text-xs text-gray-500 uppercase tracking-wider mt-2 mb-1">Block access when alarm is:</div>
+        <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+          <input type="checkbox" name="blocked_when_armed_away" value="1" class="rounded bg-gray-800 border-gray-700" />
+          Armed Away
+        </label>
+        <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+          <input type="checkbox" name="blocked_when_armed_home" value="1" class="rounded bg-gray-800 border-gray-700" />
+          Armed Home
+        </label>
+      </div>
+      <button type="submit" class="btn-primary text-sm">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+        </svg>
+        Create Group
+      </button>
+    </form>
+  </details>
+
+</div>
+{% endblock %}

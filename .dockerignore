@@ -1,0 +1,34 @@
+# Source-tree noise that should never end up in the image
+.git
+.github
+.gitignore
+.dockerignore
+.vscode
+.idea
+.claude
+.superpowers
+.worktrees
+.playwright-mcp
+.pytest_cache
+**/__pycache__
+**/*.py[cod]
+**/.DS_Store
+**/@eaDir
+
+# Repo-level docs (kept on GitHub, not in image)
+LICENSE
+README.md
+repository.yaml
+docs/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local databases and env files
+**/data/*.db
+**/data/*.db-shm
+**/data/*.db-wal
+**/.env
+**/.env.*

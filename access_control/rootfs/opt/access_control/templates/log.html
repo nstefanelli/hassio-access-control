@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+
+{% block title %}Activity Log — Access Control{% endblock %}
+
+{% block content %}
+<div class="p-4 sm:p-6 space-y-6">
+
+  <h1 class="text-xl font-bold text-gray-100">Activity Log</h1>
+
+  <div class="card p-0 overflow-hidden">
+    {% if log_entries %}
+    <div class="overflow-x-auto">
+      <table class="min-w-full divide-y divide-gray-800 text-sm">
+        <thead>
+          <tr class="text-xs text-gray-500 uppercase tracking-wider">
+            <th class="px-4 py-3 text-left font-medium">Time</th>
+            <th class="px-4 py-3 text-left font-medium">User</th>
+            <th class="px-4 py-3 text-left font-medium hidden sm:table-cell">Lock</th>
+            <th class="px-4 py-3 text-left font-medium hidden sm:table-cell">Method</th>
+            <th class="px-4 py-3 text-left font-medium">Result</th>
+            <th class="px-4 py-3 text-left font-medium hidden sm:table-cell">Reason</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-800/60">
+          {% for entry in log_entries %}
+          <tr class="hover:bg-gray-800/30 transition-colors">
+            <td class="px-4 py-3 text-gray-400 whitespace-nowrap text-xs">
+              {{ entry.timestamp[:16].replace('T', ' ') if entry.timestamp else '—' }}
+            </td>
+            <td class="px-4 py-3 text-gray-200 whitespace-nowrap">{{ entry.user_name or '—' }}</td>
+            <td class="px-4 py-3 text-gray-400 hidden sm:table-cell whitespace-nowrap">{{ entry.lock_name or '—' }}</td>
+            <td class="px-4 py-3 text-gray-500 hidden sm:table-cell capitalize">{{ entry.method or '—' }}</td>
+            <td class="px-4 py-3 whitespace-nowrap">
+              {% if entry.result == 'granted' %}
+                <span class="badge-granted">Granted</span>
+              {% elif entry.result == 'denied' %}
+                <span class="badge-denied">Denied</span>
+              {% else %}
+                <span class="badge-error">Error</span>
+              {% endif %}
+            </td>
+            <td class="px-4 py-3 text-gray-500 hidden sm:table-cell text-xs max-w-xs truncate">
+              {{ entry.reason or '—' }}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="px-4 py-12 text-center text-gray-500 text-sm">No log entries yet.</div>
+    {% endif %}
+  </div>
+
+</div>
+{% endblock %}

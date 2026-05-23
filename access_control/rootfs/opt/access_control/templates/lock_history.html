@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+
+{% block title %}{{ lock.name }} History — Access Control{% endblock %}
+
+{% block content %}
+<div class="p-4 sm:p-6 space-y-4">
+
+  <div class="flex items-center gap-3">
+    <a href="/locks" class="text-gray-500 hover:text-gray-300">
+      <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+      </svg>
+    </a>
+    <h1 class="text-xl font-bold text-gray-100">{{ lock.name }} — Access History</h1>
+  </div>
+
+  {% if log_entries %}
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="text-xs text-gray-500 uppercase tracking-wider border-b border-gray-800">
+          <th class="py-2 text-left">Time</th>
+          <th class="py-2 text-left">User</th>
+          <th class="py-2 text-left hidden sm:table-cell">Method</th>
+          <th class="py-2 text-left">Result</th>
+          <th class="py-2 text-left hidden sm:table-cell">Reason</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-800/50">
+        {% for entry in log_entries %}
+        <tr class="text-gray-400 hover:bg-gray-800/30 transition-colors">
+          <td class="py-1.5 font-mono text-xs whitespace-nowrap">{{ entry.timestamp[:16].replace('T', ' ') }}</td>
+          <td class="py-1.5">{{ entry.user_name or '—' }}</td>
+          <td class="py-1.5 hidden sm:table-cell capitalize">{{ entry.method or '—' }}</td>
+          <td class="py-1.5">
+            {% if entry.result == 'granted' %}
+            <span class="badge-granted">granted</span>
+            {% elif entry.result == 'denied' %}
+            <span class="badge-denied">denied</span>
+            {% elif entry.result == 'error' %}
+            <span class="badge-error">error</span>
+            {% else %}
+            <span class="text-gray-500">{{ entry.result }}</span>
+            {% endif %}
+          </td>
+          <td class="py-1.5 hidden sm:table-cell text-gray-600 truncate max-w-xs">{{ entry.reason or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-sm text-gray-500">No access events recorded for this lock.</p>
+  {% endif %}
+
+</div>
+{% endblock %}

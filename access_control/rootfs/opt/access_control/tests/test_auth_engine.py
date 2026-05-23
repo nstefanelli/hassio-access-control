@@ -1,0 +1,556 @@
+from __future__ import annotations
+
+import importlib
+import importlib.util
+import json
+import sys
+import unittest
+from base64 import urlsafe_b64decode, urlsafe_b64encode
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _stub_not_installed(name: str) -> bool:
+    """Return True if the module is not yet in sys.modules."""
+    return name not in sys.modules
+
+
+def _install_fastapi_stubs() -> None:
+    if not _stub_not_installed("fastapi"):
+        return
+
+    fastapi = ModuleType("fastapi")
+
+    class HTTPException(Exception):
+        def __init__(self, status_code: int, detail: str = "", headers: dict | None = None) -> None:
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+            self.headers = headers or {}
+
+    class Request:
+        pass
+
+    class APIRouter:
+        def get(self, *args, **kwargs):
+            def decorator(fn):
+                return fn
+            return decorator
+
+        def post(self, *args, **kwargs):
+            def decorator(fn):
+                return fn
+            return decorator
+
+    def Depends(dep):
+        return dep
+
+    def Form(default=None, **kwargs):
+        return default
+
+    fastapi.APIRouter = APIRouter
+    fastapi.Depends = Depends
+    fastapi.Form = Form
+    fastapi.HTTPException = HTTPException
+    fastapi.Request = Request
+
+    responses = ModuleType("fastapi.responses")
+
+    class _BaseResponse:
+        def __init__(self, content: str = "", status_code: int = 200, headers: dict | None = None) -> None:
+            self.content = content
+            self.status_code = status_code
+            self.headers = headers or {}
+
+        def set_cookie(self, key: str, value: str, **kwargs) -> None:
+            self.headers["set-cookie"] = f"{key}={value}"
+
+        def delete_cookie(self, key: str) -> None:
+            self.headers["set-cookie"] = f"{key}=;"
+
+    class HTMLResponse(_BaseResponse):
+        pass
+
+    class RedirectResponse(_BaseResponse):
+        def __init__(self, url: str, status_code: int = 303) -> None:
+            super().__init__("", status_code=status_code, headers={"location": url})
+
+    responses.HTMLResponse = HTMLResponse
+    responses.RedirectResponse = RedirectResponse
+
+    templating = ModuleType("fastapi.templating")
+
+    class Jinja2Templates:
+        def __init__(self, directory: str) -> None:
+            self.directory = directory
+
+        def TemplateResponse(self, template: str, context: dict, status_code: int = 200):
+            return HTMLResponse(template, status_code=status_code)
+
+    templating.Jinja2Templates = Jinja2Templates
+
+    # Set __spec__ so importlib.util.find_spec() returns a truthy value
+    # instead of raising ValueError when another test module runs its own guard.
+    _spec = importlib.util.spec_from_loader("fastapi", loader=None)
+    fastapi.__spec__ = _spec
+    responses.__spec__ = importlib.util.spec_from_loader("fastapi.responses", loader=None)
+    templating.__spec__ = importlib.util.spec_from_loader("fastapi.templating", loader=None)
+
+    sys.modules["fastapi"] = fastapi
+    sys.modules["fastapi.responses"] = responses
+    sys.modules["fastapi.templating"] = templating
+
+
+def _install_itsdangerous_stubs() -> None:
+    if not _stub_not_installed("itsdangerous"):
+        return
+
+    itsdangerous = ModuleType("itsdangerous")
+
+    class BadSignature(Exception):
+        pass
+
+    class URLSafeTimedSerializer:
+        def __init__(self, secret_key: str | None) -> None:
+            self.secret_key = secret_key or ""
+
+        def dumps(self, data: dict) -> str:
+            payload = json.dumps({"s": self.secret_key, "d": data}).encode()
+            return urlsafe_b64encode(payload).decode()
+
+        def loads(self, token: str, max_age: int | None = None) -> dict:
+            try:
+                decoded = json.loads(urlsafe_b64decode(token.encode()).decode())
+            except Exception as exc:
+                raise BadSignature(str(exc)) from exc
+            if decoded.get("s") != self.secret_key:
+                raise BadSignature("signature mismatch")
+            return decoded["d"]
+
+    itsdangerous.BadSignature = BadSignature
+    itsdangerous.URLSafeTimedSerializer = URLSafeTimedSerializer
+    itsdangerous.__spec__ = importlib.util.spec_from_loader("itsdangerous", loader=None)
+    sys.modules["itsdangerous"] = itsdangerous
+
+
+def _install_cryptography_stubs() -> None:
+    if not _stub_not_installed("cryptography"):
+        return
+
+    cryptography = ModuleType("cryptography")
+    fernet_mod = ModuleType("cryptography.fernet")
+    hazmat = ModuleType("cryptography.hazmat")
+    primitives = ModuleType("cryptography.hazmat.primitives")
+    hashes_mod = ModuleType("cryptography.hazmat.primitives.hashes")
+    kdf_mod = ModuleType("cryptography.hazmat.primitives.kdf")
+    pbkdf2_mod = ModuleType("cryptography.hazmat.primitives.kdf.pbkdf2")
+
+    class Fernet:
+        def __init__(self, key: bytes) -> None:
+            self.key = key
+
+        def encrypt(self, value: bytes) -> bytes:
+            return urlsafe_b64encode(value)
+
+        def decrypt(self, value: bytes) -> bytes:
+            return urlsafe_b64decode(value)
+
+    class SHA256:
+        pass
+
+    class PBKDF2HMAC:
+        def __init__(self, algorithm, length: int, salt: bytes, iterations: int) -> None:
+            self.length = length
+
+        def derive(self, data: bytes) -> bytes:
+            return (data * ((self.length // len(data)) + 1))[: self.length]
+
+    fernet_mod.Fernet = Fernet
+    hashes_mod.SHA256 = SHA256
+    pbkdf2_mod.PBKDF2HMAC = PBKDF2HMAC
+
+    cryptography.__spec__ = importlib.util.spec_from_loader("cryptography", loader=None)
+    sys.modules["cryptography"] = cryptography
+    sys.modules["cryptography.fernet"] = fernet_mod
+    sys.modules["cryptography.hazmat"] = hazmat
+    sys.modules["cryptography.hazmat.primitives"] = primitives
+    sys.modules["cryptography.hazmat.primitives.hashes"] = hashes_mod
+    sys.modules["cryptography.hazmat.primitives.kdf"] = kdf_mod
+    sys.modules["cryptography.hazmat.primitives.kdf.pbkdf2"] = pbkdf2_mod
+
+
+def _install_aiohttp_stubs() -> None:
+    if not _stub_not_installed("aiohttp"):
+        return
+
+    aiohttp = ModuleType("aiohttp")
+
+    class ClientError(Exception):
+        pass
+
+    class ClientResponseError(ClientError):
+        def __init__(self, status: int = 500) -> None:
+            self.status = status
+
+    class ClientTimeout:
+        def __init__(self, total: int | None = None) -> None:
+            self.total = total
+
+    class TCPConnector:
+        def __init__(self, ssl=None) -> None:
+            self.ssl = ssl
+
+    class CookieJar:
+        def __init__(self, unsafe: bool = False) -> None:
+            self.unsafe = unsafe
+
+        def clear(self) -> None:
+            return None
+
+    class DummyResponse:
+        status = 200
+        headers: dict[str, str] = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def text(self):
+            return ""
+
+        async def json(self, content_type=None):
+            return {}
+
+        async def release(self):
+            return None
+
+    class ClientSession:
+        def __init__(self, *args, **kwargs) -> None:
+            self.closed = False
+            self.cookie_jar = kwargs.get("cookie_jar") or CookieJar()
+
+        async def request(self, *args, **kwargs):
+            return DummyResponse()
+
+        async def post(self, *args, **kwargs):
+            return DummyResponse()
+
+        async def get(self, *args, **kwargs):
+            return DummyResponse()
+
+        async def ws_connect(self, *args, **kwargs):
+            raise ClientResponseError(status=401)
+
+        async def close(self):
+            self.closed = True
+
+    class WSMsgType:
+        TEXT = "TEXT"
+        BINARY = "BINARY"
+        ERROR = "ERROR"
+        CLOSE = "CLOSE"
+        CLOSING = "CLOSING"
+        CLOSED = "CLOSED"
+
+    aiohttp.ClientError = ClientError
+    aiohttp.ClientResponseError = ClientResponseError
+    aiohttp.ClientResponse = DummyResponse
+    aiohttp.ClientSession = ClientSession
+    aiohttp.ClientTimeout = ClientTimeout
+    aiohttp.CookieJar = CookieJar
+    aiohttp.TCPConnector = TCPConnector
+    aiohttp.WSMsgType = WSMsgType
+    aiohttp.__spec__ = importlib.util.spec_from_loader("aiohttp", loader=None)
+    sys.modules["aiohttp"] = aiohttp
+
+
+def _install_aiosqlite_stubs() -> None:
+    if not _stub_not_installed("aiosqlite"):
+        return
+
+    aiosqlite = ModuleType("aiosqlite")
+
+    class Row(dict):
+        pass
+
+    class Connection:
+        row_factory = None
+
+    async def connect(path):
+        return Connection()
+
+    aiosqlite.Row = Row
+    aiosqlite.Connection = Connection
+    aiosqlite.connect = connect
+    aiosqlite.__spec__ = importlib.util.spec_from_loader("aiosqlite", loader=None)
+    sys.modules["aiosqlite"] = aiosqlite
+
+
+def _load_package() -> None:
+    if "access_control" in sys.modules:
+        return
+    spec = importlib.util.spec_from_file_location(
+        "access_control",
+        ROOT / "__init__.py",
+        submodule_search_locations=[str(ROOT)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["access_control"] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+
+_install_fastapi_stubs()
+_install_itsdangerous_stubs()
+_install_cryptography_stubs()
+_install_aiohttp_stubs()
+_install_aiosqlite_stubs()
+_load_package()
+
+auth_engine_module = importlib.import_module("access_control.auth_engine")
+AuthEngine = auth_engine_module.AuthEngine
+
+
+# ---------------------------------------------------------------------------
+# DB / client factory helpers
+# ---------------------------------------------------------------------------
+
+def make_db(
+    user=None,
+    groups=None,
+    locks=None,
+    rules=None,
+    alarm_panels=None,
+    group_locks=None,
+):
+    """Return a SimpleNamespace that mocks the Database methods used by AuthEngine."""
+    return SimpleNamespace(
+        get_user_by_ulp_id=AsyncMock(return_value=user),
+        get_user_groups=AsyncMock(return_value=groups or []),
+        get_locks_for_location=AsyncMock(return_value=locks or []),
+        get_locks_by_entry_device=AsyncMock(return_value=[]),
+        get_rules_for_user_and_lock=AsyncMock(return_value=rules),
+        get_group_locks=AsyncMock(return_value=group_locks or []),
+        get_all_alarm_panels=AsyncMock(return_value=alarm_panels or []),
+        log_access=AsyncMock(return_value=1),
+    )
+
+
+def make_ha(alarm_state="disarmed"):
+    """Return a mock HA client with controllable alarm state."""
+    ha = MagicMock()
+    ha.unlock = AsyncMock(return_value=True)
+    ha.lock = AsyncMock(return_value=True)
+    ha.fire_event = AsyncMock(return_value=True)
+    ha.get_entity_state = AsyncMock(return_value=alarm_state)
+    ha.alarm_disarm = AsyncMock(return_value=True)
+    return ha
+
+
+def make_active_user(user_id=1, name="Nick"):
+    return {"id": user_id, "name": name, "status": "ACTIVE"}
+
+
+def make_lock(lock_id=10, entity_id="lock.front", name="Front Door"):
+    return {"id": lock_id, "type": "ha_external", "entity_id": entity_id, "name": name}
+
+
+def make_engine(db, ha=None, access_client=None):
+    if ha is None:
+        ha = make_ha()
+    return AuthEngine(db=db, access_client=access_client, ha_client=ha, relock_tasks={})
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+class TestAuthEngineUnknownUser(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_user_denies(self) -> None:
+        db = make_db(user=None)
+        engine = make_engine(db)
+        result = await engine.process_event("ulp-unknown", "door-1", method="nfc")
+        self.assertFalse(result["granted"])
+        # Reason should mention user not found / unknown
+        reason = result["reason"].lower()
+        self.assertTrue("unknown" in reason or "not found" in reason or "ulp-unknown" in reason)
+
+
+class TestAuthEngineDisabledUser(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_user_denies(self) -> None:
+        user = {"id": 1, "name": "Bob", "status": "DISABLED"}
+        db = make_db(user=user)
+        engine = make_engine(db)
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+        self.assertFalse(result["granted"])
+        self.assertIn("not active", result["reason"])
+
+
+class TestAuthEngineLockdown(unittest.IsolatedAsyncioTestCase):
+    async def test_lockdown_denies(self) -> None:
+        user = make_active_user()
+        db = make_db(user=user)
+        engine = make_engine(db)
+        engine.lockdown = True
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+        self.assertFalse(result["granted"])
+        self.assertIn("Lockdown", result["reason"])
+
+
+class TestAuthEngineNoLocks(unittest.IsolatedAsyncioTestCase):
+    async def test_no_locks_for_location_denies(self) -> None:
+        user = make_active_user()
+        db = make_db(user=user, locks=[])
+        engine = make_engine(db)
+        result = await engine.process_event("ulp-1", "door-99", method="nfc")
+        self.assertFalse(result["granted"])
+        self.assertIn("No locks", result["reason"])
+
+
+class TestAuthEngineGroupAllLocks(unittest.IsolatedAsyncioTestCase):
+    async def test_group_all_locks_grants_and_unlocks(self) -> None:
+        """Group with all_locks=True and no schedule should grant access and call HA unlock."""
+        user = make_active_user()
+        group = {
+            "id": 5,
+            "name": "Admins",
+            "all_locks": True,
+            "schedule_enabled": False,
+            "blocked_when_armed_away": False,
+            "blocked_when_armed_home": False,
+            "can_disarm": False,
+        }
+        lock = make_lock()
+        ha = make_ha(alarm_state="disarmed")
+        db = make_db(user=user, groups=[group], locks=[lock])
+        engine = make_engine(db, ha=ha)
+
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+
+        self.assertTrue(result["granted"])
+        ha.unlock.assert_awaited_once_with("lock.front")
+
+
+class TestAuthEngineScheduleInactiveDenies(unittest.IsolatedAsyncioTestCase):
+    async def test_group_schedule_inactive_denies(self) -> None:
+        """Group with schedule_enabled=True and a day that doesn't match today → denied."""
+        user = make_active_user()
+        # Use "mon" as the allowed day so we can mock now() to return a Wednesday
+        group = {
+            "id": 6,
+            "name": "WeekdayGroup",
+            "all_locks": True,
+            "schedule_enabled": True,
+            "schedule_days": "mon",
+            "schedule_start": "00:00",
+            "schedule_end": "23:59",
+            "blocked_when_armed_away": False,
+            "blocked_when_armed_home": False,
+            "can_disarm": False,
+        }
+        lock = make_lock()
+        ha = make_ha(alarm_state="disarmed")
+        db = make_db(user=user, groups=[group], locks=[lock])
+        engine = make_engine(db, ha=ha)
+
+        # Patch datetime.now inside auth_engine to return a Wednesday (weekday=2)
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        wednesday = datetime(2026, 4, 22, 12, 0, 0, tzinfo=ZoneInfo("America/New_York"))  # 2026-04-22 is a Wednesday
+        with patch("access_control.auth_engine.datetime") as mock_dt:
+            mock_dt.now.return_value = wednesday
+            result = await engine.process_event("ulp-1", "door-1", method="nfc")
+
+        self.assertFalse(result["granted"])
+        ha.unlock.assert_not_awaited()
+
+
+class TestAuthEngineBlockedArmedAway(unittest.IsolatedAsyncioTestCase):
+    async def test_blocked_when_armed_away_denies(self) -> None:
+        """Group with blocked_when_armed_away=True and alarm armed_away → denied."""
+        user = make_active_user()
+        group = {
+            "id": 7,
+            "name": "RegularUsers",
+            "all_locks": True,
+            "schedule_enabled": False,
+            "blocked_when_armed_away": True,
+            "blocked_when_armed_home": False,
+            "can_disarm": False,
+        }
+        lock = make_lock()
+        panel = {"entity_id": "alarm_control_panel.main"}
+        ha = make_ha(alarm_state="armed_away")
+        db = make_db(user=user, groups=[group], locks=[lock], alarm_panels=[panel])
+        engine = make_engine(db, ha=ha)
+
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+        self.assertFalse(result["granted"])
+        self.assertIn("armed away", result["reason"])
+
+
+class TestAuthEngineIndividualRuleGrants(unittest.IsolatedAsyncioTestCase):
+    async def test_individual_rule_grants(self) -> None:
+        """User has no groups, but has an enabled individual rule → granted."""
+        user = make_active_user()
+        lock = make_lock()
+        rule = {"enabled": 1, "schedule_enabled": 0}
+        ha = make_ha(alarm_state="disarmed")
+        db = make_db(user=user, groups=[], locks=[lock], rules=rule)
+        engine = make_engine(db, ha=ha)
+
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+        self.assertTrue(result["granted"])
+        ha.unlock.assert_awaited_once_with("lock.front")
+
+
+class TestAuthEngineIndividualRuleDisabledDenies(unittest.IsolatedAsyncioTestCase):
+    async def test_individual_rule_disabled_denies(self) -> None:
+        """User has an individual rule with enabled=0 → denied."""
+        user = make_active_user()
+        lock = make_lock()
+        rule = {"enabled": 0, "schedule_enabled": 0}
+        ha = make_ha(alarm_state="disarmed")
+        db = make_db(user=user, groups=[], locks=[lock], rules=rule)
+        engine = make_engine(db, ha=ha)
+
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+        self.assertFalse(result["granted"])
+        self.assertIn("disabled", result["reason"].lower())
+
+
+class TestAuthEngineCanDisarmTriggersDisarm(unittest.IsolatedAsyncioTestCase):
+    async def test_can_disarm_group_triggers_alarm_disarm_when_armed_home(self) -> None:
+        """
+        User in a group with can_disarm=True and blocked_when_armed_home=False.
+        Alarm is armed_home.  Access should be granted AND alarm_disarm should be called.
+        """
+        user = make_active_user()
+        group = {
+            "id": 8,
+            "name": "Owners",
+            "all_locks": True,
+            "schedule_enabled": False,
+            "blocked_when_armed_away": False,
+            "blocked_when_armed_home": False,
+            "can_disarm": True,
+        }
+        lock = make_lock()
+        panel = {"entity_id": "alarm_control_panel.main", "disarm_code_encrypted": None}
+        ha = make_ha(alarm_state="armed_home")
+        db = make_db(user=user, groups=[group], locks=[lock], alarm_panels=[panel])
+        engine = make_engine(db, ha=ha)
+
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+        self.assertTrue(result["granted"])
+        ha.unlock.assert_awaited_once_with("lock.front")
+        ha.alarm_disarm.assert_awaited_once_with("alarm_control_panel.main", code=None)
+
+
+if __name__ == "__main__":
+    unittest.main()

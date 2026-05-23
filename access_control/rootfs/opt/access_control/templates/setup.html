@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+
+{% block title %}First-Run Setup — Access Control{% endblock %}
+
+{% block content %}
+<div style="min-height:100vh; display:flex; align-items:center; justify-content:center; padding:1.5rem 1rem 3rem; background:var(--bg-deep); position:relative; overflow:hidden;">
+
+  <div style="position:absolute; inset:0; opacity:0.03;
+    background-image: linear-gradient(var(--text-muted) 1px, transparent 1px),
+                       linear-gradient(90deg, var(--text-muted) 1px, transparent 1px);
+    background-size: 48px 48px;"></div>
+
+  <div style="width:100%; max-width:32rem; position:relative; z-index:1;">
+
+    <!-- Header -->
+    <div style="text-align:center; margin-bottom:2rem;">
+      <div style="display:inline-flex; align-items:center; justify-content:center; width:3.5rem; height:3.5rem;
+        border-radius:0.75rem; background:var(--accent); margin-bottom:1.25rem;
+        box-shadow: 0 4px 20px rgba(212,148,42,0.25);">
+        <svg style="width:1.5rem; height:1.5rem;" fill="none" stroke="#fff" stroke-width="2.5" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round"
+            d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+        </svg>
+      </div>
+      <h1 class="heading" style="font-size:1.5rem; font-weight:800; color:var(--text-primary); margin:0;">Initial Setup</h1>
+      <p style="font-size:0.8125rem; color:var(--text-muted); margin-top:0.5rem;">Configure your Access Control instance</p>
+    </div>
+
+    {% if error %}
+    <div style="margin-bottom:1.25rem; padding:0.75rem; border-radius:0.5rem;
+      background:var(--danger-bg); border:1px solid rgba(239,100,97,0.2);
+      color:var(--danger); font-size:0.8125rem;">
+      {{ error }}
+    </div>
+    {% endif %}
+
+    <form method="post" action="/setup" class="space-y-6">
+
+      <!-- Admin Account -->
+      <div class="card">
+        <div class="section-heading" style="margin-bottom:1rem;">Admin Account</div>
+        <div class="space-y-4">
+          <div>
+            <label for="admin_username" class="block text-sm font-medium text-gray-300 mb-1">Username</label>
+            <input id="admin_username" name="admin_username" type="text" required class="input" placeholder="admin" autocomplete="username" />
+          </div>
+          <div>
+            <label for="admin_password" class="block text-sm font-medium text-gray-300 mb-1">Password</label>
+            <input id="admin_password" name="admin_password" type="password" required class="input" placeholder="Choose a strong password" autocomplete="new-password" />
+          </div>
+        </div>
+      </div>
+
+      <!-- UNVR Console -->
+      <div class="card">
+        <div class="section-heading" style="margin-bottom:1rem;">UNVR Console</div>
+        <div class="space-y-4">
+          <div>
+            <label for="unvr_host" class="block text-sm font-medium text-gray-300 mb-1">Host / IP</label>
+            <input id="unvr_host" name="unvr_host" type="text" required class="input" placeholder="192.168.1.10" />
+          </div>
+          <div>
+            <label for="unvr_username" class="block text-sm font-medium text-gray-300 mb-1">Username</label>
+            <input id="unvr_username" name="unvr_username" type="text" required class="input" placeholder="admin" />
+          </div>
+          <div>
+            <label for="unvr_password" class="block text-sm font-medium text-gray-300 mb-1">Password</label>
+            <input id="unvr_password" name="unvr_password" type="password" required class="input" placeholder="••••••••" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Home Assistant -->
+      <div class="card">
+        <div class="section-heading" style="margin-bottom:1rem;">Home Assistant</div>
+        <div class="space-y-4">
+          <div>
+            <label for="ha_url" class="block text-sm font-medium text-gray-300 mb-1">URL</label>
+            <input id="ha_url" name="ha_url" type="url" required class="input" placeholder="http://homeassistant.local:8123" />
+          </div>
+          <div>
+            <label for="ha_token" class="block text-sm font-medium text-gray-300 mb-1">Long-Lived Access Token</label>
+            <input id="ha_token" name="ha_token" type="password" required class="input" placeholder="eyJ..." />
+          </div>
+        </div>
+      </div>
+
+      <button type="submit" class="btn-primary" style="width:100%; justify-content:center; padding:0.625rem; font-size:0.875rem;">
+        Finish Setup
+      </button>
+
+    </form>
+  </div>
+</div>
+{% endblock %}
