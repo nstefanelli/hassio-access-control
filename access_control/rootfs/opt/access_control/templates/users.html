@@ -45,7 +45,7 @@
           {% for u in users %}
           <tr
             class="hover:bg-gray-800/40 transition-colors cursor-pointer {{ 'opacity-40' if u.hidden else '' }}"
-            onclick="window.location.href='/users/{{ u.id }}'"
+            onclick="window.location.href=(window.__INGRESS_PREFIX__ || '') + '/users/{{ u.id }}'"
           >
             <td class="px-4 py-3">
               <span class="font-medium text-gray-100">{{ u.name }}</span>

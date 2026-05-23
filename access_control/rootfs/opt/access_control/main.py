@@ -1046,3 +1046,34 @@ async def csrf_protection(request: Request, call_next):
 from .ingress import ingress_middleware as _ingress_middleware  # noqa: E402
 
 app.middleware("http")(_ingress_middleware)
+
+
+# Runtime guard: detect a future regression where someone adds a new
+# `@app.middleware("http")` *below* this block, which would silently
+# demote the ingress middleware from outermost (runs-first) to inner
+# (runs-later). FastAPI's `add_middleware` (which `@app.middleware`
+# calls under the hood) prepends to `app.user_middleware`, and
+# Starlette's stack builder iterates that list in reverse — so the
+# LAST registered middleware ends up at index 0 and runs OUTERMOST.
+# Verified by inspecting Starlette's `build_middleware_stack`. If this
+# invariant ever breaks, fail loudly at import time rather than letting
+# an auth-bypass slip through to production.
+def _assert_ingress_outermost() -> None:
+    if not app.user_middleware:
+        raise RuntimeError("No user middleware registered; ingress wiring lost")
+    outermost = app.user_middleware[0]
+    dispatch = (
+        getattr(outermost, "kwargs", {}).get("dispatch")
+        or getattr(outermost, "options", {}).get("dispatch")
+    )
+    if dispatch is not _ingress_middleware:
+        raise RuntimeError(
+            "HA Ingress middleware is no longer the outermost wrapper. "
+            "A later `@app.middleware('http')` call has demoted it, which "
+            "would let other middleware run with root_path unset and SSO "
+            "headers untrusted. Move the new middleware ABOVE the ingress "
+            "block in main.py."
+        )
+
+
+_assert_ingress_outermost()

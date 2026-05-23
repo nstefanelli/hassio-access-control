@@ -150,8 +150,14 @@ async def _enforce_action_rate_limit(request: Request, user: str, action: str) -
 
 @router.get("/login", response_class=HTMLResponse)
 async def login_get(request: Request):
-    """Login page — redirect to / if already logged in."""
-    if get_session_user(request):
+    """Login page — redirect to / if already logged in.
+
+    Under HA Ingress + SSO, `request.state.ingress_user` is populated by
+    the ingress middleware before this route runs, so an SSO admin who
+    lands here (e.g. via a stale bookmark) should never see the login
+    form — they're already authenticated.
+    """
+    if get_session_user(request) or getattr(request.state, "ingress_user", None):
         return _redirect(request, "/")
     return templates.TemplateResponse(
         "login.html",
@@ -296,6 +302,12 @@ async def setup_post(
         request.app.state.configured = False
         return _render_error(f"Setup saved, but runtime initialization failed: {exc}")
 
+    # Under SSO, send the admin straight into the dashboard — they're already
+    # authenticated by HA, no need to bounce through the legacy /login form.
+    # Direct-port deployments still need to enter the username/password just
+    # captured by setup.
+    if getattr(request.state, "ingress_user", None):
+        return _redirect(request, "/")
     return _redirect(request, "/login")
 
 

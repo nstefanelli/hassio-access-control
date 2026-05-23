@@ -31,12 +31,18 @@
   </div>
   <script>
   (function() {
-    let attempts = 0;
+    // Use the ingress prefix exposed by base.html so this works under both
+    // direct-port and HA Ingress access modes. fetch() *should* resolve
+    // relative URLs against <base href>, but being explicit avoids any
+    // browser quirks and is clearer at review time.
+    var prefix = window.__INGRESS_PREFIX__ || '';
+    var url = prefix + '/settings';
+    var attempts = 0;
     function tryReload() {
       attempts++;
-      fetch('/settings', {method: 'HEAD'}).then(r => {
-        if (r.ok) window.location.replace('/settings');
-      }).catch(() => {
+      fetch(url, {method: 'HEAD'}).then(function(r) {
+        if (r.ok) window.location.replace(url);
+      }).catch(function() {
         if (attempts < 30) setTimeout(tryReload, 2000);
       });
     }
