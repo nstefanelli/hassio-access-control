@@ -955,22 +955,23 @@ app.include_router(web_router)
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    """Add security headers to all responses."""
+    """Add security headers to all responses.
+
+    Header values depend on whether the request came through HA Ingress
+    (so the addon is iframed by HA at same-origin) vs. direct port (so
+    the addon must refuse all framing). See `security_headers_for()` in
+    ingress.py for the rationale; we just apply its output here.
+
+    The ingress middleware sets `request.state.ingress_active` before
+    this runs (LIFO order — ingress is outermost, security_headers is
+    inner). Reading that flag here is safe.
+    """
     response = await call_next(request)
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "same-origin"
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    response.headers["X-XSS-Protection"] = "0"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://unpkg.com; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.tailwindcss.com; "
-        "font-src https://fonts.gstatic.com; "
-        "connect-src 'self'; "
-        "img-src 'self' data:; "
-        "frame-ancestors 'none'"
-    )
+    from .ingress import security_headers_for
+
+    ingress_active = bool(getattr(request.state, "ingress_active", False))
+    for name, value in security_headers_for(ingress_active=ingress_active).items():
+        response.headers[name] = value
     return response
 
 

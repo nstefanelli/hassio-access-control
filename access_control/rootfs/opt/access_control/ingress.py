@@ -65,6 +65,47 @@ def _initial_state(request: Request) -> None:
     request.state.ingress_user = None
 
 
+def security_headers_for(*, ingress_active: bool) -> dict[str, str]:
+    """
+    Return the static security-header dict for a given access mode.
+
+    Frame-blocking flips with the access mode:
+
+    - **Direct port** — `X-Frame-Options: DENY` + CSP `frame-ancestors 'none'`.
+      The addon is a standalone web app and must never be iframed.
+    - **HA Ingress** — `X-Frame-Options: SAMEORIGIN` + CSP `frame-ancestors 'self'`.
+      The HA frontend *intentionally* renders the addon inside an iframe at
+      the same browser origin (Supervisor proxies the addon under the HA
+      host). `DENY` would refuse to render and the panel would be blank.
+
+    Other headers (HSTS, Referrer-Policy, X-Content-Type-Options,
+    script/style/font CSP) are identical across modes.
+    """
+    if ingress_active:
+        xframe = "SAMEORIGIN"
+        frame_ancestors = "frame-ancestors 'self'"
+    else:
+        xframe = "DENY"
+        frame_ancestors = "frame-ancestors 'none'"
+    csp = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://unpkg.com; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.tailwindcss.com; "
+        "font-src https://fonts.gstatic.com; "
+        "connect-src 'self'; "
+        "img-src 'self' data:; "
+        f"{frame_ancestors}"
+    )
+    return {
+        "X-Frame-Options": xframe,
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "same-origin",
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+        "X-XSS-Protection": "0",
+        "Content-Security-Policy": csp,
+    }
+
+
 async def ingress_middleware(request: Request, call_next):
     """
     See module docstring for behavior.

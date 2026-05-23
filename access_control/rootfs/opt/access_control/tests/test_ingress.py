@@ -179,6 +179,36 @@ class TestIngressMiddleware(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(req.state.ingress_user)
 
 
+class TestSecurityHeaders(unittest.TestCase):
+    """The frame-blocking headers must flip based on ingress_active.
+
+    Direct mode: X-Frame-Options: DENY + frame-ancestors 'none' (addon
+    must never be iframed). Ingress mode: SAMEORIGIN + frame-ancestors
+    'self' so HA can render the addon inside its own iframe.
+    """
+
+    def setUp(self):
+        from access_control.ingress import security_headers_for
+        self._fn = security_headers_for
+
+    def test_direct_mode_blocks_framing(self):
+        h = self._fn(ingress_active=False)
+        self.assertEqual(h["X-Frame-Options"], "DENY")
+        self.assertIn("frame-ancestors 'none'", h["Content-Security-Policy"])
+
+    def test_ingress_mode_allows_same_origin_framing(self):
+        h = self._fn(ingress_active=True)
+        self.assertEqual(h["X-Frame-Options"], "SAMEORIGIN")
+        self.assertIn("frame-ancestors 'self'", h["Content-Security-Policy"])
+
+    def test_common_headers_are_set_in_both_modes(self):
+        for mode in (False, True):
+            h = self._fn(ingress_active=mode)
+            self.assertEqual(h["X-Content-Type-Options"], "nosniff")
+            self.assertIn("max-age=31536000", h["Strict-Transport-Security"])
+            self.assertIn("'unsafe-inline'", h["Content-Security-Policy"])
+
+
 class TestCookiePath(unittest.TestCase):
     """The cookie Path scope must follow root_path so session cookies don't
     leak across addons sharing the HA host."""
