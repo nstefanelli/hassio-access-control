@@ -14,6 +14,11 @@ WORKDIR /opt
 # (cryptography, aiohttp, pydantic-core). Keep build deps available only
 # if a wheel is missing; pip will fall through to source build.
 COPY rootfs/opt/access_control/requirements.txt /tmp/requirements.txt
+# Build-deps are installed in a virtual package and purged in the same layer
+# so they never reach the final image. hadolint DL3018 (pin versions) is
+# muted because these are ephemeral and tracked by the base-image's Alpine
+# version pin (build.yaml).
+# hadolint ignore=DL3018
 RUN apk add --no-cache --virtual .build-deps \
         gcc musl-dev libffi-dev openssl-dev \
     && pip3 install --no-cache-dir -r /tmp/requirements.txt \

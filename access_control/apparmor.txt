@@ -6,8 +6,6 @@ profile access_control flags=(attach_disconnected,mediate_deleted) {
   # Capabilities
   network,
   capability net_bind_service,
-  capability setuid,
-  capability setgid,
 
   # Filesystem access
   / r,

@@ -115,7 +115,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build add-on
+      - name: Build add-on (PR test)
+        if: github.event_name == 'pull_request'
+        uses: home-assistant/builder@2024.08.2
+        with:
+          args: |
+            --${{ matrix.arch }} \
+            --target /data/${{ matrix.addon }} \
+            --image "ghcr.io/${{ github.repository_owner }}/hassio-${{ steps.meta.outputs.slug }}-{arch}" \
+            --version "${{ steps.meta.outputs.version }}" \
+            --addon \
+            --test
+
+      - name: Build & publish add-on
+        if: github.event_name != 'pull_request'
         uses: home-assistant/builder@2024.08.2
         with:
           args: |
@@ -123,5 +136,6 @@ jobs:
             --target /data/${{ matrix.addon }} \
             --image "ghcr.io/${{ github.repository_owner }}/hassio-${{ steps.meta.outputs.slug }}-{arch}" \
             --docker-hub-check \
+            --docker-hub ghcr.io \
             --version "${{ steps.meta.outputs.version }}" \
-            ${{ github.event_name != 'pull_request' && '--docker-hub ghcr.io --addon' || '--addon --test' }}
+            --addon
