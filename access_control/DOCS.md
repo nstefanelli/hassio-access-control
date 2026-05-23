@@ -1,19 +1,19 @@
 # Access Control — Documentation
 
-Shown to the user in the add-on's **Documentation** tab inside Supervisor.
+Shown to the user in the app's **Documentation** tab inside Supervisor.
 
 ## First-time setup
 
-After starting the add-on, click **Access Control** in the HA sidebar (you
-must be an HA admin) or **Open Web UI** on the add-on page.
+After starting the app, click **Access Control** in the HA sidebar (you
+must be an HA admin) or **Open Web UI** on the app page.
 
 The setup wizard guides you through:
 
-1. **UniFi Console host** + a local service account with **Super Admin** on
-   both Access and Protect. See "Connecting to UniFi Access" below.
+1. **UniFi Console host** + a local service account with **Super Admin**
+   on both Access and Protect. See "Connecting to UniFi Access" below.
 2. **(Optional)** Home Assistant URL + long-lived token. By default the
-   add-on uses the Supervisor proxy (`use_supervisor_api: true`) and you
-   can leave these blank. Only fill them in if you want the add-on to
+   app uses the Supervisor proxy (`use_supervisor_api: true`) and you
+   can leave these blank. Only fill them in if you want the app to
    talk to a different HA instance.
 3. **(Optional)** Split console: Access and Protect running on different
    UniFi consoles.
@@ -23,23 +23,23 @@ doors / readers.
 
 ## Connecting to UniFi Access
 
-The add-on uses a UniFi local service account that has access to **both**
+The app uses a UniFi local service account that has access to **both**
 the Access and Protect applications on your console.
 
 1. In the UniFi Console, open **Settings → Admins & Users → Add Admin**.
 2. Create a local-only user (e.g. `homeassistant`). Grant **Super Admin**
    on both Access and Protect. Owner is not required for normal
    operation.
-3. Enter those credentials in the add-on's Settings page.
+3. Enter those credentials in the app's Settings page.
 
 > **Note:** Some user-management actions (delete / disable users) require
-> the **Owner** rank that only one admin per console has. The add-on works
+> the **Owner** rank that only one admin per console has. The app works
 > around this with app-level "disable" (removes group memberships +
 > disables rules + sets status=`disabled`).
 
 ## Authentication
 
-The add-on integrates with HA's authentication via **HA Ingress** and
+The app integrates with HA's authentication via **HA Ingress** and
 `auth_api: true`. When you click the sidebar entry:
 
 - You're already authenticated by HA — no second password.
@@ -55,20 +55,20 @@ If you'd like family members to access the dashboard, give them the
 Each lock has three independent re-lock toggles (Locks page):
 
 - **Buzz button** — manual UI button; always does timed unlock+relock.
-- **Remote relock** — auto-relock after an unlock via the UniFi mobile app
-  (`remote_through_uah` event).
+- **Remote relock** — auto-relock after an unlock via the UniFi mobile
+  app (`remote_through_uah` event).
 - **Device-auth relock** — auto-relock after a successful face / PIN /
   NFC / fingerprint authentication.
 
 All three share a single configurable timer. Pending re-locks are
-persisted to SQLite and re-armed on add-on restart — a re-lock scheduled
+persisted to SQLite and re-armed on app restart — a re-lock scheduled
 just before a restart still fires.
 
 ## Visitors / guests
 
-The **Visitors** page creates time-windowed visitors via the UniFi Visitor
-API. UniFi enforces the start/end times natively; the add-on writes the
-PIN (encrypted) so admins can look it up later.
+The **Visitors** page creates time-windowed visitors via the UniFi
+Visitor API. UniFi enforces the start/end times natively; the app writes
+the PIN (encrypted) so admins can look it up later.
 
 Names get " - Visitor" appended in UniFi so they're easy to identify in
 the UniFi UI.
@@ -122,22 +122,22 @@ non-admin user. Give your HA user the **Administrator** role and
 re-load.
 
 **Bookmarks to `http://<ha-host>:8080` stopped working after upgrade.**
-The direct port was removed in v1.1.0. Use the HA sidebar or the add-on
+The direct port was removed in v1.1.0. Use the HA sidebar or the app
 page's "Open Web UI" button instead.
 
 **WebSocket keeps disconnecting.** Usually a UniFi session expiry after a
-UNVR restart. The add-on handles that — its WS clients log a single
+UNVR restart. The app handles that — its WS clients log a single
 "session expired" and reconnect. If you see continuous 401s, double-check
 the service-account credentials.
 
 **HA connection fails on startup.** Check that
-`http://supervisor/core/api/` is reachable from inside the container. The
-add-on logs the exact failure message and surfaces it on the home page
+`http://supervisor/core/api/` is reachable from inside the container.
+The app logs the exact failure message and surfaces it on the home page
 status badge.
 
 ## Logs
 
-- **Add-on logs (uvicorn + app):** Supervisor add-on log tab.
+- **App logs (uvicorn + app):** Supervisor app log tab.
 - **Access events:** in-app **Activity** page; retained 90 days.
 - **Admin actions:** in-app **Settings** page (audit log). Sessions
   authenticated via HA SSO show up as `ha:<HA-display-name>` so you can
