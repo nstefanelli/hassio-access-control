@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# App data (SQLite + WAL)
+**/data/*.db
+**/data/*.db-shm
+**/data/*.db-wal
+data/access_control.db*
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+@eaDir/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+*.egg-info/
+build/
+dist/
+
+# Claude / dev tooling
+.claude/
+.superpowers/
+.worktrees/
+.playwright-mcp/
