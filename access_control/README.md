@@ -48,9 +48,12 @@ plus any HA `lock.*` and `alarm_control_panel.*` entities.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `port` | `8080` | Container port for the web UI (also the watchdog probe port) |
 | `log_level` | `info` | One of `trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal` |
 | `use_supervisor_api` | `true` | Auto-configure HA URL + token from `SUPERVISOR_TOKEN`. Set to `false` if you want to point the add-on at a different HA instance. |
+
+The web UI binds to port `8080` inside the container. If you need a
+different host port, remap it in the **Network** section of the add-on
+page — the watchdog and "Open Web UI" button track the remap automatically.
 
 UNVR credentials and all other settings are entered through the in-app
 Settings page (encrypted in the SQLite DB on `/data`). They are intentionally
