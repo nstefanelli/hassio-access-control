@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+
+{% block title %}Sign In — Access Control{% endblock %}
+
+{% block content %}
+<div style="min-height:100vh; display:flex; align-items:center; justify-content:center; padding:1.5rem; background:var(--bg-deep); position:relative; overflow:hidden;">
+
+  <!-- Subtle background grid pattern -->
+  <div style="position:absolute; inset:0; opacity:0.03;
+    background-image: linear-gradient(var(--text-muted) 1px, transparent 1px),
+                       linear-gradient(90deg, var(--text-muted) 1px, transparent 1px);
+    background-size: 48px 48px;"></div>
+
+  <!-- Ambient glow -->
+  <div style="position:absolute; top:-20%; left:50%; transform:translateX(-50%); width:500px; height:500px;
+    background:radial-gradient(circle, rgba(212,148,42,0.06) 0%, transparent 70%); pointer-events:none;"></div>
+
+  <div style="width:100%; max-width:22rem; position:relative; z-index:1;">
+
+    <!-- Header -->
+    <div style="text-align:center; margin-bottom:2.5rem;">
+      <div style="display:inline-flex; align-items:center; justify-content:center; width:3.5rem; height:3.5rem;
+        border-radius:0.75rem; background:var(--accent); margin-bottom:1.25rem;
+        box-shadow: 0 4px 20px rgba(212,148,42,0.25);">
+        <svg style="width:1.5rem; height:1.5rem;" fill="none" stroke="#fff" stroke-width="2.5" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round"
+            d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+        </svg>
+      </div>
+      <h1 class="heading" style="font-size:1.625rem; font-weight:800; color:var(--text-primary); margin:0;">Access Control</h1>
+      <p style="font-size:0.8125rem; color:var(--text-muted); margin-top:0.5rem;">Sign in to your account</p>
+    </div>
+
+    <!-- Card -->
+    <div class="card" style="padding:1.5rem;">
+      {% if error %}
+      <div style="margin-bottom:1rem; padding:0.75rem; border-radius:0.5rem;
+        background:var(--danger-bg); border:1px solid rgba(239,100,97,0.2);
+        color:var(--danger); font-size:0.8125rem;">
+        {{ error }}
+      </div>
+      {% endif %}
+
+      <form method="post" action="/login" style="display:flex; flex-direction:column; gap:1.125rem;">
+        <div>
+          <label for="username" style="display:block; font-size:0.75rem; font-weight:600; color:var(--text-secondary); margin-bottom:0.375rem; letter-spacing:0.02em;">Username</label>
+          <input id="username" name="username" type="text" required autocomplete="username" class="input" placeholder="admin" />
+        </div>
+        <div>
+          <label for="password" style="display:block; font-size:0.75rem; font-weight:600; color:var(--text-secondary); margin-bottom:0.375rem; letter-spacing:0.02em;">Password</label>
+          <input id="password" name="password" type="password" required autocomplete="current-password" class="input" />
+        </div>
+        <button type="submit" class="btn-primary" style="width:100%; justify-content:center; padding:0.625rem; font-size:0.875rem; margin-top:0.25rem;">
+          Sign in
+        </button>
+      </form>
+    </div>
+
+  </div>
+</div>
+{% endblock %}

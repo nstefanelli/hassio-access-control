@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+
+{% block title %}{{ group.name }} — Groups — Access Control{% endblock %}
+
+{% block content %}
+<div class="p-4 sm:p-6 space-y-6">
+
+  {% if error %}
+  <div class="card border border-red-900/50 bg-red-950/30 text-red-200 text-sm">
+    {{ error }}
+  </div>
+  {% endif %}
+
+  <!-- Header -->
+  <div class="flex items-center gap-3">
+    <a href="/groups" class="text-gray-500 hover:text-gray-300">
+      <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+      </svg>
+    </a>
+    <h1 class="text-xl font-bold text-gray-100">{{ group.name }}</h1>
+    {% if group.all_locks %}
+    <span class="text-xs bg-blue-900/40 text-blue-300 px-2 py-0.5 rounded-full">All Locks</span>
+    {% endif %}
+  </div>
+
+  <!-- Group settings -->
+  <div class="card space-y-3">
+    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Settings</h2>
+    <form method="post" action="/groups/{{ group.id }}/update" class="space-y-3">
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Name</label>
+          <input name="name" type="text" required value="{{ group.name }}" class="input w-full" />
+        </div>
+        <div>
+          <label class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Description</label>
+          <input name="description" type="text" value="{{ group.description or '' }}" class="input w-full" />
+        </div>
+      </div>
+      <div class="space-y-2">
+        <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+          <input type="checkbox" name="all_locks" value="1" {{ 'checked' if group.all_locks else '' }}
+                 class="rounded bg-gray-800 border-gray-700" />
+          Grant access to all locks
+        </label>
+        <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+          <input type="checkbox" name="can_disarm" value="1" {{ 'checked' if group.can_disarm else '' }}
+                 class="rounded bg-gray-800 border-gray-700" />
+          Can disarm alarm on unlock
+        </label>
+        <div class="text-xs text-gray-500 uppercase tracking-wider mt-2 mb-1">Block access when alarm is:</div>
+        <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+          <input type="checkbox" name="blocked_when_armed_away" value="1" {{ 'checked' if group.blocked_when_armed_away else '' }}
+                 class="rounded bg-gray-800 border-gray-700" />
+          Armed Away
+        </label>
+        <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+          <input type="checkbox" name="blocked_when_armed_home" value="1" {{ 'checked' if group.blocked_when_armed_home else '' }}
+                 class="rounded bg-gray-800 border-gray-700" />
+          Armed Home
+        </label>
+      </div>
+
+      <!-- Schedule -->
+      <div class="border-t border-gray-800 pt-3 space-y-3">
+        <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+          <input type="checkbox" name="schedule_enabled" value="1" {{ 'checked' if group.schedule_enabled else '' }}
+                 class="rounded bg-gray-800 border-gray-700" />
+          Enable schedule (group only active during these times)
+        </label>
+        <div>
+          <div class="text-xs text-gray-500 uppercase tracking-wider mb-2">Days</div>
+          <div class="flex flex-wrap gap-2">
+            {% set day_list = [('mon','Mon'),('tue','Tue'),('wed','Wed'),('thu','Thu'),('fri','Fri'),('sat','Sat'),('sun','Sun')] %}
+            {% set schedule_days = group.schedule_days.split(',') if group.schedule_days else [] %}
+            {% for day_key, day_label in day_list %}
+            <label class="flex items-center gap-1.5 cursor-pointer">
+              <input type="checkbox" name="{{ day_key }}" value="{{ day_key }}"
+                     {% if day_key in schedule_days %}checked{% endif %}
+                     class="w-4 h-4 rounded bg-gray-800 border-gray-600 text-blue-500" />
+              <span class="text-sm text-gray-300">{{ day_label }}</span>
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Start time</label>
+            <input type="time" name="schedule_start" value="{{ group.schedule_start or '' }}" class="input" />
+          </div>
+          <div>
+            <label class="block text-xs text-gray-500 uppercase tracking-wider mb-1">End time</label>
+            <input type="time" name="schedule_end" value="{{ group.schedule_end or '' }}" class="input" />
+          </div>
+        </div>
+      </div>
+
+      <button type="submit" class="btn-primary text-sm">Save</button>
+    </form>
+    <form method="post" action="/groups/{{ group.id }}/delete"
+          data-name="{{ group.name|e }}" onsubmit="return confirm('Delete group ' + this.dataset.name + '?')" class="inline mt-3">
+      <button type="submit" class="btn-danger text-sm">Delete Group</button>
+    </form>
+  </div>
+
+  <!-- Specific locks (only if not all_locks) -->
+  {% if not group.all_locks %}
+  <div class="card space-y-3">
+    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Locks</h2>
+    <form method="post" action="/groups/{{ group.id }}/locks" class="space-y-3">
+      {% if all_locks %}
+      <div class="space-y-2">
+        {% for lock in all_locks %}
+        <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+          <input type="checkbox" name="lock_ids" value="{{ lock.id }}"
+                 {{ 'checked' if lock.id in group_lock_ids else '' }}
+                 class="rounded bg-gray-800 border-gray-700" />
+          {{ lock.name }}
+          {% if lock.door_name %}<span class="text-gray-500">— {{ lock.door_name }}</span>{% endif %}
+        </label>
+        {% endfor %}
+      </div>
+      <button type="submit" class="btn-primary text-sm">Save Locks</button>
+      {% else %}
+      <p class="text-sm text-gray-500">No locks configured yet.</p>
+      {% endif %}
+    </form>
+  </div>
+  {% endif %}
+
+  <!-- Members -->
+  <div class="card space-y-3">
+    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">
+      Members ({{ members|length }})
+    </h2>
+
+    {% if members %}
+    <div class="divide-y divide-gray-800 -mx-4 px-4">
+      {% for m in members %}
+      <div class="flex items-center justify-between py-2.5 gap-4">
+        <div>
+          <span class="text-sm text-gray-200">{{ m.name }}</span>
+          {% if m.email %}
+          <span class="text-xs text-gray-500 ml-2">{{ m.email }}</span>
+          {% endif %}
+        </div>
+        <form method="post" action="/groups/{{ group.id }}/remove-member/{{ m.id }}">
+          <button type="submit" class="text-xs text-gray-600 hover:text-red-400" title="Remove">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+            </svg>
+          </button>
+        </form>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <!-- Add member -->
+    {% if available_users %}
+    <div class="border-t border-gray-800 pt-3">
+      <form method="post" action="/groups/{{ group.id }}/add-member" class="flex gap-2">
+        <select name="user_id" required class="input flex-1">
+          <option value="">— Add a member —</option>
+          {% for u in available_users %}
+          <option value="{{ u.id }}">{{ u.name }}{% if u.email %} ({{ u.email }}){% endif %}</option>
+          {% endfor %}
+        </select>
+        <button type="submit" class="btn-primary text-sm whitespace-nowrap">Add</button>
+      </form>
+    </div>
+    {% elif not members %}
+    <p class="text-sm text-gray-500">No users available. Sync users from UNVR first.</p>
+    {% endif %}
+  </div>
+
+</div>
+{% endblock %}

@@ -1,0 +1,361 @@
+{% extends "base.html" %}
+
+{% block title %}Settings — Access Control{% endblock %}
+
+{% block content %}
+<div class="p-4 sm:p-6 space-y-6">
+
+  <h1 class="text-xl font-bold text-gray-100">Settings</h1>
+
+  <!-- Result message -->
+  {% if save_result %}
+  <div class="p-3 rounded-lg text-sm {{ 'bg-green-900/40 border border-green-700 text-green-300' if save_result.success else 'bg-red-900/40 border border-red-700 text-red-300' }}">
+    {{ save_result.message }}
+  </div>
+  {% endif %}
+
+  {% if created_api_key %}
+  <div class="card space-y-2 border border-blue-900/50 bg-blue-950/20">
+    <div class="text-sm text-blue-200 font-medium">New API key</div>
+    <div id="created-api-key" class="text-xs font-mono bg-gray-900 rounded px-2 py-1.5 text-gray-300 break-all select-all">{{ created_api_key }}</div>
+    <div class="flex gap-2">
+      <button type="button" class="text-xs text-gray-400 hover:text-gray-200" onclick="navigator.clipboard.writeText(document.getElementById('created-api-key').textContent)">Copy</button>
+      <span class="text-xs text-gray-500">This value is only shown once.</span>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if restarting %}
+  <div id="restart-banner" class="p-3 rounded-lg text-sm bg-yellow-900/40 border border-yellow-700 text-yellow-300">
+    Restarting service&hellip; This page will reload automatically.
+  </div>
+  <script>
+  (function() {
+    let attempts = 0;
+    function tryReload() {
+      attempts++;
+      fetch('/settings', {method: 'HEAD'}).then(r => {
+        if (r.ok) window.location.replace('/settings');
+      }).catch(() => {
+        if (attempts < 30) setTimeout(tryReload, 2000);
+      });
+    }
+    setTimeout(tryReload, 3000);
+  })();
+  </script>
+  {% endif %}
+
+  <!-- UniFi Console (primary — used for Protect and Access by default) -->
+  <div class="card space-y-3">
+    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">UniFi Console</h2>
+    <p class="text-xs text-gray-600">Primary console for Protect and Access. If Access runs on a separate console, configure it below.</p>
+    <form method="post" action="/settings/unvr" class="space-y-3">
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div>
+          <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">Host</label>
+          <input name="unvr_host" type="text" value="{{ unvr_host }}" required
+                 class="input w-full" placeholder="192.168.1.1" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">Username</label>
+          <input name="unvr_username" type="text" value="{{ unvr_username }}" required
+                 class="input w-full" placeholder="admin" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">Password</label>
+          <input name="unvr_password" type="password" required
+                 class="input w-full" placeholder="Enter password" />
+        </div>
+      </div>
+      <button type="submit" class="btn-primary text-sm">Test &amp; Save Console</button>
+    </form>
+  </div>
+
+  <!-- Separate Access Console (optional — falls back to primary console if empty) -->
+  <details class="card" {% if access_host %}open{% endif %}>
+    <summary class="text-sm font-semibold text-gray-300 uppercase tracking-wider cursor-pointer hover:text-gray-100">
+      Access on Separate Console
+      {% if access_host %}
+      <span class="text-xs font-normal text-gray-500 ml-2">{{ access_host }}</span>
+      {% else %}
+      <span class="text-xs font-normal text-gray-600 ml-2">Same as primary</span>
+      {% endif %}
+    </summary>
+    <div class="mt-3 space-y-3">
+      <p class="text-xs text-gray-600">Only configure if UniFi Access runs on a different console than Protect (e.g., Access on UNVR, Protect on UDM).</p>
+      <form method="post" action="/settings/access-console" class="space-y-3">
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div>
+            <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">Host</label>
+            <input name="access_host" type="text" value="{{ access_host }}"
+                   class="input w-full" placeholder="192.168.1.1 (or leave empty)" />
+          </div>
+          <div>
+            <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">Username</label>
+            <input name="access_username" type="text" value="{{ access_username }}"
+                   class="input w-full" placeholder="Same as primary if empty" />
+          </div>
+          <div>
+            <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">Password</label>
+            <input name="access_password" type="password"
+                   class="input w-full" placeholder="Same as primary if empty" />
+          </div>
+        </div>
+        <div class="flex gap-2">
+          <button type="submit" class="btn-primary text-sm">Test &amp; Save Access Console</button>
+          {% if access_host %}
+          <button type="submit" name="clear" value="1" class="btn-secondary text-sm">Clear (Use Primary Console)</button>
+          {% endif %}
+        </div>
+      </form>
+    </div>
+  </details>
+
+  <!-- HA Connection -->
+  <div class="card space-y-3">
+    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Home Assistant</h2>
+    <form method="post" action="/settings/ha" class="space-y-3">
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div>
+          <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">URL</label>
+          <input name="ha_url" type="text" value="{{ ha_url }}" required
+                 class="input w-full" placeholder="http://homeassistant.local:8123" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">Long-Lived Token</label>
+          <input name="ha_token" type="password" required
+                 class="input w-full" placeholder="Enter token" />
+        </div>
+      </div>
+      <button type="submit" class="btn-primary text-sm">Test &amp; Save HA</button>
+    </form>
+  </div>
+
+  <!-- API Keys -->
+  <div class="card space-y-4">
+    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">API Keys</h2>
+
+    <!-- Key list -->
+    {% if api_keys %}
+    <div class="divide-y divide-gray-800 -mx-4 px-4">
+      {% for key in api_keys %}
+      <div class="py-3 space-y-2">
+        <div class="flex items-center justify-between gap-4">
+          <div class="min-w-0">
+            <div class="flex items-center gap-2">
+              <span class="font-medium text-gray-200 truncate">{{ key.name }}</span>
+              <span class="text-xs px-1.5 py-0.5 rounded bg-gray-800 text-gray-400">{{ key.scope or 'full' }}</span>
+            </div>
+            <div class="text-xs text-gray-600 mt-0.5">
+              Created {{ key.created_at[:10] if key.created_at else '—' }}
+            </div>
+          </div>
+          <form method="post" action="/settings/api-keys/{{ key.id }}/delete"
+            data-name="{{ key.name|e }}" onsubmit="return confirm('Revoke API key ' + this.dataset.name + '?')">
+            <button type="submit" class="btn-danger text-xs shrink-0">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"/>
+              </svg>
+              Revoke
+            </button>
+          </form>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="text-sm text-gray-500">No API keys configured.</p>
+    {% endif %}
+
+    <!-- Create new key -->
+    <div class="border-t border-gray-800 pt-4">
+      <h3 class="text-xs text-gray-500 uppercase tracking-wider mb-3">Create New Key</h3>
+      <form method="post" action="/settings/api-keys/create" class="flex gap-3 flex-wrap">
+        <input
+          name="name"
+          type="text"
+          required
+          class="input flex-1 min-w-40"
+          placeholder="Key name (e.g. homeassistant)"
+        />
+        <select name="scope" class="input min-w-32">
+          <option value="full">Full Access</option>
+          <option value="read_only">Read Only</option>
+          <option value="locks_only">Locks Only</option>
+        </select>
+        <button type="submit" class="btn-primary whitespace-nowrap">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/>
+          </svg>
+          Generate Key
+        </button>
+      </form>
+    </div>
+
+  </div>
+
+  <!-- Service Control -->
+  <div class="card space-y-4">
+    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Service Control</h2>
+    <div class="flex items-center justify-between">
+      <div>
+        <p class="text-sm text-gray-400">Restart the Access Control service. The page will reload automatically.</p>
+      </div>
+      <form method="post" action="/settings/restart" onsubmit="return confirm('Restart the Access Control service?')">
+        <button type="submit" class="btn-danger text-sm whitespace-nowrap">
+          <svg class="w-4 h-4 inline -mt-0.5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+          </svg>
+          Restart Service
+        </button>
+      </form>
+    </div>
+
+    <!-- Scheduled reboot -->
+    <form method="post" action="/settings/reboot-schedule"
+          class="border-t border-gray-800 pt-4 space-y-3">
+      <div class="flex items-start justify-between gap-4 flex-wrap">
+        <div class="min-w-0">
+          <div class="text-sm font-medium text-gray-200">Scheduled restart</div>
+          <p class="text-xs text-gray-500 mt-1">
+            Automatically restart the service on a schedule. Skipped if there's
+            been a door event in the last 5 minutes.
+          </p>
+        </div>
+        <label class="inline-flex items-center gap-2 text-sm text-gray-300 shrink-0">
+          <input type="checkbox" name="reboot_enabled" value="1"
+                 {% if reboot_enabled %}checked{% endif %}
+                 class="rounded bg-gray-800 border-gray-700">
+          Enable
+        </label>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3 sm:max-w-md">
+        <label class="text-xs text-gray-400 space-y-1">
+          <span>Day</span>
+          <select name="reboot_day" class="input w-full text-sm">
+            <option value="daily"  {% if reboot_day == 'daily' %}selected{% endif %}>Daily</option>
+            <option value="0" {% if reboot_day == '0' %}selected{% endif %}>Monday</option>
+            <option value="1" {% if reboot_day == '1' %}selected{% endif %}>Tuesday</option>
+            <option value="2" {% if reboot_day == '2' %}selected{% endif %}>Wednesday</option>
+            <option value="3" {% if reboot_day == '3' %}selected{% endif %}>Thursday</option>
+            <option value="4" {% if reboot_day == '4' %}selected{% endif %}>Friday</option>
+            <option value="5" {% if reboot_day == '5' %}selected{% endif %}>Saturday</option>
+            <option value="6" {% if reboot_day == '6' %}selected{% endif %}>Sunday</option>
+          </select>
+        </label>
+        <label class="text-xs text-gray-400 space-y-1">
+          <span>Hour (local)</span>
+          <select name="reboot_hour" class="input w-full text-sm">
+            {% for h in range(24) %}
+            <option value="{{ h }}" {% if reboot_hour == h %}selected{% endif %}>
+              {{ '%02d:00' % h }}
+            </option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+
+      <div class="flex justify-end">
+        <button type="submit" class="btn-primary text-sm">Save schedule</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Alarm Panels -->
+  <div class="card space-y-4">
+    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Alarm Panels</h2>
+
+    {% if alarm_panels %}
+    <div class="divide-y divide-gray-800 -mx-4 px-4">
+      {% for panel in alarm_panels %}
+      <div class="flex items-center justify-between py-3 gap-4">
+        <div class="min-w-0 flex-1">
+          <div class="font-medium text-gray-200 truncate">{{ panel.name }}</div>
+          <div class="text-xs text-gray-600 font-mono mt-0.5">{{ panel.entity_id }}</div>
+        </div>
+        <form method="post" action="/settings/alarm/{{ panel.id }}/code" class="flex items-center gap-2 shrink-0">
+          <input name="disarm_code" type="password" inputmode="numeric" pattern="[0-9]*"
+            class="input w-24 text-sm text-center" placeholder="{{ '••••' if panel.disarm_code_encrypted else 'PIN' }}"
+            title="Numeric disarm PIN" />
+          <button type="submit" class="btn-secondary text-xs">Save PIN</button>
+        </form>
+        <form method="post" action="/settings/alarm/{{ panel.id }}/delete"
+          data-name="{{ panel.name|e }}" onsubmit="return confirm('Remove alarm panel ' + this.dataset.name + '?')">
+          <button type="submit" class="btn-danger text-xs shrink-0">Remove</button>
+        </form>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="text-sm text-gray-500">No alarm panels configured.</p>
+    {% endif %}
+
+    {% if ha_alarms %}
+    <div class="border-t border-gray-800 pt-4">
+      <h3 class="text-xs text-gray-500 uppercase tracking-wider mb-3">Add Alarm Panel</h3>
+      <form method="post" action="/settings/alarm/add" class="flex gap-3 flex-wrap">
+        <select name="entity_id" required class="input flex-1 min-w-40" onchange="this.form.querySelector('[name=name]').value = this.options[this.selectedIndex].dataset.name || ''">
+          <option value="">— Select panel —</option>
+          {% for a in ha_alarms %}
+          <option value="{{ a.entity_id }}" data-name="{{ a.friendly_name }}">{{ a.friendly_name }} ({{ a.state }})</option>
+          {% endfor %}
+        </select>
+        <input name="name" type="text" required class="input flex-1 min-w-40" placeholder="Display name" />
+        <button type="submit" class="btn-primary whitespace-nowrap text-sm">Add Panel</button>
+      </form>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- Admin Audit Log -->
+  <div class="card space-y-3">
+    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Admin Audit Log</h2>
+    {% if admin_log %}
+    <div class="overflow-x-auto -mx-4 px-4">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="text-xs text-gray-500 uppercase tracking-wider border-b border-gray-800">
+            <th class="py-2 text-left">Time</th>
+            <th class="py-2 text-left">User</th>
+            <th class="py-2 text-left">Action</th>
+            <th class="py-2 text-left hidden sm:table-cell">Target</th>
+            <th class="py-2 text-left hidden sm:table-cell">Detail</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-800/50">
+          {% for entry in admin_log %}
+          <tr class="text-gray-400">
+            <td class="py-1.5 font-mono text-xs">{{ entry.timestamp[:16].replace('T', ' ') }}</td>
+            <td class="py-1.5">{{ entry.username }}</td>
+            <td class="py-1.5">{{ entry.action }}</td>
+            <td class="py-1.5 hidden sm:table-cell text-gray-600 truncate max-w-xs">{{ entry.target or '—' }}</td>
+            <td class="py-1.5 hidden sm:table-cell text-gray-600 truncate max-w-xs">{{ entry.detail or '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="text-sm text-gray-500">No admin actions logged yet.</p>
+    {% endif %}
+  </div>
+
+</div>
+
+<script>
+function toggleKey(btn, displayId) {
+  const el = document.getElementById(displayId);
+  if (btn.textContent.trim() === 'Show') {
+    el.textContent = el.dataset.fullKey;
+    btn.textContent = 'Hide';
+  } else {
+    el.textContent = el.dataset.maskedKey;
+    btn.textContent = 'Show';
+  }
+}
+</script>
+{% endblock %}

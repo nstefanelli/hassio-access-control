@@ -1,0 +1,37 @@
+#include <tunables/global>
+
+profile access_control flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # Capabilities
+  network,
+  capability net_bind_service,
+  capability setuid,
+  capability setgid,
+
+  # Filesystem access
+  / r,
+  /bin/** rix,
+  /sbin/** rix,
+  /usr/bin/** rix,
+  /usr/sbin/** rix,
+  /usr/lib/** mrix,
+  /usr/local/** mrix,
+  /etc/** r,
+  /opt/** r,
+  /tmp/** rwk,
+  /run/** rwk,
+  /proc/** r,
+  /sys/** r,
+  /dev/null rw,
+  /dev/random r,
+  /dev/urandom r,
+
+  # Add-on data + write-able paths
+  /data/** rwk,
+  /data/ rwk,
+
+  # Python venv / site-packages execution
+  /usr/lib/python*/site-packages/** mr,
+  /usr/lib/python*/** mr,
+}

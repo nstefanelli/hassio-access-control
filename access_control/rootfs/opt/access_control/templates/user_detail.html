@@ -1,0 +1,203 @@
+{% extends "base.html" %}
+
+{% block title %}{{ target_user.name }} — Access Control{% endblock %}
+
+{% block content %}
+<div class="p-4 sm:p-6 space-y-6">
+
+  <!-- Back link + header -->
+  <div>
+    <a href="/users" class="inline-flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-300 transition-colors mb-4">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+      </svg>
+      All Users
+    </a>
+    <h1 class="text-xl font-bold text-gray-100">{{ target_user.name }}</h1>
+    {% if target_user.email %}
+    <p class="text-sm text-gray-500 mt-0.5">{{ target_user.email }}</p>
+    {% endif %}
+  </div>
+
+  <!-- PIN Code -->
+  <div class="card space-y-2">
+    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">PIN Code</h2>
+    {% if has_stored_pin %}
+    <p class="text-sm text-gray-400">
+      A PIN is stored locally for this user.
+    </p>
+    {% else %}
+    <p class="text-sm text-gray-500">No PIN stored locally</p>
+    {% endif %}
+    <form method="post" action="/users/{{ target_user.id }}/set-pin" class="flex gap-2 items-center">
+      <input name="pin_code" type="text" pattern="[0-9]{4,8}" maxlength="8" class="input w-32" placeholder="e.g. 123456" />
+      <button type="submit" class="btn-primary text-xs">Set PIN</button>
+    </form>
+  </div>
+
+  <!-- Add Lock Access -->
+  {% if available_locks %}
+  <div class="card">
+    <h2 class="text-sm font-semibold text-gray-300 mb-3">Add Lock Access</h2>
+    <form method="post" action="/users/{{ target_user.id }}/rules" class="flex gap-3 flex-wrap">
+      <select name="lock_id" required class="input flex-1 min-w-40">
+        <option value="" disabled selected>Select a lock…</option>
+        {% for lock in available_locks %}
+        <option value="{{ lock.id }}">{{ lock.name }}{% if lock.door_name %} ({{ lock.door_name }}){% endif %}</option>
+        {% endfor %}
+      </select>
+      <button type="submit" class="btn-primary whitespace-nowrap">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+        </svg>
+        Add
+      </button>
+    </form>
+  </div>
+  {% endif %}
+
+  <!-- Rules list -->
+  <div>
+    <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">Access Rules</h2>
+
+    {% if rules %}
+    <div class="space-y-3">
+      {% for rule in rules %}
+      <div class="card space-y-3">
+
+        <!-- Rule header: lock name, toggle, delete -->
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <div class="font-medium text-gray-100">{{ rule.lock_name }}</div>
+            <div class="text-xs text-gray-500 mt-0.5">
+              {% if rule.schedule_enabled %}
+                Schedule active
+              {% else %}
+                Always
+              {% endif %}
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <!-- Enable/Disable toggle -->
+            <form method="post" action="/rules/{{ rule.id }}/toggle">
+              <button
+                type="submit"
+                title="{% if rule.enabled %}Disable{% else %}Enable{% endif %}"
+                class="btn-secondary text-xs px-2 py-1 {% if rule.enabled %}text-green-400{% else %}text-gray-500{% endif %}"
+              >
+                {% if rule.enabled %}
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                  </svg>
+                  Enabled
+                {% else %}
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                  </svg>
+                  Disabled
+                {% endif %}
+              </button>
+            </form>
+
+            <!-- Delete -->
+            <form method="post" action="/rules/{{ rule.id }}/delete"
+              data-lock-name="{{ rule.lock_name|e }}" onsubmit="return confirm('Delete access to ' + this.dataset.lockName + '?')">
+              <button type="submit" class="btn-danger text-xs px-2 py-1">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                    d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                </svg>
+              </button>
+            </form>
+
+            <!-- Expand schedule toggle -->
+            <button
+              type="button"
+              class="btn-secondary text-xs px-2 py-1"
+              onclick="this.closest('.card').querySelector('.schedule-editor').classList.toggle('hidden')"
+              title="Edit schedule"
+            >
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Schedule editor (hidden by default) -->
+        <div class="schedule-editor hidden border-t border-gray-800 pt-3">
+          <form method="post" action="/rules/{{ rule.id }}/schedule" class="space-y-4">
+
+            <!-- Schedule enabled toggle -->
+            <div class="flex items-center gap-3">
+              <label class="text-sm text-gray-300 font-medium">Enable schedule</label>
+              <input
+                type="checkbox"
+                name="schedule_enabled"
+                value="on"
+                {% if rule.schedule_enabled %}checked{% endif %}
+                class="w-4 h-4 rounded bg-gray-800 border-gray-600 text-blue-500 focus:ring-blue-500"
+              />
+            </div>
+
+            <!-- Day checkboxes -->
+            <div>
+              <div class="text-xs text-gray-500 mb-2 uppercase tracking-wider">Days</div>
+              <div class="flex flex-wrap gap-2">
+                {% set day_list = [('mon','Mon'),('tue','Tue'),('wed','Wed'),('thu','Thu'),('fri','Fri'),('sat','Sat'),('sun','Sun')] %}
+                {% set schedule_days = rule.schedule_days.split(',') if rule.schedule_days else [] %}
+                {% for day_key, day_label in day_list %}
+                <label class="flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    name="{{ day_key }}"
+                    value="{{ day_key }}"
+                    {% if day_key in schedule_days %}checked{% endif %}
+                    class="w-4 h-4 rounded bg-gray-800 border-gray-600 text-blue-500"
+                  />
+                  <span class="text-sm text-gray-300">{{ day_label }}</span>
+                </label>
+                {% endfor %}
+              </div>
+            </div>
+
+            <!-- Time range -->
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Start time</label>
+                <input
+                  type="time"
+                  name="schedule_start"
+                  value="{{ rule.schedule_start or '' }}"
+                  class="input"
+                />
+              </div>
+              <div>
+                <label class="block text-xs text-gray-500 uppercase tracking-wider mb-1">End time</label>
+                <input
+                  type="time"
+                  name="schedule_end"
+                  value="{{ rule.schedule_end or '' }}"
+                  class="input"
+                />
+              </div>
+            </div>
+
+            <button type="submit" class="btn-primary text-xs">Save Schedule</button>
+          </form>
+        </div>
+
+      </div>
+      {% endfor %}
+    </div>
+
+    {% else %}
+    <div class="card text-center text-gray-500 text-sm py-8">
+      No access rules yet. Add a lock above.
+    </div>
+    {% endif %}
+  </div>
+
+</div>
+{% endblock %}

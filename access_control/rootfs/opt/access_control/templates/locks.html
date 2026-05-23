@@ -1,0 +1,327 @@
+{% extends "base.html" %}
+
+{% block title %}Locks — Access Control{% endblock %}
+
+{% block content %}
+<div class="p-4 sm:p-6 space-y-6">
+
+  <div class="flex items-center justify-between">
+    <h1 class="text-xl font-bold text-gray-100">Locks</h1>
+    <form method="post" action="/sync-users">
+      <input type="hidden" name="redirect" value="/locks">
+      <button type="submit" class="text-xs px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 transition-colors">Re-sync from UniFi</button>
+    </form>
+  </div>
+
+  <!-- Locks grid -->
+  {% set visible_locks = locks | rejectattr('hidden') | list %}
+  {% set hidden_locks = locks | selectattr('hidden') | list %}
+  {% if visible_locks %}
+  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+    {% for lock in visible_locks %}
+    <div class="card space-y-3">
+
+      <!-- Lock info + state -->
+      <div class="flex items-start justify-between gap-2">
+        <div class="min-w-0">
+          <div class="font-semibold text-gray-100 truncate">{{ lock.name }}</div>
+          {% if lock.door_name %}
+          <div class="text-sm text-gray-400 mt-0.5 truncate">{{ lock.door_name }}</div>
+          {% endif %}
+          <div class="text-xs text-gray-600 mt-0.5 uppercase tracking-wide">{{ lock.type.replace('_', ' ') }}</div>
+          {% if lock.entity_id %}
+          <div class="text-xs text-gray-600 mt-0.5 font-mono truncate" title="{{ lock.entity_id }}">{{ lock.entity_id }}</div>
+          {% endif %}
+        </div>
+        <div class="shrink-0">
+          {% if lock.state == 'locked' %}
+          <span class="inline-flex items-center gap-1 text-xs font-medium text-green-400">
+            <span class="w-2 h-2 rounded-full bg-green-400"></span> Locked
+          </span>
+          {% elif lock.state == 'unlocked' %}
+          <span class="inline-flex items-center gap-1 text-xs font-medium text-yellow-400">
+            <span class="w-2 h-2 rounded-full bg-yellow-400"></span> Unlocked
+          </span>
+          {% elif lock.state == 'jammed' %}
+          <span class="inline-flex items-center gap-1 text-xs font-medium text-red-400">
+            <span class="w-2 h-2 rounded-full bg-red-400"></span> Jammed
+          </span>
+          {% else %}
+          <span class="inline-flex items-center gap-1 text-xs font-medium text-gray-600">
+            <span class="w-2 h-2 rounded-full bg-gray-600"></span> {{ lock.state|capitalize }}
+          </span>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- Actions -->
+      <div class="flex items-center gap-2 pt-1 border-t border-gray-800 flex-wrap">
+        <!-- Lock -->
+        <form method="post" action="/locks/{{ lock.id }}/lock" class="flex-1 min-w-[4rem]">
+          <button type="submit" class="btn-secondary w-full justify-center text-xs">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+            </svg>
+            Lock
+          </button>
+        </form>
+
+        <!-- Unlock -->
+        <form method="post" action="/locks/{{ lock.id }}/unlock" class="flex-1 min-w-[4rem]">
+          <button type="submit" class="btn-secondary w-full justify-center text-xs">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z"/>
+            </svg>
+            Unlock
+          </button>
+        </form>
+
+        <!-- Buzz (if enabled) -->
+        {% if lock.buzz_enabled %}
+        <form method="post" action="/locks/{{ lock.id }}/buzz" class="flex-1 min-w-[4rem]">
+          <button type="submit" class="btn-primary w-full justify-center text-xs" title="Unlock for {{ lock.relock_duration }}s then re-lock">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/>
+            </svg>
+            Buzz {{ lock.relock_duration }}s
+          </button>
+        </form>
+        {% endif %}
+
+        <!-- History -->
+        <a href="/locks/{{ lock.id }}/history" class="btn-secondary text-xs flex items-center gap-1">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+          </svg>
+          History
+        </a>
+
+        <!-- Hide -->
+        <form method="post" action="/locks/{{ lock.id }}/hide">
+          <button type="submit" class="btn-secondary text-xs px-2.5 py-1.5" title="Hide from list">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.878 9.878L6.11 6.11m3.768 3.768l4.242 4.242m0 0l3.768 3.768M6.11 6.11L3 3m3.11 3.11l4.242 4.242"/>
+            </svg>
+          </button>
+        </form>
+
+        <!-- Delete (HA external only) -->
+        {% if lock.type == 'ha_external' %}
+        <form method="post" action="/locks/{{ lock.id }}/delete"
+          data-lock-name="{{ lock.name|e }}" onsubmit="return confirm('Delete lock ' + this.dataset.lockName + '? This will remove all associated rules.')">
+          <button type="submit" class="btn-danger text-xs px-2.5 py-1.5" title="Delete">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+            </svg>
+          </button>
+        </form>
+        {% endif %}
+      </div>
+
+      <!-- Settings toggle -->
+      <details class="border-t border-gray-800 pt-2 -mb-1">
+        <summary class="text-xs text-gray-600 cursor-pointer hover:text-gray-400">Settings</summary>
+        <form method="post" action="/locks/{{ lock.id }}/settings" class="mt-2 space-y-2">
+          <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+            <input type="checkbox" name="buzz_enabled" value="1" {{ 'checked' if lock.buzz_enabled else '' }}
+                   class="rounded bg-gray-800 border-gray-700" />
+            Enable buzz button (timed unlock)
+          </label>
+          <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+            <input type="checkbox" name="relock_on_remote" value="1" {{ 'checked' if lock.relock_on_remote else '' }}
+                   class="rounded bg-gray-800 border-gray-700" />
+            Auto re-lock on remote unlock
+          </label>
+          <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+            <input type="checkbox" name="relock_on_device_auth" value="1" {{ 'checked' if lock.relock_on_device_auth else '' }}
+                   class="rounded bg-gray-800 border-gray-700" />
+            Auto re-lock on device auth (face/PIN/NFC)
+          </label>
+          <div class="flex items-center gap-2">
+            <label class="text-xs text-gray-500">Relock duration:</label>
+            <input name="relock_duration" type="number" min="1" max="300" value="{{ lock.relock_duration }}"
+                   class="input w-20 text-xs" /> <span class="text-xs text-gray-600">sec</span>
+          </div>
+          <button type="submit" class="btn-secondary text-xs">Save</button>
+        </form>
+
+        <!-- Entry Devices -->
+        <div class="mt-3 pt-2 border-t border-gray-800/50">
+          <div class="text-xs text-gray-500 uppercase tracking-wider mb-2">Entry Devices</div>
+          {% if lock.entry_devices %}
+          <div class="space-y-1 mb-2">
+            {% for ed in lock.entry_devices %}
+            <div class="flex items-center justify-between text-xs">
+              <span class="text-gray-400">
+                <span class="text-gray-600">{{ ed.type }}:</span> {{ ed.name }}
+              </span>
+              <form method="post" action="/locks/{{ lock.id }}/entry-devices/{{ ed.id }}/delete" class="inline">
+                <button type="submit" class="text-gray-600 hover:text-red-400">&times;</button>
+              </form>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+          <details>
+            <summary class="text-xs text-gray-600 cursor-pointer hover:text-gray-400">Add device</summary>
+            <form method="post" action="/locks/{{ lock.id }}/entry-devices/add" class="mt-2 space-y-2" id="ed-form-{{ lock.id }}">
+              <select name="device_type" class="input w-full text-xs" onchange="toggleDeviceFields(this, {{ lock.id }})">
+                <option value="access_reader">Access NFC Reader</option>
+                <option value="protect_doorbell">Protect Doorbell</option>
+                <option value="protect_camera">Protect Camera</option>
+              </select>
+              <div class="ed-access-{{ lock.id }}">
+                <select name="device_id" class="input w-full text-xs" onchange="autoFillDeviceName(this, {{ lock.id }})">
+                  <option value="">— Select Access location —</option>
+                  {% for loc in access_locations %}
+                  <option value="{{ loc.id }}" data-name="{{ loc.name }}">{{ loc.name }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="ed-protect-{{ lock.id }} hidden">
+                <select disabled class="input w-full text-xs ed-protect-select" onchange="autoFillDeviceName(this, {{ lock.id }})">
+                  <option value="">— Select doorbell/camera —</option>
+                  {% for db in protect_doorbells %}
+                  <option value="{{ db.id }}" data-name="{{ db.name }}">{{ db.name }} (Doorbell)</option>
+                  {% endfor %}
+                  {% for cam in protect_cameras %}
+                  <option value="{{ cam.id }}" data-name="{{ cam.name }}">{{ cam.name }} (Camera)</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <input name="device_name" type="text" required class="input w-full text-xs" placeholder="Display name" id="ed-name-{{ lock.id }}" />
+              <button type="submit" class="btn-secondary text-xs">Add</button>
+            </form>
+          </details>
+        </div>
+      </details>
+
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="card text-center text-gray-500 text-sm py-8">
+    No locks configured. Add an external lock below or sync from UNVR.
+  </div>
+  {% endif %}
+
+  <!-- Hidden locks -->
+  {% if hidden_locks %}
+  <details class="card">
+    <summary class="text-sm font-semibold text-gray-500 cursor-pointer hover:text-gray-300">
+      Hidden Locks ({{ hidden_locks | length }})
+    </summary>
+    <div class="mt-3 divide-y divide-gray-800">
+      {% for lock in hidden_locks %}
+      <div class="py-2 flex items-center justify-between gap-4">
+        <div class="min-w-0">
+          <span class="text-gray-400">{{ lock.name }}</span>
+          <span class="text-xs text-gray-600 ml-2 uppercase">{{ lock.type.replace('_', ' ') }}</span>
+        </div>
+        <form method="post" action="/locks/{{ lock.id }}/unhide">
+          <button type="submit" class="btn-secondary text-xs">Unhide</button>
+        </form>
+      </div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+
+  <!-- Add HA Lock -->
+  <details class="card">
+    <summary class="text-sm font-semibold text-gray-300 uppercase tracking-wider cursor-pointer hover:text-gray-100">Add Lock from Home Assistant</summary>
+    <div class="space-y-4 mt-3">
+
+    {% if ha_locks %}
+    <form method="post" action="/locks/add" class="space-y-4">
+      <div>
+        <label for="entity_id" class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Select Lock Entity</label>
+        <select id="entity_id" name="entity_id" required class="input w-full"
+                onchange="autoFillName(this)">
+          <option value="">— Choose a lock —</option>
+          {% for hl in ha_locks %}
+          <option value="{{ hl.entity_id }}" data-name="{{ hl.friendly_name }}">
+            {{ hl.friendly_name }} ({{ hl.state }}) — {{ hl.entity_id }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="name" class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Display Name</label>
+        <input id="name" name="name" type="text" required class="input w-full" placeholder="Auto-filled from selection" />
+      </div>
+      <div>
+        <label for="door_name" class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Door Name <span class="text-gray-600">(optional)</span></label>
+        <input id="door_name" name="door_name" type="text" class="input w-full" placeholder="e.g. Front Door" />
+      </div>
+      <div class="flex items-center gap-4">
+        <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+          <input type="checkbox" name="buzz_enabled" value="1" checked class="rounded bg-gray-800 border-gray-700" />
+          Enable buzz
+        </label>
+        <div class="flex items-center gap-2">
+          <label class="text-xs text-gray-500">Relock duration:</label>
+          <input name="relock_duration" type="number" min="1" max="300" value="30" class="input w-20 text-xs" />
+          <span class="text-xs text-gray-600">sec</span>
+        </div>
+      </div>
+      <button type="submit" class="btn-primary text-sm">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+        </svg>
+        Add Lock
+      </button>
+    </form>
+
+    <script>
+    function autoFillName(sel) {
+      const opt = sel.options[sel.selectedIndex];
+      const nameInput = document.getElementById('name');
+      if (opt && opt.dataset.name) {
+        nameInput.value = opt.dataset.name;
+      }
+    }
+    </script>
+    {% elif ha_locks is defined %}
+    <p class="text-sm text-gray-500">No additional lock entities found in Home Assistant, or HA is not connected.</p>
+    {% endif %}
+
+    <!-- Manual entry fallback -->
+    <details class="border-t border-gray-800 pt-3">
+      <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-400">Add manually by entity ID</summary>
+      <form method="post" action="/locks/add" class="space-y-3 mt-3">
+        <input name="entity_id" type="text" required class="input w-full" placeholder="lock.front_door" />
+        <input name="name" type="text" required class="input w-full" placeholder="Display Name" />
+        <input name="door_name" type="text" class="input w-full" placeholder="Door Name (optional)" />
+        <button type="submit" class="btn-secondary text-sm">Add Lock</button>
+      </form>
+    </details>
+    </div>
+  </details>
+
+</div>
+
+<script>
+function toggleDeviceFields(sel, lockId) {
+  const isAccess = sel.value === 'access_reader';
+  const accessDiv = document.querySelector('.ed-access-' + lockId);
+  const protectDiv = document.querySelector('.ed-protect-' + lockId);
+  accessDiv.classList.toggle('hidden', !isAccess);
+  protectDiv.classList.toggle('hidden', isAccess);
+  // Reset and enable/disable the right select — both use name="device_id"
+  // so we need to disable the hidden one to avoid sending two values
+  accessDiv.querySelectorAll('select').forEach(s => { s.disabled = !isAccess; if(!isAccess) s.value=''; s.name = isAccess ? 'device_id' : ''; });
+  protectDiv.querySelectorAll('select').forEach(s => { s.disabled = isAccess; if(isAccess) s.value=''; s.name = !isAccess ? 'device_id' : ''; });
+}
+function autoFillDeviceName(sel, lockId) {
+  var opt = sel.options[sel.selectedIndex];
+  var nameInput = document.getElementById('ed-name-' + lockId);
+  if (opt && opt.dataset.name) nameInput.value = opt.dataset.name;
+}
+</script>
+{% endblock %}

@@ -1,0 +1,79 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  yamllint:
+    name: YAMLlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: yamllint
+        uses: frenck/action-yamllint@v1.5.0
+
+  hadolint:
+    name: Hadolint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        addon:
+          - access_control
+    steps:
+      - uses: actions/checkout@v4
+      - name: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ matrix.addon }}/Dockerfile
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@2.0.0
+        env:
+          SHELLCHECK_OPTS: "-e SC1008 -s bash"
+        with:
+          ignore_paths: >-
+            **/tests
+            **/templates
+            **/static
+
+  pytest:
+    name: pytest (${{ matrix.addon }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        addon:
+          - access_control
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: ${{ matrix.addon }}/rootfs/opt/access_control/requirements.txt
+      - name: Install dependencies
+        working-directory: ${{ matrix.addon }}/rootfs/opt/access_control
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run tests
+        working-directory: ${{ matrix.addon }}/rootfs/opt
+        run: pytest access_control/tests -q

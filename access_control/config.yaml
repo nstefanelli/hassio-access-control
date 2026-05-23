@@ -1,0 +1,37 @@
+---
+name: Access Control
+version: "1.0.0"
+slug: access_control
+description: >-
+  Unified access control bridging UniFi Access + Protect with Home Assistant
+  for lock, alarm, and door management. Supports G6 Entry Pro readers,
+  Aqara/Z-Wave/Zigbee locks via HA, scheduled groups, visitor PINs, and
+  resilient WebSocket event paths.
+url: https://github.com/nstefanelli/hassio-access-control
+codenotary: notary@home-assistant.io
+arch:
+  - amd64
+  - aarch64
+init: false
+startup: services
+boot: auto
+hassio_role: default
+hassio_api: false
+homeassistant_api: true
+host_network: false
+ports:
+  "8080/tcp": 8080
+ports_description:
+  "8080/tcp": Web UI
+webui: "http://[HOST]:[PORT:8080]"
+watchdog: "http://[HOST]:[PORT:8080]/health/live"
+options:
+  port: 8080
+  log_level: info
+  use_supervisor_api: true
+schema:
+  port: port
+  log_level: list(trace|debug|info|notice|warning|error|fatal)
+  use_supervisor_api: bool
+apparmor: true
+image: ghcr.io/nstefanelli/hassio-access-control-{arch}

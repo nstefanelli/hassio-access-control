@@ -1,0 +1,9 @@
+---
+build_from:
+  amd64: ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.21
+  aarch64: ghcr.io/home-assistant/aarch64-base-python:3.12-alpine3.21
+labels:
+  org.opencontainers.image.title: "Home Assistant Add-on: Access Control"
+  org.opencontainers.image.description: "UniFi Access + Protect + HA lock/alarm bridge"
+  org.opencontainers.image.source: "https://github.com/nstefanelli/hassio-access-control"
+  org.opencontainers.image.licenses: "MIT"
