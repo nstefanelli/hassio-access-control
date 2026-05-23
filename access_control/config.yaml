@@ -26,11 +26,9 @@ ports_description:
 webui: "http://[HOST]:[PORT:8080]"
 watchdog: "http://[HOST]:[PORT:8080]/health/live"
 options:
-  port: 8080
   log_level: info
   use_supervisor_api: true
 schema:
-  port: port
   log_level: list(trace|debug|info|notice|warning|error|fatal)
   use_supervisor_api: bool
 apparmor: true

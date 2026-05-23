@@ -3,8 +3,11 @@
 profile access_control flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
 
-  # Capabilities
-  network,
+  # Capabilities — IPv4/IPv6 TCP only (no raw sockets, no Bluetooth, etc.)
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
   capability net_bind_service,
 
   # Filesystem access
@@ -14,7 +17,6 @@ profile access_control flags=(attach_disconnected,mediate_deleted) {
   /usr/bin/** rix,
   /usr/sbin/** rix,
   /usr/lib/** mrix,
-  /usr/local/** mrix,
   /etc/** r,
   /opt/** r,
   /tmp/** rwk,
