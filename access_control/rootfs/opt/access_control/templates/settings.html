@@ -49,7 +49,7 @@
   <div class="card space-y-3">
     <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">UniFi Console</h2>
     <p class="text-xs text-gray-600">Primary console for Protect and Access. If Access runs on a separate console, configure it below.</p>
-    <form method="post" action="/settings/unvr" class="space-y-3">
+    <form method="post" action="settings/unvr" class="space-y-3">
       <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div>
           <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">Host</label>
@@ -83,7 +83,7 @@
     </summary>
     <div class="mt-3 space-y-3">
       <p class="text-xs text-gray-600">Only configure if UniFi Access runs on a different console than Protect (e.g., Access on UNVR, Protect on UDM).</p>
-      <form method="post" action="/settings/access-console" class="space-y-3">
+      <form method="post" action="settings/access-console" class="space-y-3">
         <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <div>
             <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">Host</label>
@@ -114,7 +114,7 @@
   <!-- HA Connection -->
   <div class="card space-y-3">
     <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Home Assistant</h2>
-    <form method="post" action="/settings/ha" class="space-y-3">
+    <form method="post" action="settings/ha" class="space-y-3">
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
           <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">URL</label>
@@ -150,7 +150,7 @@
               Created {{ key.created_at[:10] if key.created_at else '—' }}
             </div>
           </div>
-          <form method="post" action="/settings/api-keys/{{ key.id }}/delete"
+          <form method="post" action="settings/api-keys/{{ key.id }}/delete"
             data-name="{{ key.name|e }}" onsubmit="return confirm('Revoke API key ' + this.dataset.name + '?')">
             <button type="submit" class="btn-danger text-xs shrink-0">
               <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -171,7 +171,7 @@
     <!-- Create new key -->
     <div class="border-t border-gray-800 pt-4">
       <h3 class="text-xs text-gray-500 uppercase tracking-wider mb-3">Create New Key</h3>
-      <form method="post" action="/settings/api-keys/create" class="flex gap-3 flex-wrap">
+      <form method="post" action="settings/api-keys/create" class="flex gap-3 flex-wrap">
         <input
           name="name"
           type="text"
@@ -203,7 +203,7 @@
       <div>
         <p class="text-sm text-gray-400">Restart the Access Control service. The page will reload automatically.</p>
       </div>
-      <form method="post" action="/settings/restart" onsubmit="return confirm('Restart the Access Control service?')">
+      <form method="post" action="settings/restart" onsubmit="return confirm('Restart the Access Control service?')">
         <button type="submit" class="btn-danger text-sm whitespace-nowrap">
           <svg class="w-4 h-4 inline -mt-0.5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -215,7 +215,7 @@
     </div>
 
     <!-- Scheduled reboot -->
-    <form method="post" action="/settings/reboot-schedule"
+    <form method="post" action="settings/reboot-schedule"
           class="border-t border-gray-800 pt-4 space-y-3">
       <div class="flex items-start justify-between gap-4 flex-wrap">
         <div class="min-w-0">
@@ -277,13 +277,13 @@
           <div class="font-medium text-gray-200 truncate">{{ panel.name }}</div>
           <div class="text-xs text-gray-600 font-mono mt-0.5">{{ panel.entity_id }}</div>
         </div>
-        <form method="post" action="/settings/alarm/{{ panel.id }}/code" class="flex items-center gap-2 shrink-0">
+        <form method="post" action="settings/alarm/{{ panel.id }}/code" class="flex items-center gap-2 shrink-0">
           <input name="disarm_code" type="password" inputmode="numeric" pattern="[0-9]*"
             class="input w-24 text-sm text-center" placeholder="{{ '••••' if panel.disarm_code_encrypted else 'PIN' }}"
             title="Numeric disarm PIN" />
           <button type="submit" class="btn-secondary text-xs">Save PIN</button>
         </form>
-        <form method="post" action="/settings/alarm/{{ panel.id }}/delete"
+        <form method="post" action="settings/alarm/{{ panel.id }}/delete"
           data-name="{{ panel.name|e }}" onsubmit="return confirm('Remove alarm panel ' + this.dataset.name + '?')">
           <button type="submit" class="btn-danger text-xs shrink-0">Remove</button>
         </form>
@@ -297,7 +297,7 @@
     {% if ha_alarms %}
     <div class="border-t border-gray-800 pt-4">
       <h3 class="text-xs text-gray-500 uppercase tracking-wider mb-3">Add Alarm Panel</h3>
-      <form method="post" action="/settings/alarm/add" class="flex gap-3 flex-wrap">
+      <form method="post" action="settings/alarm/add" class="flex gap-3 flex-wrap">
         <select name="entity_id" required class="input flex-1 min-w-40" onchange="this.form.querySelector('[name=name]').value = this.options[this.selectedIndex].dataset.name || ''">
           <option value="">— Select panel —</option>
           {% for a in ha_alarms %}

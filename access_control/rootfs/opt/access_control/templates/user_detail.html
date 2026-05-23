@@ -7,7 +7,7 @@
 
   <!-- Back link + header -->
   <div>
-    <a href="/users" class="inline-flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-300 transition-colors mb-4">
+    <a href="users" class="inline-flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-300 transition-colors mb-4">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
       </svg>
@@ -29,7 +29,7 @@
     {% else %}
     <p class="text-sm text-gray-500">No PIN stored locally</p>
     {% endif %}
-    <form method="post" action="/users/{{ target_user.id }}/set-pin" class="flex gap-2 items-center">
+    <form method="post" action="users/{{ target_user.id }}/set-pin" class="flex gap-2 items-center">
       <input name="pin_code" type="text" pattern="[0-9]{4,8}" maxlength="8" class="input w-32" placeholder="e.g. 123456" />
       <button type="submit" class="btn-primary text-xs">Set PIN</button>
     </form>
@@ -39,7 +39,7 @@
   {% if available_locks %}
   <div class="card">
     <h2 class="text-sm font-semibold text-gray-300 mb-3">Add Lock Access</h2>
-    <form method="post" action="/users/{{ target_user.id }}/rules" class="flex gap-3 flex-wrap">
+    <form method="post" action="users/{{ target_user.id }}/rules" class="flex gap-3 flex-wrap">
       <select name="lock_id" required class="input flex-1 min-w-40">
         <option value="" disabled selected>Select a lock…</option>
         {% for lock in available_locks %}
@@ -79,7 +79,7 @@
           </div>
           <div class="flex items-center gap-2">
             <!-- Enable/Disable toggle -->
-            <form method="post" action="/rules/{{ rule.id }}/toggle">
+            <form method="post" action="rules/{{ rule.id }}/toggle">
               <button
                 type="submit"
                 title="{% if rule.enabled %}Disable{% else %}Enable{% endif %}"
@@ -100,7 +100,7 @@
             </form>
 
             <!-- Delete -->
-            <form method="post" action="/rules/{{ rule.id }}/delete"
+            <form method="post" action="rules/{{ rule.id }}/delete"
               data-lock-name="{{ rule.lock_name|e }}" onsubmit="return confirm('Delete access to ' + this.dataset.lockName + '?')">
               <button type="submit" class="btn-danger text-xs px-2 py-1">
                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -127,7 +127,7 @@
 
         <!-- Schedule editor (hidden by default) -->
         <div class="schedule-editor hidden border-t border-gray-800 pt-3">
-          <form method="post" action="/rules/{{ rule.id }}/schedule" class="space-y-4">
+          <form method="post" action="rules/{{ rule.id }}/schedule" class="space-y-4">
 
             <!-- Schedule enabled toggle -->
             <div class="flex items-center gap-3">

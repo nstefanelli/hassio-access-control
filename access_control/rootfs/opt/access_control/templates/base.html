@@ -3,6 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  {# Base href makes every relative URL on the page resolve against the
+     correct prefix — either the HA Ingress path (when accessed via HA
+     Sidebar / Open Web UI) or the root (when accessed directly during
+     local docker testing). All in-app links use RELATIVE paths so they
+     work in both modes; do NOT introduce leading slashes. #}
+  <base href="{% if ingress_path %}{{ ingress_path }}/{% else %}/{% endif %}">
+  <script>window.__INGRESS_PREFIX__ = "{{ ingress_path or '' }}";</script>
   <title>{% block title %}Access Control{% endblock %}</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%233b82f6'><path d='M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 3.18L18 7.1v4.9c0 4.28-2.98 8.28-6 9.67-3.02-1.39-6-5.39-6-9.67V7.1l6-2.92z'/></svg>" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -10,7 +17,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/htmx.org@2.0.0"></script>
-  <link rel="stylesheet" href="/static/app.css" />
+  <link rel="stylesheet" href="static/app.css" />
   <style>
     :root {
       --bg-deep: #050810;
@@ -221,31 +228,31 @@
       </div>
     </div>
     <nav style="flex:1; padding:0.75rem 0.625rem; display:flex; flex-direction:column; gap:0.125rem;">
-      <a href="/" class="nav-link{% if page == 'home' %} active{% endif %}">
+      <a href="." class="nav-link{% if page == 'home' %} active{% endif %}">
         <svg style="width:1rem;height:1rem;flex-shrink:0;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
         Status
       </a>
-      <a href="/users" class="nav-link{% if page == 'users' %} active{% endif %}">
+      <a href="users" class="nav-link{% if page == 'users' %} active{% endif %}">
         <svg style="width:1rem;height:1rem;flex-shrink:0;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
         Users
       </a>
-      <a href="/visitors" class="nav-link{% if page == 'visitors' %} active{% endif %}">
+      <a href="visitors" class="nav-link{% if page == 'visitors' %} active{% endif %}">
         <svg style="width:1rem;height:1rem;flex-shrink:0;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"/></svg>
         Visitors
       </a>
-      <a href="/locks" class="nav-link{% if page == 'locks' %} active{% endif %}">
+      <a href="locks" class="nav-link{% if page == 'locks' %} active{% endif %}">
         <svg style="width:1rem;height:1rem;flex-shrink:0;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
         Locks
       </a>
-      <a href="/groups" class="nav-link{% if page == 'groups' %} active{% endif %}">
+      <a href="groups" class="nav-link{% if page == 'groups' %} active{% endif %}">
         <svg style="width:1rem;height:1rem;flex-shrink:0;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
         Groups
       </a>
-      <a href="/log" class="nav-link{% if page == 'log' %} active{% endif %}">
+      <a href="log" class="nav-link{% if page == 'log' %} active{% endif %}">
         <svg style="width:1rem;height:1rem;flex-shrink:0;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
         Activity
       </a>
-      <a href="/settings" class="nav-link{% if page == 'settings' %} active{% endif %}">
+      <a href="settings" class="nav-link{% if page == 'settings' %} active{% endif %}">
         <svg style="width:1rem;height:1rem;flex-shrink:0;" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
@@ -255,7 +262,11 @@
     </nav>
     <div style="padding:0.875rem 1rem; border-top:1px solid var(--border-subtle);">
       <div style="font-size:0.6875rem; color:var(--text-muted); margin-bottom:0.375rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:500;">{{ user }}</div>
-      <a href="/logout" style="font-size:0.6875rem; color:var(--text-muted); text-decoration:none; font-weight:500; transition:color 0.15s;" onmouseover="this.style.color='var(--text-secondary)'" onmouseout="this.style.color='var(--text-muted)'">Sign out</a>
+      {% if not ingress_active %}
+      <a href="logout" style="font-size:0.6875rem; color:var(--text-muted); text-decoration:none; font-weight:500; transition:color 0.15s;" onmouseover="this.style.color='var(--text-secondary)'" onmouseout="this.style.color='var(--text-muted)'">Sign out</a>
+      {% else %}
+      <div style="font-size:0.6875rem; color:var(--text-muted); font-weight:500;" title="Signed in via Home Assistant; manage from HA user settings">via HA SSO</div>
+      {% endif %}
     </div>
   </aside>
 
@@ -271,31 +282,31 @@
 
 <!-- Mobile bottom tab bar -->
 <nav id="bottom-nav">
-  <a href="/" class="tab{% if page == 'home' %} active{% endif %}">
+  <a href="." class="tab{% if page == 'home' %} active{% endif %}">
     <svg style="width:1.125rem;height:1.125rem;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
     Status
   </a>
-  <a href="/users" class="tab{% if page == 'users' %} active{% endif %}">
+  <a href="users" class="tab{% if page == 'users' %} active{% endif %}">
     <svg style="width:1.125rem;height:1.125rem;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
     Users
   </a>
-  <a href="/visitors" class="tab{% if page == 'visitors' %} active{% endif %}">
+  <a href="visitors" class="tab{% if page == 'visitors' %} active{% endif %}">
     <svg style="width:1.125rem;height:1.125rem;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"/></svg>
     Visitors
   </a>
-  <a href="/locks" class="tab{% if page == 'locks' %} active{% endif %}">
+  <a href="locks" class="tab{% if page == 'locks' %} active{% endif %}">
     <svg style="width:1.125rem;height:1.125rem;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
     Locks
   </a>
-  <a href="/groups" class="tab{% if page == 'groups' %} active{% endif %}">
+  <a href="groups" class="tab{% if page == 'groups' %} active{% endif %}">
     <svg style="width:1.125rem;height:1.125rem;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
     Groups
   </a>
-  <a href="/log" class="tab{% if page == 'log' %} active{% endif %}">
+  <a href="log" class="tab{% if page == 'log' %} active{% endif %}">
     <svg style="width:1.125rem;height:1.125rem;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
     Log
   </a>
-  <a href="/settings" class="tab{% if page == 'settings' %} active{% endif %}">
+  <a href="settings" class="tab{% if page == 'settings' %} active{% endif %}">
     <svg style="width:1.125rem;height:1.125rem;" fill="none" stroke="currentColor" viewBox="0 0 24 24">
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>

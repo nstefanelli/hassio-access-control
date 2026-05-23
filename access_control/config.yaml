@@ -1,6 +1,6 @@
 ---
 name: Access Control
-version: "1.0.0"
+version: "1.1.0"
 slug: access_control
 description: >-
   Unified access control bridging UniFi Access + Protect with Home Assistant
@@ -17,13 +17,13 @@ boot: auto
 hassio_role: default
 hassio_api: false
 homeassistant_api: true
+auth_api: true
 host_network: false
-ports:
-  "8080/tcp": 8080
-ports_description:
-  "8080/tcp": Web UI
-webui: "http://[HOST]:[PORT:8080]"
-watchdog: "http://[HOST]:[PORT:8080]/health/live"
+ingress: true
+ingress_port: 8080
+panel_icon: mdi:door-closed-lock
+panel_title: Access Control
+panel_admin: true
 options:
   log_level: info
   use_supervisor_api: true

@@ -937,8 +937,21 @@ app.include_router(web_router)
 
 
 # ---------------------------------------------------------------------------
-# Setup-mode middleware
+# HTTP middleware stack
 # ---------------------------------------------------------------------------
+#
+# Starlette wraps middlewares LIFO — the LAST `@app.middleware("http")`
+# registered runs FIRST. The ingress middleware (registered at the very
+# bottom of this file) must execute before setup_guard so that:
+#
+#   • `request.scope["root_path"]` is set before any redirect helper
+#     builds a Location header
+#   • non-admin HA users get a 403 before being bounced to /setup
+#
+# DO NOT add new `@app.middleware("http")` decorators after the ingress
+# middleware registration — they would run BEFORE ingress and break the
+# invariant. New middleware goes here, between security_headers and the
+# ingress block at the end of the file.
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
@@ -976,7 +989,8 @@ async def setup_guard(request: Request, call_next):
     if not configured:
         exempt = path.startswith("/setup") or path.startswith("/static") or path == "/health/live"
         if not exempt:
-            return RedirectResponse(url="/setup", status_code=302)
+            root = request.scope.get("root_path", "")
+            return RedirectResponse(url=f"{root}/setup", status_code=302)
 
     return await call_next(request)
 
@@ -1020,3 +1034,15 @@ async def csrf_protection(request: Request, call_next):
 
     response = await call_next(request)
     return response
+
+
+# ---------------------------------------------------------------------------
+# HA Ingress middleware  (REGISTERED LAST — RUNS FIRST)
+# ---------------------------------------------------------------------------
+# Must run before security_headers/setup_guard/csrf_protection so that
+# request.scope["root_path"] is populated before any of those build a
+# Location header or read auth state. See the note above security_headers
+# for the LIFO ordering rationale.
+from .ingress import ingress_middleware as _ingress_middleware  # noqa: E402
+
+app.middleware("http")(_ingress_middleware)

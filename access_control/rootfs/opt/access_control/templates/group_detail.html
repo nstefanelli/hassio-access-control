@@ -13,7 +13,7 @@
 
   <!-- Header -->
   <div class="flex items-center gap-3">
-    <a href="/groups" class="text-gray-500 hover:text-gray-300">
+    <a href="groups" class="text-gray-500 hover:text-gray-300">
       <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
       </svg>
@@ -27,7 +27,7 @@
   <!-- Group settings -->
   <div class="card space-y-3">
     <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Settings</h2>
-    <form method="post" action="/groups/{{ group.id }}/update" class="space-y-3">
+    <form method="post" action="groups/{{ group.id }}/update" class="space-y-3">
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
           <label class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Name</label>
@@ -98,7 +98,7 @@
 
       <button type="submit" class="btn-primary text-sm">Save</button>
     </form>
-    <form method="post" action="/groups/{{ group.id }}/delete"
+    <form method="post" action="groups/{{ group.id }}/delete"
           data-name="{{ group.name|e }}" onsubmit="return confirm('Delete group ' + this.dataset.name + '?')" class="inline mt-3">
       <button type="submit" class="btn-danger text-sm">Delete Group</button>
     </form>
@@ -108,7 +108,7 @@
   {% if not group.all_locks %}
   <div class="card space-y-3">
     <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Locks</h2>
-    <form method="post" action="/groups/{{ group.id }}/locks" class="space-y-3">
+    <form method="post" action="groups/{{ group.id }}/locks" class="space-y-3">
       {% if all_locks %}
       <div class="space-y-2">
         {% for lock in all_locks %}
@@ -145,7 +145,7 @@
           <span class="text-xs text-gray-500 ml-2">{{ m.email }}</span>
           {% endif %}
         </div>
-        <form method="post" action="/groups/{{ group.id }}/remove-member/{{ m.id }}">
+        <form method="post" action="groups/{{ group.id }}/remove-member/{{ m.id }}">
           <button type="submit" class="text-xs text-gray-600 hover:text-red-400" title="Remove">
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
@@ -160,7 +160,7 @@
     <!-- Add member -->
     {% if available_users %}
     <div class="border-t border-gray-800 pt-3">
-      <form method="post" action="/groups/{{ group.id }}/add-member" class="flex gap-2">
+      <form method="post" action="groups/{{ group.id }}/add-member" class="flex gap-2">
         <select name="user_id" required class="input flex-1">
           <option value="">— Add a member —</option>
           {% for u in available_users %}

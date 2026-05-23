@@ -374,6 +374,8 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_setup_initializes_runtime(self) -> None:
         db = FakeDB()
         request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
             app=SimpleNamespace(
                 state=SimpleNamespace(
                     db=db,
@@ -412,6 +414,8 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
         hashed = config.hash_password("password")
         db.get_config = AsyncMock(side_effect=["admin", hashed])
         request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
             client=SimpleNamespace(host="127.0.0.1"),
             app=SimpleNamespace(state=SimpleNamespace(db=db)),
         )
@@ -448,6 +452,8 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         db.get_lock = AsyncMock(return_value={"id": 4, "type": "ha_external", "entity_id": "lock.back", "name": "Back Door"})
         ha_client = FakeHAClient()
         request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
             app=SimpleNamespace(
                 state=SimpleNamespace(
                     db=db,
@@ -470,6 +476,8 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         db = FakeDB()
         db.create_group = AsyncMock(side_effect=sqlite3.IntegrityError("UNIQUE constraint failed: groups.name"))
         request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
             app=SimpleNamespace(state=SimpleNamespace(db=db)),
             form=AsyncMock(return_value={"name": "Family", "description": ""}),
             client=SimpleNamespace(host="127.0.0.1"),
@@ -482,6 +490,8 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unlock_route_is_rate_limited(self) -> None:
         request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
             client=SimpleNamespace(host="127.0.0.1"),
             app=SimpleNamespace(state=SimpleNamespace()),
         )
@@ -496,6 +506,8 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         access_client = SimpleNamespace(connected=True, get_bootstrap=AsyncMock(), parse_door_locations=AsyncMock())
         protect_client = SimpleNamespace(connected=True, get_cameras=AsyncMock())
         request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
             app=SimpleNamespace(
                 state=SimpleNamespace(
                     db=db,
