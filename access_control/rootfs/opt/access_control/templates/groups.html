@@ -17,7 +17,7 @@
   {% if groups %}
   <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
     {% for g in groups %}
-    <a href="/groups/{{ g.id }}" class="card hover:bg-gray-800/60 transition-colors block space-y-2">
+    <a href="groups/{{ g.id }}" class="card hover:bg-gray-800/60 transition-colors block space-y-2">
       <div class="flex items-start justify-between gap-2">
         <div>
           <div class="font-semibold text-gray-100">{{ g.name }}</div>
@@ -54,7 +54,7 @@
   <!-- Create group -->
   <details class="card">
     <summary class="text-sm font-semibold text-gray-300 uppercase tracking-wider cursor-pointer hover:text-gray-100">Create Group</summary>
-    <form method="post" action="/groups/create" class="space-y-3 mt-3">
+    <form method="post" action="groups/create" class="space-y-3 mt-3">
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
           <label class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Name</label>

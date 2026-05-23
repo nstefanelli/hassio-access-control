@@ -7,7 +7,7 @@
 
   <div class="flex items-center justify-between">
     <h1 class="text-xl font-bold text-gray-100">Locks</h1>
-    <form method="post" action="/sync-users">
+    <form method="post" action="sync-users">
       <input type="hidden" name="redirect" value="/locks">
       <button type="submit" class="text-xs px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 transition-colors">Re-sync from UniFi</button>
     </form>
@@ -57,7 +57,7 @@
       <!-- Actions -->
       <div class="flex items-center gap-2 pt-1 border-t border-gray-800 flex-wrap">
         <!-- Lock -->
-        <form method="post" action="/locks/{{ lock.id }}/lock" class="flex-1 min-w-[4rem]">
+        <form method="post" action="locks/{{ lock.id }}/lock" class="flex-1 min-w-[4rem]">
           <button type="submit" class="btn-secondary w-full justify-center text-xs">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -68,7 +68,7 @@
         </form>
 
         <!-- Unlock -->
-        <form method="post" action="/locks/{{ lock.id }}/unlock" class="flex-1 min-w-[4rem]">
+        <form method="post" action="locks/{{ lock.id }}/unlock" class="flex-1 min-w-[4rem]">
           <button type="submit" class="btn-secondary w-full justify-center text-xs">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -80,7 +80,7 @@
 
         <!-- Buzz (if enabled) -->
         {% if lock.buzz_enabled %}
-        <form method="post" action="/locks/{{ lock.id }}/buzz" class="flex-1 min-w-[4rem]">
+        <form method="post" action="locks/{{ lock.id }}/buzz" class="flex-1 min-w-[4rem]">
           <button type="submit" class="btn-primary w-full justify-center text-xs" title="Unlock for {{ lock.relock_duration }}s then re-lock">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -92,7 +92,7 @@
         {% endif %}
 
         <!-- History -->
-        <a href="/locks/{{ lock.id }}/history" class="btn-secondary text-xs flex items-center gap-1">
+        <a href="locks/{{ lock.id }}/history" class="btn-secondary text-xs flex items-center gap-1">
           <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
           </svg>
@@ -100,7 +100,7 @@
         </a>
 
         <!-- Hide -->
-        <form method="post" action="/locks/{{ lock.id }}/hide">
+        <form method="post" action="locks/{{ lock.id }}/hide">
           <button type="submit" class="btn-secondary text-xs px-2.5 py-1.5" title="Hide from list">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -111,7 +111,7 @@
 
         <!-- Delete (HA external only) -->
         {% if lock.type == 'ha_external' %}
-        <form method="post" action="/locks/{{ lock.id }}/delete"
+        <form method="post" action="locks/{{ lock.id }}/delete"
           data-lock-name="{{ lock.name|e }}" onsubmit="return confirm('Delete lock ' + this.dataset.lockName + '? This will remove all associated rules.')">
           <button type="submit" class="btn-danger text-xs px-2.5 py-1.5" title="Delete">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -126,7 +126,7 @@
       <!-- Settings toggle -->
       <details class="border-t border-gray-800 pt-2 -mb-1">
         <summary class="text-xs text-gray-600 cursor-pointer hover:text-gray-400">Settings</summary>
-        <form method="post" action="/locks/{{ lock.id }}/settings" class="mt-2 space-y-2">
+        <form method="post" action="locks/{{ lock.id }}/settings" class="mt-2 space-y-2">
           <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
             <input type="checkbox" name="buzz_enabled" value="1" {{ 'checked' if lock.buzz_enabled else '' }}
                    class="rounded bg-gray-800 border-gray-700" />
@@ -160,7 +160,7 @@
               <span class="text-gray-400">
                 <span class="text-gray-600">{{ ed.type }}:</span> {{ ed.name }}
               </span>
-              <form method="post" action="/locks/{{ lock.id }}/entry-devices/{{ ed.id }}/delete" class="inline">
+              <form method="post" action="locks/{{ lock.id }}/entry-devices/{{ ed.id }}/delete" class="inline">
                 <button type="submit" class="text-gray-600 hover:text-red-400">&times;</button>
               </form>
             </div>
@@ -169,7 +169,7 @@
           {% endif %}
           <details>
             <summary class="text-xs text-gray-600 cursor-pointer hover:text-gray-400">Add device</summary>
-            <form method="post" action="/locks/{{ lock.id }}/entry-devices/add" class="mt-2 space-y-2" id="ed-form-{{ lock.id }}">
+            <form method="post" action="locks/{{ lock.id }}/entry-devices/add" class="mt-2 space-y-2" id="ed-form-{{ lock.id }}">
               <select name="device_type" class="input w-full text-xs" onchange="toggleDeviceFields(this, {{ lock.id }})">
                 <option value="access_reader">Access NFC Reader</option>
                 <option value="protect_doorbell">Protect Doorbell</option>
@@ -223,7 +223,7 @@
           <span class="text-gray-400">{{ lock.name }}</span>
           <span class="text-xs text-gray-600 ml-2 uppercase">{{ lock.type.replace('_', ' ') }}</span>
         </div>
-        <form method="post" action="/locks/{{ lock.id }}/unhide">
+        <form method="post" action="locks/{{ lock.id }}/unhide">
           <button type="submit" class="btn-secondary text-xs">Unhide</button>
         </form>
       </div>
@@ -238,7 +238,7 @@
     <div class="space-y-4 mt-3">
 
     {% if ha_locks %}
-    <form method="post" action="/locks/add" class="space-y-4">
+    <form method="post" action="locks/add" class="space-y-4">
       <div>
         <label for="entity_id" class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Select Lock Entity</label>
         <select id="entity_id" name="entity_id" required class="input w-full"
@@ -294,7 +294,7 @@
     <!-- Manual entry fallback -->
     <details class="border-t border-gray-800 pt-3">
       <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-400">Add manually by entity ID</summary>
-      <form method="post" action="/locks/add" class="space-y-3 mt-3">
+      <form method="post" action="locks/add" class="space-y-3 mt-3">
         <input name="entity_id" type="text" required class="input w-full" placeholder="lock.front_door" />
         <input name="name" type="text" required class="input w-full" placeholder="Display Name" />
         <input name="door_name" type="text" class="input w-full" placeholder="Door Name (optional)" />

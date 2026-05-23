@@ -10,11 +10,11 @@
     <h1 class="text-xl font-bold text-gray-100">Users</h1>
     <div class="flex items-center gap-2">
       {% if show_hidden %}
-      <a href="/users" class="btn-secondary text-xs">Hide Hidden</a>
+      <a href="users" class="btn-secondary text-xs">Hide Hidden</a>
       {% else %}
-      <a href="/users?show_hidden=1" class="btn-secondary text-xs">Show Hidden</a>
+      <a href="users?show_hidden=1" class="btn-secondary text-xs">Show Hidden</a>
       {% endif %}
-      <form method="post" action="/sync-users">
+      <form method="post" action="sync-users">
         <button type="submit" class="btn-secondary">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -45,7 +45,7 @@
           {% for u in users %}
           <tr
             class="hover:bg-gray-800/40 transition-colors cursor-pointer {{ 'opacity-40' if u.hidden else '' }}"
-            onclick="window.location.href='/users/{{ u.id }}'"
+            onclick="window.location.href=(window.__INGRESS_PREFIX__ || '') + '/users/{{ u.id }}'"
           >
             <td class="px-4 py-3">
               <span class="font-medium text-gray-100">{{ u.name }}</span>
@@ -86,7 +86,7 @@
             </td>
             <td class="px-4 py-3 text-right" onclick="event.stopPropagation()">
               {% if u.hidden %}
-              <form method="post" action="/users/{{ u.id }}/unhide" class="inline">
+              <form method="post" action="users/{{ u.id }}/unhide" class="inline">
                 <button type="submit" class="text-xs text-gray-600 hover:text-gray-300" title="Unhide">
                   <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -97,7 +97,7 @@
                 </button>
               </form>
               {% else %}
-              <form method="post" action="/users/{{ u.id }}/hide" class="inline">
+              <form method="post" action="users/{{ u.id }}/hide" class="inline">
                 <button type="submit" class="text-xs text-gray-600 hover:text-gray-300" title="Hide">
                   <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -115,7 +115,7 @@
     {% else %}
     <div class="px-4 py-12 text-center text-gray-500 text-sm">
       No users yet.
-      <form method="post" action="/sync-users" class="mt-4 inline-block">
+      <form method="post" action="sync-users" class="mt-4 inline-block">
         <button type="submit" class="btn-primary text-xs">Sync from UNVR</button>
       </form>
     </div>
@@ -125,7 +125,7 @@
   <!-- Add User -->
   <details class="card">
     <summary class="text-sm font-semibold text-gray-300 uppercase tracking-wider cursor-pointer hover:text-gray-100">Add User to UniFi Access</summary>
-    <form method="post" action="/users/add" class="mt-3 flex gap-3 flex-wrap items-end">
+    <form method="post" action="users/add" class="mt-3 flex gap-3 flex-wrap items-end">
       <div>
         <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">First Name</label>
         <input name="first_name" type="text" required class="input" placeholder="First name" />

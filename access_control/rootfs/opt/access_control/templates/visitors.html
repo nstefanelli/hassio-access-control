@@ -16,7 +16,7 @@
   <!-- Add Visitor Form -->
   <div class="card space-y-3">
     <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Add Visitor</h2>
-    <form method="post" action="/visitors/add" class="space-y-3">
+    <form method="post" action="visitors/add" class="space-y-3">
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <input name="first_name" type="text" required class="input" placeholder="First name" />
         <input name="last_name" type="text" required class="input" placeholder="Last name" />
@@ -83,12 +83,12 @@
             {% endif %}
           </div>
           <div class="flex gap-2 shrink-0">
-            <form method="post" action="/visitors/{{ v.id }}/extend" class="flex gap-1 items-center">
+            <form method="post" action="visitors/{{ v.id }}/extend" class="flex gap-1 items-center">
               <input name="end_date" type="date" required class="input text-xs py-1 w-32" />
               <input name="end_time" type="time" value="17:00" class="input text-xs py-1 w-20" />
               <button type="submit" class="btn-secondary text-xs">Extend</button>
             </form>
-            <form method="post" action="/visitors/{{ v.id }}/delete"
+            <form method="post" action="visitors/{{ v.id }}/delete"
               onsubmit="return confirm('Delete visitor {{ v.name|e }}?')">
               <button type="submit" class="btn-danger text-xs">Delete</button>
             </form>
@@ -115,7 +115,7 @@
             · {{ v.start_time[:16].replace('T', ' ') }} → {{ v.end_time[:16].replace('T', ' ') }}
           </div>
         </div>
-        <form method="post" action="/visitors/{{ v.id }}/delete"
+        <form method="post" action="visitors/{{ v.id }}/delete"
           onsubmit="return confirm('Remove expired visitor {{ v.name|e }}?')">
           <button type="submit" class="btn-danger text-xs">Remove</button>
         </form>

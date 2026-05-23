@@ -27,7 +27,15 @@ from .config import (
 )
 from .ha_client import HAClient
 from . import web_auth
-from .web_auth import create_session_cookie, generate_csrf_token, get_session_user, require_csrf, require_login
+from .web_auth import (
+    clear_session_cookie,
+    generate_csrf_token,
+    get_session_user,
+    refresh_session_cookie,  # noqa: F401  (re-exported for backward compat)
+    require_csrf,
+    require_login,
+    set_session_cookie,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,24 +70,53 @@ def _extract_schedule_days(form) -> str | None:
     return ",".join(selected) if selected else None
 
 
-def _redirect(url: str, *, delete_cookie: bool = False) -> RedirectResponse:
+def _redirect(request: Request, url: str, *, delete_cookie: bool = False) -> RedirectResponse:
+    """
+    Redirect helper that honors the HA Ingress URL prefix.
+
+    Absolute paths (starting with `/`) are rewritten to include the ingress
+    prefix when present. Use this everywhere the app issues a Location
+    header so links survive the ingress proxy.
+    """
+    root = request.scope.get("root_path", "")
+    if root and url.startswith("/"):
+        url = root + url
     resp = RedirectResponse(url=url, status_code=303)
     if delete_cookie:
-        resp.delete_cookie("session")
+        clear_session_cookie(resp, request)
     return resp
 
 
+def _inject_ingress_context(request: Request, context: dict) -> dict:
+    """
+    Mutate `context` to include `ingress_path` and `ingress_active` so every
+    template knows where to point `<base href>` and whether to hide UI
+    elements that don't make sense under HA SSO (e.g. the logout button).
+
+    Returns the same dict (for convenient chaining).
+    """
+    context["ingress_active"] = bool(getattr(request.state, "ingress_active", False))
+    context["ingress_path"] = request.scope.get("root_path", "") or ""
+    return context
+
+
 async def _render(template: str, request: Request, context: dict) -> HTMLResponse:
-    """Render a template with CSRF token injected and session refreshed."""
+    """Render a template with CSRF token injected and session refreshed.
+
+    Also injects `ingress_path` and `ingress_active` so templates can render
+    `<base href>` correctly and hide UI elements that don't make sense under
+    HA SSO (e.g. the logout button).
+    """
     user = get_session_user(request)
-    if user:
-        context["csrf_token"] = generate_csrf_token(user)
-    else:
-        context["csrf_token"] = ""
+    ingress_user = getattr(request.state, "ingress_user", None)
+    effective_user = user or (f"ha:{ingress_user['name']}" if ingress_user else None)
+
+    context["csrf_token"] = generate_csrf_token(effective_user) if effective_user else ""
+    _inject_ingress_context(request, context)
+
     response = templates.TemplateResponse(template, context)
     if user:
-        from .web_auth import refresh_session_cookie
-        refresh_session_cookie(response, user)
+        refresh_session_cookie(response, request, user)
     return response
 
 
@@ -113,12 +150,18 @@ async def _enforce_action_rate_limit(request: Request, user: str, action: str) -
 
 @router.get("/login", response_class=HTMLResponse)
 async def login_get(request: Request):
-    """Login page — redirect to / if already logged in."""
-    if get_session_user(request):
-        return _redirect("/")
+    """Login page — redirect to / if already logged in.
+
+    Under HA Ingress + SSO, `request.state.ingress_user` is populated by
+    the ingress middleware before this route runs, so an SSO admin who
+    lands here (e.g. via a stale bookmark) should never see the login
+    form — they're already authenticated.
+    """
+    if get_session_user(request) or getattr(request.state, "ingress_user", None):
+        return _redirect(request, "/")
     return templates.TemplateResponse(
         "login.html",
-        {"request": request, "page": "login", "error": None},
+        _inject_ingress_context(request, {"request": request, "page": "login", "error": None}),
     )
 
 
@@ -134,7 +177,7 @@ async def login_post(
     if await db.is_rate_limited("login", client_ip):
         return templates.TemplateResponse(
             "login.html",
-            {"request": request, "error": "Too many failed attempts. Try again in 60 seconds."},
+            _inject_ingress_context(request, {"request": request, "error": "Too many failed attempts. Try again in 60 seconds."}),
             status_code=429,
         )
 
@@ -150,32 +193,24 @@ async def login_post(
         await db.record_rate_limit_failure("login", client_ip, **_LOGIN_RATE_LIMIT)
         return templates.TemplateResponse(
             "login.html",
-            {
+            _inject_ingress_context(request, {
                 "request": request,
                 "page": "login",
                 "error": "Invalid username or password.",
-            },
+            }),
             status_code=401,
         )
 
     await db.clear_rate_limit("login", client_ip)
-    cookie_value = create_session_cookie(username)
-    resp = _redirect("/")
-    resp.set_cookie(
-        "session",
-        cookie_value,
-        httponly=True,
-        secure=True,
-        samesite="lax",
-        max_age=web_auth.SESSION_MAX_AGE,
-    )
+    resp = _redirect(request, "/")
+    set_session_cookie(resp, request, username)
     return resp
 
 
 @router.get("/logout")
 async def logout(request: Request):
     """Delete session cookie and redirect to /login."""
-    return _redirect("/login", delete_cookie=True)
+    return _redirect(request, "/login", delete_cookie=True)
 
 
 @router.get("/setup", response_class=HTMLResponse)
@@ -183,10 +218,10 @@ async def setup_get(request: Request):
     """First-run wizard — redirect to /login if already configured."""
     db = request.app.state.db
     if await db.get_config("admin_username") is not None:
-        return _redirect("/login")
+        return _redirect(request, "/login")
     return templates.TemplateResponse(
         "setup.html",
-        {"request": request, "page": "setup", "error": None},
+        _inject_ingress_context(request, {"request": request, "page": "setup", "error": None}),
     )
 
 
@@ -207,7 +242,7 @@ async def setup_post(
     def _render_error(error: str) -> HTMLResponse:
         return templates.TemplateResponse(
             "setup.html",
-            {"request": request, "page": "setup", "error": error},
+            _inject_ingress_context(request, {"request": request, "page": "setup", "error": error}),
             status_code=422,
         )
 
@@ -267,7 +302,13 @@ async def setup_post(
         request.app.state.configured = False
         return _render_error(f"Setup saved, but runtime initialization failed: {exc}")
 
-    return _redirect("/login")
+    # Under SSO, send the admin straight into the dashboard — they're already
+    # authenticated by HA, no need to bounce through the legacy /login form.
+    # Direct-port deployments still need to enter the username/password just
+    # captured by setup.
+    if getattr(request.state, "ingress_user", None):
+        return _redirect(request, "/")
+    return _redirect(request, "/login")
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +395,7 @@ async def hide_user(user_id: int, request: Request, user: str = Depends(require_
     db = request.app.state.db
     await db.set_user_hidden(user_id, True)
     await db.log_admin_action(user, "user_hide", str(user_id))
-    return _redirect("/users")
+    return _redirect(request, "/users")
 
 
 @router.post("/users/{user_id}/unhide")
@@ -366,7 +407,7 @@ async def unhide_user(user_id: int, request: Request, user: str = Depends(requir
     db = request.app.state.db
     await db.set_user_hidden(user_id, False)
     await db.log_admin_action(user, "user_unhide", str(user_id))
-    return _redirect("/users?show_hidden=1")
+    return _redirect(request, "/users?show_hidden=1")
 
 
 @router.get("/users/{user_id}", response_class=HTMLResponse)
@@ -378,7 +419,7 @@ async def user_detail(
 
     target_user = await db.get_user(user_id)
     if target_user is None:
-        return _redirect("/users")
+        return _redirect(request, "/users")
 
     rules = await db.get_rules_for_user(user_id)
     locks = await db.get_all_locks()
@@ -420,7 +461,7 @@ async def add_rule(
     if existing is None:
         await db.add_rule(user_id, lock_id)
 
-    return _redirect(f"/users/{user_id}")
+    return _redirect(request, f"/users/{user_id}")
 
 
 @router.post("/rules/{rule_id}/toggle")
@@ -437,7 +478,7 @@ async def toggle_rule(
 
     rule = await db.get_rule(rule_id)
     if rule is None:
-        return _redirect("/users")
+        return _redirect(request, "/users")
 
     user_id = rule["user_id"]
     new_enabled = not bool(rule["enabled"])
@@ -451,7 +492,7 @@ async def toggle_rule(
         schedule_end=rule["schedule_end"],
     )
 
-    return _redirect(f"/users/{user_id}")
+    return _redirect(request, f"/users/{user_id}")
 
 
 @router.post("/rules/{rule_id}/delete")
@@ -471,8 +512,8 @@ async def delete_rule(
     await db.delete_rule(rule_id)
 
     if user_id:
-        return _redirect(f"/users/{user_id}")
-    return _redirect("/users")
+        return _redirect(request, f"/users/{user_id}")
+    return _redirect(request, "/users")
 
 
 @router.post("/rules/{rule_id}/schedule")
@@ -499,7 +540,7 @@ async def update_schedule(
 
     rule = await db.get_rule(rule_id)
     if rule is None:
-        return _redirect("/users")
+        return _redirect(request, "/users")
 
     user_id = rule["user_id"]
 
@@ -519,7 +560,7 @@ async def update_schedule(
         schedule_end=schedule_end or None,
     )
 
-    return _redirect(f"/users/{user_id}")
+    return _redirect(request, f"/users/{user_id}")
 
 
 @router.get("/locks", response_class=HTMLResponse)
@@ -613,7 +654,7 @@ async def add_lock(
     if limited:
         return limited
     if not _HA_ENTITY_ID_RE.match(entity_id):
-        return _redirect("/locks?error=Invalid+entity+ID+format")
+        return _redirect(request, "/locks?error=Invalid+entity+ID+format")
     db = request.app.state.db
     await db.add_external_lock(
         entity_id=entity_id,
@@ -623,7 +664,7 @@ async def add_lock(
         relock_duration=relock_duration,
     )
     await db.log_admin_action(user, "lock_create", name)
-    return _redirect("/locks")
+    return _redirect(request, "/locks")
 
 
 @router.post("/locks/{lock_id}/settings")
@@ -649,7 +690,7 @@ async def update_lock_settings(
         relock_on_remote=bool(relock_on_remote),
         relock_on_device_auth=bool(relock_on_device_auth),
     )
-    return _redirect("/locks")
+    return _redirect(request, "/locks")
 
 
 @router.post("/locks/{lock_id}/delete")
@@ -665,7 +706,7 @@ async def delete_lock(
     db = request.app.state.db
     await db.delete_lock(lock_id)
     await db.log_admin_action(user, "lock_delete", str(lock_id))
-    return _redirect("/locks")
+    return _redirect(request, "/locks")
 
 
 @router.post("/locks/{lock_id}/hide")
@@ -677,7 +718,7 @@ async def hide_lock(lock_id: int, request: Request, user: str = Depends(require_
     db = request.app.state.db
     await db.set_lock_hidden(lock_id, True)
     await db.log_admin_action(user, "lock_hide", str(lock_id))
-    return _redirect("/locks")
+    return _redirect(request, "/locks")
 
 
 @router.post("/locks/{lock_id}/unhide")
@@ -689,7 +730,7 @@ async def unhide_lock(lock_id: int, request: Request, user: str = Depends(requir
     db = request.app.state.db
     await db.set_lock_hidden(lock_id, False)
     await db.log_admin_action(user, "lock_unhide", str(lock_id))
-    return _redirect("/locks")
+    return _redirect(request, "/locks")
 
 
 @router.post("/locks/{lock_id}/entry-devices/add")
@@ -713,7 +754,7 @@ async def add_entry_device(
         device_id=device_id or None,
         entity_id=entity_id or None,
     )
-    return _redirect("/locks")
+    return _redirect(request, "/locks")
 
 
 @router.post("/locks/{lock_id}/entry-devices/{ed_id}/delete")
@@ -725,7 +766,7 @@ async def delete_entry_device(
         return limited
     db = request.app.state.db
     await db.delete_entry_device(ed_id)
-    return _redirect("/locks")
+    return _redirect(request, "/locks")
 
 
 @router.post("/locks/{lock_id}/unlock")
@@ -763,7 +804,7 @@ async def _lock_action(lock_id: int, action: str, user: str, request):
 
     lock = await db.get_lock(lock_id)
     if lock is None:
-        return _redirect("/locks")
+        return _redirect(request, "/locks")
 
     result = "error"
     reason: str | None = None
@@ -875,7 +916,7 @@ async def _lock_action(lock_id: int, action: str, user: str, request):
             except Exception:
                 logger.exception("Failed to auto-disarm %s", panel["entity_id"])
 
-    return _redirect("/locks")
+    return _redirect(request, "/locks")
 
 
 @router.get("/locks/{lock_id}/history", response_class=HTMLResponse)
@@ -884,7 +925,7 @@ async def lock_history(lock_id: int, request: Request, user: str = Depends(requi
     db = request.app.state.db
     lock = await db.get_lock(lock_id)
     if not lock:
-        return _redirect("/locks")
+        return _redirect(request, "/locks")
     log_entries = await db.get_log_for_lock(lock_id)
     return await _render("lock_history.html", request, {
         "request": request, "user": user, "page": "locks",
@@ -926,7 +967,7 @@ async def alarm_arm_away(panel_id: int, request: Request, user: str = Depends(re
         ok = await ha.alarm_arm_away(panel["entity_id"])
         if not ok:
             logger.error("Alarm arm-away failed for %s", panel["entity_id"])
-    return _redirect("/")
+    return _redirect(request, "/")
 
 
 @router.post("/alarm/{panel_id}/arm-home")
@@ -941,7 +982,7 @@ async def alarm_arm_home(panel_id: int, request: Request, user: str = Depends(re
         ok = await ha.alarm_arm_home(panel["entity_id"])
         if not ok:
             logger.error("Alarm arm-home failed for %s", panel["entity_id"])
-    return _redirect("/")
+    return _redirect(request, "/")
 
 
 @router.post("/alarm/{panel_id}/disarm")
@@ -957,7 +998,7 @@ async def alarm_disarm(panel_id: int, request: Request, user: str = Depends(requ
         ok = await ha.alarm_disarm(panel["entity_id"], code=code)
         if not ok:
             logger.error("Alarm disarm failed for %s", panel["entity_id"])
-    return _redirect("/")
+    return _redirect(request, "/")
 
 
 async def _get_alarm_panel(db, panel_id):
@@ -988,11 +1029,11 @@ async def add_alarm_panel(
     if limited:
         return limited
     if not _HA_ENTITY_ID_RE.match(entity_id):
-        return _redirect("/settings?error=Invalid+entity+ID+format")
+        return _redirect(request, "/settings?error=Invalid+entity+ID+format")
     db = request.app.state.db
     await db.add_alarm_panel(entity_id, name)
     await db.log_admin_action(user, "alarm_panel_add", entity_id)
-    return _redirect("/settings")
+    return _redirect(request, "/settings")
 
 
 @router.post("/settings/alarm/{panel_id}/code")
@@ -1009,7 +1050,7 @@ async def set_alarm_panel_code(
     code = disarm_code.strip()
     if code:
         if not re.fullmatch(r"[0-9]{4,8}", code):
-            return _redirect("/settings")
+            return _redirect(request, "/settings")
         enc = encrypt_value(code, request.app.state.enc_key)
         action = "alarm_panel_code_set"
     else:
@@ -1017,7 +1058,7 @@ async def set_alarm_panel_code(
         action = "alarm_panel_code_cleared"
     await db.update_alarm_panel_code(panel_id, enc)
     await db.log_admin_action(user, action, str(panel_id))
-    return _redirect("/settings")
+    return _redirect(request, "/settings")
 
 
 @router.post("/settings/alarm/{panel_id}/delete")
@@ -1028,7 +1069,7 @@ async def delete_alarm_panel(panel_id: int, request: Request, user: str = Depend
     db = request.app.state.db
     await db.delete_alarm_panel(panel_id)
     await db.log_admin_action(user, "alarm_panel_remove", str(panel_id))
-    return _redirect("/settings")
+    return _redirect(request, "/settings")
 
 
 # ---------------------------------------------------------------------------
@@ -1072,10 +1113,10 @@ async def create_group(request: Request, user: str = Depends(require_csrf)):
             schedule_end=form.get("schedule_end") or None,
         )
     except sqlite3.IntegrityError:
-        return _redirect(f"/groups?error={quote_plus('Group name already exists.')}")
+        return _redirect(request, f"/groups?error={quote_plus('Group name already exists.')}")
     name = form.get("name", "")
     await db.log_admin_action(user, "group_create", name)
-    return _redirect("/groups")
+    return _redirect(request, "/groups")
 
 
 @router.get("/groups/{group_id}", response_class=HTMLResponse)
@@ -1083,7 +1124,7 @@ async def group_detail(group_id: int, request: Request, user: str = Depends(requ
     db = request.app.state.db
     group = await db.get_group(group_id)
     if not group:
-        return _redirect("/groups")
+        return _redirect(request, "/groups")
     members = await db.get_group_members(group_id)
     member_ids = {m["id"] for m in members}
     all_users = await db.get_all_users(include_hidden=False)
@@ -1118,7 +1159,7 @@ async def add_group_member(
         return limited
     db = request.app.state.db
     await db.add_group_member(group_id, user_id)
-    return _redirect(f"/groups/{group_id}")
+    return _redirect(request, f"/groups/{group_id}")
 
 
 @router.post("/groups/{group_id}/remove-member/{member_id}")
@@ -1130,7 +1171,7 @@ async def remove_group_member(
         return limited
     db = request.app.state.db
     await db.remove_group_member(group_id, member_id)
-    return _redirect(f"/groups/{group_id}")
+    return _redirect(request, f"/groups/{group_id}")
 
 
 @router.post("/groups/{group_id}/update")
@@ -1156,9 +1197,9 @@ async def update_group(group_id: int, request: Request, user: str = Depends(requ
             schedule_end=form.get("schedule_end") or None,
         )
     except sqlite3.IntegrityError:
-        return _redirect(f"/groups/{group_id}?error={quote_plus('Group name already exists.')}")
+        return _redirect(request, f"/groups/{group_id}?error={quote_plus('Group name already exists.')}")
     await db.log_admin_action(user, "group_update", str(group_id))
-    return _redirect(f"/groups/{group_id}")
+    return _redirect(request, f"/groups/{group_id}")
 
 
 @router.post("/groups/{group_id}/locks")
@@ -1170,7 +1211,7 @@ async def set_group_locks(group_id: int, request: Request, user: str = Depends(r
     form = await request.form()
     lock_ids = [int(v) for k, v in form.multi_items() if k == "lock_ids"]
     await db.set_group_locks(group_id, lock_ids)
-    return _redirect(f"/groups/{group_id}")
+    return _redirect(request, f"/groups/{group_id}")
 
 
 @router.post("/groups/{group_id}/delete")
@@ -1181,7 +1222,7 @@ async def delete_group(group_id: int, request: Request, user: str = Depends(requ
     db = request.app.state.db
     await db.delete_group(group_id)
     await db.log_admin_action(user, "group_delete", str(group_id))
-    return _redirect("/groups")
+    return _redirect(request, "/groups")
 
 
 # ------------------------------------------------------------------
@@ -1240,13 +1281,13 @@ async def add_visitor(
 
     # Validate PIN if provided
     if pin_code and not re.match(r'^[0-9]{4,8}$', pin_code):
-        return _redirect("/visitors?error=Invalid+PIN+format")
+        return _redirect(request, "/visitors?error=Invalid+PIN+format")
 
     db = request.app.state.db
     access = request.app.state.access_client
     enc_key = getattr(request.app.state, "enc_key", None)
     if not access:
-        return _redirect("/visitors?error=Access+client+not+available")
+        return _redirect(request, "/visitors?error=Access+client+not+available")
 
     local_tz = ZoneInfo("America/New_York")
     start_dt = dt.strptime(f"{start_date} {start_time}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
@@ -1254,7 +1295,7 @@ async def add_visitor(
 
     # Validate time window
     if end_dt <= start_dt:
-        return _redirect("/visitors?error=End+time+must+be+after+start+time")
+        return _redirect(request, "/visitors?error=End+time+must+be+after+start+time")
 
     start_unix = int(start_dt.timestamp())
     end_unix = int(end_dt.timestamp())
@@ -1263,11 +1304,11 @@ async def add_visitor(
         visitor_data = await access.create_visitor(first_name, last_name + " - Visitor", start_unix, end_unix)
     except Exception:
         logger.exception("Failed to create visitor in UniFi")
-        return _redirect("/visitors?error=Failed+to+create+visitor+in+UniFi")
+        return _redirect(request, "/visitors?error=Failed+to+create+visitor+in+UniFi")
     visitor_id = visitor_data.get("unique_id", "")
     if not visitor_id:
         logger.error("UniFi returned no unique_id for new visitor")
-        return _redirect("/visitors")
+        return _redirect(request, "/visitors")
 
     location_name = ""
     pin_encrypted = None
@@ -1299,10 +1340,10 @@ async def add_visitor(
             await access.delete_visitor(visitor_id)
         except Exception:
             logger.exception("Cleanup failed for partially created visitor %s", visitor_id)
-        return _redirect("/visitors?error=Visitor+creation+partially+failed")
+        return _redirect(request, "/visitors?error=Visitor+creation+partially+failed")
 
     await db.log_admin_action(user, "visitor_create", name, f"door={location_name}, expires={end_dt.isoformat()}")
-    return _redirect("/visitors")
+    return _redirect(request, "/visitors")
 
 
 @router.post("/visitors/{visitor_id}/extend")
@@ -1324,24 +1365,24 @@ async def extend_visitor(
     access = request.app.state.access_client
     visitor = await db.get_visitor(visitor_id)
     if not visitor:
-        return _redirect("/visitors")
+        return _redirect(request, "/visitors")
     if not access:
-        return _redirect("/visitors?error=Access+client+not+available")
+        return _redirect(request, "/visitors?error=Access+client+not+available")
 
     local_tz = ZoneInfo("America/New_York")
     end_dt = dt.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
     if end_dt <= dt.now(local_tz):
-        return _redirect("/visitors")
+        return _redirect(request, "/visitors")
     end_unix = int(end_dt.timestamp())
 
     try:
         await access.update_visitor(visitor["unvr_visitor_id"], end_time=end_unix)
     except Exception:
         logger.exception("Failed to extend visitor %s in UniFi", visitor["name"])
-        return _redirect("/visitors?error=Failed+to+extend+visitor+in+UniFi")
+        return _redirect(request, "/visitors?error=Failed+to+extend+visitor+in+UniFi")
     await db.update_visitor_end_time(visitor_id, end_dt.isoformat())
     await db.log_admin_action(user, "visitor_extend", visitor["name"], f"new end={end_dt.isoformat()}")
-    return _redirect("/visitors")
+    return _redirect(request, "/visitors")
 
 
 @router.post("/visitors/{visitor_id}/delete")
@@ -1358,21 +1399,21 @@ async def delete_visitor_route(
     access = request.app.state.access_client
     visitor = await db.get_visitor(visitor_id)
     if not visitor:
-        return _redirect("/visitors")
+        return _redirect(request, "/visitors")
 
     if not access or not access.connected:
         logger.warning("Cannot delete visitor %s from UniFi — Access client not connected", visitor_id)
-        return _redirect("/visitors?error=access_unavailable")
+        return _redirect(request, "/visitors?error=access_unavailable")
 
     try:
         await access.delete_visitor(visitor["unvr_visitor_id"])
     except Exception:
         logger.exception("Failed to delete visitor from UniFi")
-        return _redirect("/visitors?error=unifi_delete_failed")
+        return _redirect(request, "/visitors?error=unifi_delete_failed")
 
     await db.delete_visitor(visitor_id)
     await db.log_admin_action(user, "visitor_delete", visitor["name"])
-    return _redirect("/visitors")
+    return _redirect(request, "/visitors")
 
 
 # ------------------------------------------------------------------
@@ -1391,7 +1432,7 @@ async def set_user_pin(
     if limited:
         return limited
     if not re.match(r'^[0-9]{4,8}$', pin_code):
-        return _redirect(f"/users/{user_id}")
+        return _redirect(request, f"/users/{user_id}")
 
     db = request.app.state.db
     access = request.app.state.access_client
@@ -1399,20 +1440,20 @@ async def set_user_pin(
 
     db_user = await db.get_user(user_id)
     if not db_user or not db_user.get("ulp_id"):
-        return _redirect(f"/users/{user_id}")
+        return _redirect(request, f"/users/{user_id}")
 
     try:
         await access.set_user_pin(db_user["ulp_id"], pin_code)
     except Exception:
         logger.exception("Failed to set PIN for user %s via UniFi API", db_user.get("name"))
-        return _redirect(f"/users/{user_id}")
+        return _redirect(request, f"/users/{user_id}")
 
     if enc_key:
         pin_encrypted = encrypt_value(pin_code, enc_key)
         await db.update_user_pin(user_id, pin_encrypted)
 
     await db.log_admin_action(user, "user_pin_set", db_user.get("name", str(user_id)))
-    return _redirect(f"/users/{user_id}")
+    return _redirect(request, f"/users/{user_id}")
 
 
 async def _load_settings_context(request: Request, db, enc_key) -> dict:
@@ -1756,7 +1797,7 @@ async def delete_api_key(
     db = request.app.state.db
     await db.delete_api_key(key_id)
     await db.log_admin_action(user, "api_key_revoke", str(key_id))
-    return _redirect("/settings")
+    return _redirect(request, "/settings")
 
 
 @router.post("/sync-users")
@@ -1776,7 +1817,7 @@ async def sync_users(request: Request, user: str = Depends(require_csrf)):
     redirect_to = form.get("redirect", "/users")
     if redirect_to not in ("/users", "/locks", "/"):
         redirect_to = "/users"
-    return _redirect(redirect_to)
+    return _redirect(request, redirect_to)
 
 
 @router.post("/users/add")
@@ -1797,7 +1838,7 @@ async def add_user_route(
         user_data = await access.create_user(first_name, last_name)
     except Exception:
         logger.exception("Failed to create user in UniFi")
-        return _redirect("/users")
+        return _redirect(request, "/users")
     ulp_id = user_data.get("unique_id", "")
     full_name = user_data.get("full_name", f"{first_name} {last_name}")
 
@@ -1810,7 +1851,7 @@ async def add_user_route(
         )
 
     await db.log_admin_action(user, "user_create", full_name)
-    return _redirect("/users")
+    return _redirect(request, "/users")
 
 
 @router.post("/settings/restart")
@@ -1835,7 +1876,7 @@ async def restart_service(request: Request, user: str = Depends(require_csrf)):
         await proc.wait()
 
     asyncio.create_task(_do_restart(), name="service-restart")
-    return _redirect("/settings?restarting=1")
+    return _redirect(request, "/settings?restarting=1")
 
 
 @router.post("/settings/reboot-schedule")
@@ -1863,4 +1904,4 @@ async def update_reboot_schedule(
         user, "reboot_schedule_update",
         target=f"enabled={enabled} day={day} hour={hour}",
     )
-    return _redirect("/settings")
+    return _redirect(request, "/settings")

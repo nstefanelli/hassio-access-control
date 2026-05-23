@@ -937,27 +937,41 @@ app.include_router(web_router)
 
 
 # ---------------------------------------------------------------------------
-# Setup-mode middleware
+# HTTP middleware stack
 # ---------------------------------------------------------------------------
+#
+# Starlette wraps middlewares LIFO — the LAST `@app.middleware("http")`
+# registered runs FIRST. The ingress middleware (registered at the very
+# bottom of this file) must execute before setup_guard so that:
+#
+#   • `request.scope["root_path"]` is set before any redirect helper
+#     builds a Location header
+#   • non-admin HA users get a 403 before being bounced to /setup
+#
+# DO NOT add new `@app.middleware("http")` decorators after the ingress
+# middleware registration — they would run BEFORE ingress and break the
+# invariant. New middleware goes here, between security_headers and the
+# ingress block at the end of the file.
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    """Add security headers to all responses."""
+    """Add security headers to all responses.
+
+    Header values depend on whether the request came through HA Ingress
+    (so the addon is iframed by HA at same-origin) vs. direct port (so
+    the addon must refuse all framing). See `security_headers_for()` in
+    ingress.py for the rationale; we just apply its output here.
+
+    The ingress middleware sets `request.state.ingress_active` before
+    this runs (LIFO order — ingress is outermost, security_headers is
+    inner). Reading that flag here is safe.
+    """
     response = await call_next(request)
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "same-origin"
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    response.headers["X-XSS-Protection"] = "0"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://unpkg.com; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.tailwindcss.com; "
-        "font-src https://fonts.gstatic.com; "
-        "connect-src 'self'; "
-        "img-src 'self' data:; "
-        "frame-ancestors 'none'"
-    )
+    from .ingress import security_headers_for
+
+    ingress_active = bool(getattr(request.state, "ingress_active", False))
+    for name, value in security_headers_for(ingress_active=ingress_active).items():
+        response.headers[name] = value
     return response
 
 
@@ -976,7 +990,8 @@ async def setup_guard(request: Request, call_next):
     if not configured:
         exempt = path.startswith("/setup") or path.startswith("/static") or path == "/health/live"
         if not exempt:
-            return RedirectResponse(url="/setup", status_code=302)
+            root = request.scope.get("root_path", "")
+            return RedirectResponse(url=f"{root}/setup", status_code=302)
 
     return await call_next(request)
 
@@ -1020,3 +1035,46 @@ async def csrf_protection(request: Request, call_next):
 
     response = await call_next(request)
     return response
+
+
+# ---------------------------------------------------------------------------
+# HA Ingress middleware  (REGISTERED LAST — RUNS FIRST)
+# ---------------------------------------------------------------------------
+# Must run before security_headers/setup_guard/csrf_protection so that
+# request.scope["root_path"] is populated before any of those build a
+# Location header or read auth state. See the note above security_headers
+# for the LIFO ordering rationale.
+from .ingress import ingress_middleware as _ingress_middleware  # noqa: E402
+
+app.middleware("http")(_ingress_middleware)
+
+
+# Runtime guard: detect a future regression where someone adds a new
+# `@app.middleware("http")` *below* this block, which would silently
+# demote the ingress middleware from outermost (runs-first) to inner
+# (runs-later). FastAPI's `add_middleware` (which `@app.middleware`
+# calls under the hood) prepends to `app.user_middleware`, and
+# Starlette's stack builder iterates that list in reverse — so the
+# LAST registered middleware ends up at index 0 and runs OUTERMOST.
+# Verified by inspecting Starlette's `build_middleware_stack`. If this
+# invariant ever breaks, fail loudly at import time rather than letting
+# an auth-bypass slip through to production.
+def _assert_ingress_outermost() -> None:
+    if not app.user_middleware:
+        raise RuntimeError("No user middleware registered; ingress wiring lost")
+    outermost = app.user_middleware[0]
+    dispatch = (
+        getattr(outermost, "kwargs", {}).get("dispatch")
+        or getattr(outermost, "options", {}).get("dispatch")
+    )
+    if dispatch is not _ingress_middleware:
+        raise RuntimeError(
+            "HA Ingress middleware is no longer the outermost wrapper. "
+            "A later `@app.middleware('http')` call has demoted it, which "
+            "would let other middleware run with root_path unset and SSO "
+            "headers untrusted. Move the new middleware ABOVE the ingress "
+            "block in main.py."
+        )
+
+
+_assert_ingress_outermost()
