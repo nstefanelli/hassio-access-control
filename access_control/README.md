@@ -1,37 +1,41 @@
-# Home Assistant Add-on: Access Control
+# Access Control
 
 Unified access control dashboard bridging **UniFi Access + Protect** with
 **Home Assistant** locks and alarm panels.
 
+This is a Home Assistant **app** *(formerly called "add-on")* — see the
+[main README](https://github.com/nstefanelli/hassio-access-control) for
+full features, use cases, configuration deep-dive, and screenshots.
+
 ## Quick start
 
-1. Add the repository in **Settings → Add-ons → ⋮ → Repositories**:
+1. Add the repository in **Settings → Apps → ⋮ → Repositories**:
 
    ```text
    https://github.com/nstefanelli/hassio-access-control
    ```
 
-2. Install **Access Control** from the add-on store. Start it.
+2. Install **Access Control** from the app store and start it.
 
-3. Open it from the HA sidebar (admins only) or via "Open Web UI" on the
-   add-on page.
+3. Open it from the HA sidebar (admin users only) or via **Open Web UI**
+   on the app page.
 
 4. Complete the on-screen setup wizard (UniFi Console host + service
    account). HA URL + token are auto-configured by default.
 
-5. Visit **Locks** to wire HA lock entities to physical doors / readers.
+5. Visit **Locks** to wire HA lock entities to physical doors and readers.
 
 ## Configuration options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `log_level` | `info` | One of `trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal` |
-| `use_supervisor_api` | `true` | Auto-configure HA URL + token from `SUPERVISOR_TOKEN`. Set to `false` to point the add-on at a different HA instance. |
+| `use_supervisor_api` | `true` | Auto-configure HA URL + token from `SUPERVISOR_TOKEN`. Set to `false` to point the app at a different HA instance. |
 
 The web UI binds to port `8080` inside the container and is reached
 through HA Ingress — there's no host-side port mapping by default.
-Credentials and per-installation settings are entered through the in-app
-**Settings** page (encrypted in `/data`).
+UniFi credentials and per-installation settings are entered through the
+in-app **Settings** page and stored encrypted at `/data`.
 
 ## Manual install (private repository)
 
@@ -39,18 +43,18 @@ If the repository is private (the Supervisor "Add repository" UI can't
 clone private repos):
 
 ```bash
-# Via the Advanced SSH & Web Terminal add-on (Protection Mode off)
+# Via the Advanced SSH & Web Terminal app (Protection Mode off)
 cd /addons
 git clone https://github.com/nstefanelli/hassio-access-control.git
 ```
 
-Then in HA: **Settings → Add-ons → Add-on Store → ⋮ → Reload**.
-The add-on appears under **Local add-ons**.
+Then in HA: **Settings → Apps → App Store → ⋮ → Reload**.
+The app appears under **Local apps**.
 
 ## Persistence
 
-All state lives in `/data/access_control.db` (SQLite with WAL). The
-volume survives add-on restarts and updates; Supervisor backups include
+All state lives in `/data/access_control.db` (SQLite + WAL). The
+volume survives app restarts and updates; Supervisor backups include
 `/data` automatically.
 
 ## Architecture and security
