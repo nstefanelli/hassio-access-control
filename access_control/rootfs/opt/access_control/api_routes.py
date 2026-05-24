@@ -21,6 +21,10 @@ def _require_scope(auth: dict, *allowed: str) -> None:
 @router.get("/health")
 async def health(request: Request, auth: dict = Depends(verify_api_key)):
     """System health status."""
+    # All scopes can read health — but require explicit allowlist rather
+    # than implicit acceptance, so a future scope can't accidentally see
+    # the health endpoint without an audit. (Audit 2026-05-24, M1.)
+    _require_scope(auth, "full", "read_only", "locks_only")
     app = request.app
     access = app.state.access_client
     ha = app.state.ha_client

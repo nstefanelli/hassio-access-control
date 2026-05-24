@@ -8,8 +8,8 @@ and WebSocket notifications from the UNVR console.
 import asyncio
 import json
 import logging
-import random
 import re
+import secrets
 import ssl
 from typing import Callable, List, Optional
 
@@ -126,13 +126,22 @@ class AccessClient:
                     if resp.status == 401:
                         self._auth_permanently_failed = True
                         text = await resp.text()
+                        # Log the raw response for diagnostics, but surface a
+                        # sanitized message to the user (the UI displays this
+                        # on the Settings page; future UniFi firmware could
+                        # include internal hostnames or version strings in
+                        # error bodies). Audit 2026-05-24, L1.
+                        logger.warning("UniFi login 401 — response body: %s", text[:500])
                         raise AccessClientError(
-                            f"Login failed with HTTP 401 (bad credentials): {text}"
+                            "UniFi rejected the credentials (HTTP 401). "
+                            "Double-check the service-account username + password."
                         )
                     if resp.status not in (200, 201):
                         text = await resp.text()
+                        logger.warning("UniFi login HTTP %d — response body: %s", resp.status, text[:500])
                         raise AccessClientError(
-                            f"Login failed with HTTP {resp.status}: {text}"
+                            f"UniFi returned HTTP {resp.status} during login. "
+                            "Check the app log for the full upstream response."
                         )
                     # Extract CSRF token — prefer the "updated" variant
                     token = (
@@ -603,7 +612,7 @@ class AccessClient:
             if self._running:
                 logger.info("WebSocket disconnected, reconnecting in %ds…", delay)
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, max_delay) * (0.75 + random.random() * 0.5)
+                delay = min(delay * 2, max_delay) * (0.75 + secrets.SystemRandom().random() * 0.5)
 
     async def _ws_connect(self) -> None:
         """

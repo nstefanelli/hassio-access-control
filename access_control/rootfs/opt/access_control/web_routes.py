@@ -1478,8 +1478,11 @@ async def _load_settings_context(request: Request, db, enc_key) -> dict:
         if raw:
             try:
                 access_username = decrypt_value(raw, enc_key)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Settings page falls back to a blank field if decryption
+                # fails (e.g. after secret_key rotation). Log at warning
+                # so a quiet failure mode is at least visible in the log.
+                logger.warning("Settings: could not decrypt access_username: %s", exc)
 
     ha = request.app.state.ha_client
     alarm_panels = await db.get_all_alarm_panels()
@@ -1489,8 +1492,11 @@ async def _load_settings_context(request: Request, db, enc_key) -> dict:
             ha_alarms = await ha.get_alarm_entities()
             existing_eids = {p["entity_id"] for p in alarm_panels}
             ha_alarms = [a for a in ha_alarms if a["entity_id"] not in existing_eids]
-        except Exception:
-            pass
+        except Exception as exc:
+            # HA may have temporarily dropped or returned an unexpected
+            # shape — Settings page renders with an empty alarm dropdown.
+            # Log for diagnostics.
+            logger.warning("Settings: could not fetch HA alarm entities: %s", exc)
 
     admin_log = await db.get_admin_log(50)
 
