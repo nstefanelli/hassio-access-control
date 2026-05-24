@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from .access_client import AccessClient, AccessClientError
 from .config import decrypt_value
 from .database import Database
-from .ha_client import HAClient, HAClientError
+from .ha_client import HAClient
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -137,22 +137,33 @@ class AuthEngine:
         user_groups = await self._db.get_user_groups(user_id)
         alarm_state = await self._get_alarm_state()
 
+        # Pre-compute schedule-active groups here (we previously only
+        # computed this below the alarm check). The `can_disarm` override
+        # below must only honor groups that are ACTIVE per their schedule —
+        # otherwise a Cleaner whose "Tue 10-2 disarm" group is out of
+        # schedule at 11 PM still bypasses an alarm-armed block from a
+        # different group. Audit 2026-05-24, clients-#8.
+        active_groups = [
+            g for g in user_groups
+            if not g.get("schedule_enabled") or self._check_schedule(g)
+        ]
+
         if alarm_state in ("triggered", "armed_away", "armed_home", "unknown"):
-            # Check if any group blocks this user, and whether a *separate* group grants disarm
-            # "triggered" and "unknown" are treated like armed — block users who would be blocked
+            # Block-when-armed always applies regardless of schedule (a
+            # blocking group blocks deny-first). can_disarm overrides only
+            # from schedule-active groups.
             any_blocking = any(
                 (alarm_state == "armed_away" and g.get("blocked_when_armed_away"))
                 or (alarm_state == "armed_home" and g.get("blocked_when_armed_home"))
                 or (alarm_state in ("triggered", "unknown") and (g.get("blocked_when_armed_away") or g.get("blocked_when_armed_home")))
                 for g in user_groups
             )
-            # can_disarm must come from a non-blocking group to override a block
             can_disarm = any(
                 g.get("can_disarm")
                 and not (alarm_state == "armed_away" and g.get("blocked_when_armed_away"))
                 and not (alarm_state == "armed_home" and g.get("blocked_when_armed_home"))
                 and not (alarm_state in ("triggered", "unknown") and (g.get("blocked_when_armed_away") or g.get("blocked_when_armed_home")))
-                for g in user_groups
+                for g in active_groups
             )
 
             if any_blocking and not can_disarm:
@@ -179,14 +190,8 @@ class AuthEngine:
         any_granted = False
         last_denied_reason = "No matching access rules"
 
-        # Filter groups by schedule — only active groups grant access
-        active_groups = []
-        for g in user_groups:
-            if g.get("schedule_enabled"):
-                if not self._check_schedule(g):
-                    _LOGGER.debug("Group '%s' outside schedule for user %s", g.get("name"), user_name)
-                    continue
-            active_groups.append(g)
+        # active_groups was already computed above (Step 3.5) so the
+        # can_disarm override could honor it. Re-using the same list here.
 
         group_all_locks = any(g.get("all_locks") for g in active_groups)
         group_lock_ids: set[int] = set()

@@ -11,11 +11,16 @@ class CircuitBreaker:
     """
     Circuit breaker with CLOSED / OPEN / HALF_OPEN states.
 
-    CLOSED: calls pass through; failure_threshold consecutive network
-            failures trips to OPEN.
-    OPEN:   calls blocked immediately; after recovery_timeout elapses
-            transitions to HALF_OPEN.
-    HALF_OPEN: one probe call allowed; success → CLOSED, failure → OPEN.
+    CLOSED:    calls pass through; failure_threshold consecutive network
+               failures trips to OPEN.
+    OPEN:      calls blocked immediately; after recovery_timeout elapses
+               transitions to HALF_OPEN.
+    HALF_OPEN: exactly ONE probe call allowed at a time. While that probe
+               is in flight, additional concurrent callers see the
+               breaker as open (per `is_open()`) and bail. Audit
+               2026-05-24, clients-#9: without this guard, two
+               coroutines calling `_call_service` during HALF_OPEN could
+               both observe state=HALF_OPEN and both probe.
     """
 
     CLOSED = "closed"
@@ -34,20 +39,34 @@ class CircuitBreaker:
         self._state = self.CLOSED
         self._failures = 0
         self._opened_at: float = 0.0
+        # True between the moment a HALF_OPEN probe is dispatched and the
+        # moment `record_success` / `record_failure` resolves its outcome.
+        # Additional callers observing HALF_OPEN while this flag is set
+        # are treated as blocked.
+        self._probe_in_flight = False
 
     @property
     def state(self) -> str:
         return self._state
 
     def is_open(self) -> bool:
-        """Return True if the call should be blocked."""
+        """Return True if the call should be blocked.
+
+        Side effect: if state is OPEN and the recovery window has elapsed,
+        transitions to HALF_OPEN and reserves the probe slot for the
+        caller (sets `_probe_in_flight`). The caller MUST follow up with
+        either `record_success()` or `record_failure()`.
+        """
         if self._state == self.CLOSED:
             return False
         if self._state == self.HALF_OPEN:
-            return False  # allow probe
+            # Concurrent caller arriving during an in-flight probe is
+            # blocked. The probing caller's record_* call will release.
+            return self._probe_in_flight
         # OPEN: check if recovery window has elapsed
         if time.monotonic() - self._opened_at >= self._recovery_timeout:
             self._state = self.HALF_OPEN
+            self._probe_in_flight = True
             _LOGGER.info("Circuit %s: OPEN → HALF_OPEN (probe allowed)", self.name)
             return False
         return True
@@ -57,6 +76,7 @@ class CircuitBreaker:
             _LOGGER.info("Circuit %s: HALF_OPEN → CLOSED", self.name)
         self._state = self.CLOSED
         self._failures = 0
+        self._probe_in_flight = False
 
     def record_failure(self) -> None:
         self._failures += 1
@@ -72,4 +92,5 @@ class CircuitBreaker:
             self._opened_at = time.monotonic()
             _LOGGER.warning("Circuit %s: HALF_OPEN → OPEN (probe failed)", self.name)
             self._state = self.OPEN
+            self._probe_in_flight = False
         # If already OPEN, do NOT reset _opened_at — let the recovery timer tick

@@ -375,9 +375,17 @@ class FakeAccessClient:
 class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_setup_initializes_runtime(self) -> None:
         db = FakeDB()
+        # First-run setup: admin_username must be unset so the C1 guard
+        # (audit 2026-05-24) doesn't refuse with 404. Also: setup_post
+        # now checks the rate limit before doing real work — return
+        # not-limited.
+        db.get_config = AsyncMock(return_value=None)
+        db.is_rate_limited = AsyncMock(return_value=False)
+        db.record_rate_limit_failure = AsyncMock()
         request = SimpleNamespace(
             scope={},
             state=SimpleNamespace(),
+            client=SimpleNamespace(host="127.0.0.1"),
             app=SimpleNamespace(
                 state=SimpleNamespace(
                     db=db,
@@ -409,6 +417,40 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
         request.app.state.initialize_configured_state.assert_awaited_once()
         db.add_api_key.assert_awaited_once()
         self.assertIn(("admin_username", "admin"), db.config_values)
+
+    async def test_setup_post_refuses_when_already_configured(self) -> None:
+        """Audit 2026-05-24, C1: after first-run, /setup POST must refuse.
+
+        Without this guard a network-reachable attacker (or a malicious
+        HA admin via ingress) could re-run setup, overwrite admin
+        credentials, and rotate the encryption_salt — orphaning every
+        previously-encrypted UNVR/HA token and visitor PIN.
+        """
+        from fastapi import HTTPException
+        db = FakeDB()
+        # Simulate post-first-run state: admin_username is already set.
+        db.get_config = AsyncMock(return_value="admin")
+        db.is_rate_limited = AsyncMock(return_value=False)
+        request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
+            client=SimpleNamespace(host="1.2.3.4"),
+            app=SimpleNamespace(state=SimpleNamespace(db=db, configured=True)),
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            await web_routes.setup_post(
+                request,
+                admin_username="attacker",
+                admin_password="hijack",
+                unvr_host="evil.example",
+                unvr_username="x",
+                unvr_password="x",
+                ha_url="http://evil/",
+                ha_token="x",
+            )
+        self.assertEqual(ctx.exception.status_code, 404)
+        # No config writes should have happened on the rejected attempt.
+        self.assertNotIn(("admin_username", "attacker"), db.config_values)
 
     async def test_login_post_sets_session_cookie(self) -> None:
         web_auth.SECRET_KEY = "test-secret"

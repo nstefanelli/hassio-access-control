@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import aiosqlite
+
+_LOGGER = logging.getLogger(__name__)
 
 DB_PATH = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent / "data"))) / "access_control.db"
 
@@ -175,6 +178,25 @@ CREATE INDEX IF NOT EXISTS idx_ui_cache_expires_at ON ui_cache(expires_at);
 
 def _row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
     return dict(row)
+
+
+def _utc_now_sqlite() -> str:
+    """
+    Produce a UTC timestamp string compatible with SQLite's `datetime('now')`.
+
+    Audit 2026-05-24, db-#4: The schema defaults use SQLite's
+    `datetime('now')` which returns `YYYY-MM-DD HH:MM:SS` (space-
+    separated, no timezone suffix, no microseconds). Previous Python
+    writes used `datetime.now(timezone.utc).isoformat()` which produces
+    `YYYY-MM-DDTHH:MM:SS.ffffff+00:00`. Lexically these two formats sort
+    against each other incorrectly (space < 'T'), so any range query
+    (`prune_logs`, the `since` filter in `get_filtered_log`) gives wrong
+    results when the column contains a mix.
+
+    Returns the same format the schema defaults produce so the column
+    stays consistent and range queries are correct.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 class Database:
@@ -436,7 +458,7 @@ class Database:
     ) -> int:
         """Insert or update a user by ulp_id. Returns the row id."""
         if synced_at is None:
-            synced_at = datetime.now(timezone.utc).isoformat()
+            synced_at = _utc_now_sqlite()
         await self._db.execute(
             """
             INSERT INTO users (ulp_id, name, email, status, synced_at)
@@ -457,23 +479,30 @@ class Database:
             return row["id"]
 
     async def mark_deleted_users(self, active_ulp_ids: list[str]) -> int:
-        """Mark users not in active_ulp_ids as deleted_upstream. Returns count."""
+        """Mark users not in active_ulp_ids as deleted_upstream. Returns count.
+
+        Audit 2026-05-24, db-#3: an empty `active_ulp_ids` from a failed
+        upstream sync (UniFi returns []) used to mark every local user
+        as deleted. Now refuse the empty case explicitly — callers can
+        still pass `[""]` or a real list. If a real sync ever needs to
+        deactivate everyone, it must call with a known sentinel.
+        """
         if not active_ulp_ids:
-            cursor = await self._db.execute(
-                "UPDATE users SET status = 'deleted_upstream'"
-                " WHERE status != 'deleted_upstream'"
+            _LOGGER.warning(
+                "mark_deleted_users called with empty list — refusing to mass-delete. "
+                "Likely an upstream sync error; check UniFi Access connection."
             )
-        else:
-            # `placeholders` is a comma-joined string of `?` literals,
-            # NOT user input. Values flow through aiosqlite parameter
-            # binding via `active_ulp_ids`. Bandit B608 false positive.
-            placeholders = ",".join("?" * len(active_ulp_ids))
-            cursor = await self._db.execute(
-                f"UPDATE users SET status = 'deleted_upstream'"
-                f" WHERE ulp_id NOT IN ({placeholders})"
-                f"   AND status != 'deleted_upstream'",  # nosec B608 — placeholders only
-                active_ulp_ids,
-            )
+            return 0
+        # `placeholders` is a comma-joined string of `?` literals,
+        # NOT user input. Values flow through aiosqlite parameter
+        # binding via `active_ulp_ids`. Bandit B608 false positive.
+        placeholders = ",".join("?" * len(active_ulp_ids))
+        cursor = await self._db.execute(
+            f"UPDATE users SET status = 'deleted_upstream'"
+            f" WHERE ulp_id NOT IN ({placeholders})"
+            f"   AND status != 'deleted_upstream'",  # nosec B608 — placeholders only
+            active_ulp_ids,
+        )
         await self._db.commit()
         return cursor.rowcount
 
@@ -625,7 +654,7 @@ class Database:
         schedule_start: Optional[str] = None,
         schedule_end: Optional[str] = None,
     ) -> int:
-        now = datetime.now(timezone.utc).isoformat()
+        now = _utc_now_sqlite()
         cursor = await self._db.execute(
             """
             INSERT INTO access_rules
@@ -658,7 +687,7 @@ class Database:
         schedule_start: Optional[str] = None,
         schedule_end: Optional[str] = None,
     ) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = _utc_now_sqlite()
         await self._db.execute(
             """
             UPDATE access_rules SET
@@ -702,7 +731,7 @@ class Database:
         lock_name: Optional[str] = None,
         reason: Optional[str] = None,
     ) -> int:
-        now = datetime.now(timezone.utc).isoformat()
+        now = _utc_now_sqlite()
         cursor = await self._db.execute(
             """
             INSERT INTO access_log
@@ -773,7 +802,7 @@ class Database:
     async def add_api_key(
         self, name: str, key_hash: str, scope: str = "full"
     ) -> int:
-        now = datetime.now(timezone.utc).isoformat()
+        now = _utc_now_sqlite()
         cursor = await self._db.execute(
             "INSERT INTO api_keys (name, key_hash, created_at, scope) VALUES (?, ?, ?, ?)",
             (name, key_hash, now, scope),

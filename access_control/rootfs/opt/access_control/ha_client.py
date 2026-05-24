@@ -1,9 +1,18 @@
 """Home Assistant REST API client for lock control."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import aiohttp
+
+# Every `except` block that handles an HA REST call below catches both
+# `aiohttp.ClientError` AND `asyncio.TimeoutError`. The latter is NOT a
+# subclass of ClientError in aiohttp 3.x; without catching it
+# explicitly, a TimeoutError would bypass `_circuit.record_failure()`
+# and the circuit-breaker's `_probe_in_flight` slot (HALF_OPEN guard)
+# would stay reserved forever → permanent wedge. Audit 2026-05-24
+# (codebase review), final-pass finding.
 
 from .circuit_breaker import CircuitBreaker
 
@@ -66,7 +75,7 @@ class HAClient:
                 self._connected = False
                 self._last_error = f"HTTP {resp.status}"
                 return False
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             self._connected = False
             self._last_error = str(err)
             return False
@@ -113,7 +122,7 @@ class HAClient:
                                   entity_id, domain, service, resp.status)
                 self._circuit.record_success()
                 return resp.status == 200
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.error("HA request failed: %s", err)
             self._last_error = str(err)
             self._circuit.record_failure()
@@ -143,7 +152,7 @@ class HAClient:
                     _LOGGER.warning("HA get_entity_state %s returned HTTP %s", entity_id, resp.status)
                 self._circuit.record_success()  # HA responded — not a network failure
                 return None
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.warning("HA get_entity_state %s failed: %s", entity_id, err)
             self._last_error = str(err)
             self._circuit.record_failure()
@@ -167,7 +176,7 @@ class HAClient:
                     return []
                 states = await resp.json()
                 self._circuit.record_success()
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.warning("HA get_lock_entities failed: %s", err)
             self._circuit.record_failure()
             return []
@@ -204,7 +213,7 @@ class HAClient:
                     return []
                 states = await resp.json()
                 self._circuit.record_success()
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.warning("HA get_camera_entities failed: %s", err)
             self._circuit.record_failure()
             return []
@@ -241,7 +250,7 @@ class HAClient:
                     return []
                 states = await resp.json()
                 self._circuit.record_success()
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.warning("HA get_alarm_entities failed: %s", err)
             self._circuit.record_failure()
             return []
@@ -297,7 +306,7 @@ class HAClient:
                 if resp.status != 200:
                     _LOGGER.warning("HA fire_event %s returned HTTP %s", event_type, resp.status)
                 return resp.status == 200
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.warning("HA fire_event %s failed: %s", event_type, err)
             self._circuit.record_failure()
             return False

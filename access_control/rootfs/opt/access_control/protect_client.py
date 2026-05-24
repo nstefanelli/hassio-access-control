@@ -40,6 +40,9 @@ class ProtectClient:
         self._last_event_at: float = 0.0
         self._reconnect_count: int = 0
 
+        # See AccessClient.__init__ for the full TLS-trust trade-off
+        # discussion. Short version: UNVR ships self-signed certs; we
+        # don't verify them; LAN trust is assumed. Audit 2026-05-24, clients-#5.
         self._ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         self._ssl_ctx.check_hostname = False
         self._ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -84,14 +87,14 @@ class ProtectClient:
                     text = await resp.text()
                     # Sanitize the user-facing message; log the raw response
                     # body for diagnostics only. Audit 2026-05-24, L1.
-                    logger.warning("Protect login 401 — response body: %s", text[:500])
+                    _LOGGER.warning("Protect login 401 — response body: %s", text[:500])
                     raise RuntimeError(
                         "UniFi Protect rejected the credentials (HTTP 401). "
                         "Double-check the service-account username + password."
                     )
                 if resp.status not in (200, 201):
                     text = await resp.text()
-                    logger.warning("Protect login HTTP %d — response body: %s", resp.status, text[:500])
+                    _LOGGER.warning("Protect login HTTP %d — response body: %s", resp.status, text[:500])
                     raise RuntimeError(
                         f"UniFi Protect returned HTTP {resp.status} during login. "
                         "Check the app log for the full upstream response."
@@ -177,8 +180,9 @@ class ProtectClient:
         self._ws_connected = False
 
     async def _ws_loop(self) -> None:
-        delay = WS_RECONNECT_DELAY
-        max_delay = 300
+        delay: float = float(WS_RECONNECT_DELAY)
+        max_delay: float = 300.0
+        ws_401_count = 0  # consecutive WS-upgrade 401s; see _ws_connect
 
         while self._running:
             if self._auth_permanently_failed:
@@ -187,11 +191,29 @@ class ProtectClient:
             try:
                 await self._ws_connect()
                 self._reconnect_count += 1  # connection closed normally, will reconnect
-                delay = WS_RECONNECT_DELAY
+                delay = float(WS_RECONNECT_DELAY)
+                ws_401_count = 0  # successful connect — reset the counter
             except asyncio.CancelledError:
                 break
+            except aiohttp.ClientResponseError as exc:
+                if exc.status == 401:
+                    # Persistent WS 401s indicate something stuck server-side
+                    # (token reuse against a moved endpoint, attacker echoing
+                    # 401s, etc.). Bound the retry storm — after N consecutive
+                    # WS 401s, stop reconnecting and stop reposting the
+                    # service-account password. Audit 2026-05-24, clients-#6.
+                    ws_401_count += 1
+                    if ws_401_count >= 5:
+                        _LOGGER.error(
+                            "Protect WS returned 401 %d times in a row — refusing "
+                            "to continue. Re-enter credentials in Settings to clear.",
+                            ws_401_count,
+                        )
+                        self._auth_permanently_failed = True
+                        break
+                _LOGGER.exception("Protect WS error — retry in %.0fs", delay)
             except Exception:
-                _LOGGER.exception("Protect WS error — retry in %ds", delay)
+                _LOGGER.exception("Protect WS error — retry in %.0fs", delay)
             finally:
                 self._ws_connected = False
 
