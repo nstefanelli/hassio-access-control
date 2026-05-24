@@ -1,0 +1,7 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/nstefanelli/hassio-access-control/security/advisories/new
+    about: >-
+      For security issues, please use GitHub Private Vulnerability Reporting
+      instead of a public issue. See SECURITY.md for details.
