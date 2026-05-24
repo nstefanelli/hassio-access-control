@@ -32,7 +32,7 @@ jobs:
     name: yamllint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: frenck/action-yamllint@v1.5.0
 
   hadolint:
@@ -42,8 +42,8 @@ jobs:
       matrix:
         addon: [access_control]
     steps:
-      - uses: actions/checkout@v4
-      - uses: hadolint/hadolint-action@v3.1.0
+      - uses: actions/checkout@v6
+      - uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: ${{ matrix.addon }}/Dockerfile
 
@@ -51,7 +51,7 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: ludeeus/action-shellcheck@2.0.0
         env:
           SHELLCHECK_OPTS: "-e SC1008 -s bash"
@@ -69,8 +69,8 @@ jobs:
       matrix:
         addon: [access_control]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -94,7 +94,7 @@ jobs:
       changed_addons: ${{ steps.detect.outputs.addons }}
       changed: ${{ steps.detect.outputs.changed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Detect changed apps
@@ -173,7 +173,7 @@ jobs:
           - amd64
           - aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Read app metadata
         id: meta
@@ -186,7 +186,7 @@ jobs:
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -194,7 +194,7 @@ jobs:
 
       - name: Build app (PR test)
         if: github.event_name == 'pull_request'
-        uses: home-assistant/builder@2024.08.2
+        uses: home-assistant/builder@2026.03.2
         with:
           args: |
             --${{ matrix.arch }} \
@@ -206,7 +206,7 @@ jobs:
 
       - name: Build & publish app
         if: github.event_name != 'pull_request'
-        uses: home-assistant/builder@2024.08.2
+        uses: home-assistant/builder@2026.03.2
         with:
           args: |
             --${{ matrix.arch }} \
