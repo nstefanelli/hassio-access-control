@@ -13,8 +13,12 @@ on:
     branches:
       - main
     paths:
+      # Only trigger on version bump. CHANGELOG-only edits don't need a
+      # workflow run — the awk extraction reads from disk at job time, so
+      # the latest CHANGELOG.md is always picked up alongside an actual
+      # version change. Adding CHANGELOG.md here would cause noisy "no
+      # section found" runs on retroactive note edits.
       - access_control/config.yaml
-      - access_control/CHANGELOG.md
   workflow_dispatch:
 
 permissions:
