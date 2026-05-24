@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import random
+import secrets
 import re
 import ssl
 import struct
@@ -82,10 +82,20 @@ class ProtectClient:
                 if resp.status == 401:
                     self._auth_permanently_failed = True
                     text = await resp.text()
-                    raise RuntimeError(f"Protect login failed: HTTP 401 (bad credentials): {text}")
+                    # Sanitize the user-facing message; log the raw response
+                    # body for diagnostics only. Audit 2026-05-24, L1.
+                    logger.warning("Protect login 401 — response body: %s", text[:500])
+                    raise RuntimeError(
+                        "UniFi Protect rejected the credentials (HTTP 401). "
+                        "Double-check the service-account username + password."
+                    )
                 if resp.status not in (200, 201):
                     text = await resp.text()
-                    raise RuntimeError(f"Protect login failed: HTTP {resp.status}: {text}")
+                    logger.warning("Protect login HTTP %d — response body: %s", resp.status, text[:500])
+                    raise RuntimeError(
+                        f"UniFi Protect returned HTTP {resp.status} during login. "
+                        "Check the app log for the full upstream response."
+                    )
                 self._csrf_token = (
                     resp.headers.get("X-Updated-CSRF-Token")
                     or resp.headers.get("X-CSRF-Token")
@@ -187,7 +197,7 @@ class ProtectClient:
 
             if self._running:
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, max_delay) * (0.75 + random.random() * 0.5)
+                delay = min(delay * 2, max_delay) * (0.75 + secrets.SystemRandom().random() * 0.5)
 
     async def _ws_connect(self) -> None:
         if not self.connected:

@@ -77,4 +77,9 @@ exec python3 -m uvicorn access_control.main:app \
     --log-level "${LOG_LEVEL}" \
     --no-server-header \
     --proxy-headers \
-    --forwarded-allow-ips='*'
+    --forwarded-allow-ips='127.0.0.1,172.30.32.2'
+# `--forwarded-allow-ips` lists IPs we trust to set X-Forwarded-For. Under
+# HA Ingress the only upstream is Supervisor's proxy on the hassio Docker
+# bridge (typically 172.30.32.2 / 172.30.32.0/23). We trust 127.0.0.1 too
+# for local docker testing. Trusting '*' would let an attacker rotate XFF
+# per request to evade rate limits — see Audit 2026-05-24, M2.

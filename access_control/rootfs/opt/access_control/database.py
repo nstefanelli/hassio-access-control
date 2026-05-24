@@ -404,6 +404,8 @@ class Database:
 
     async def get_all_users(self, include_hidden: bool = False) -> list[dict[str, Any]]:
         """Return all users with an additional rule_count column."""
+        # `where` is a hardcoded literal chosen by an internal bool, NOT
+        # user input. Bandit B608 false positive suppressed below.
         where = "" if include_hidden else "WHERE u.hidden = 0"
         async with self._db.execute(
             f"""
@@ -413,7 +415,7 @@ class Database:
             {where}
             GROUP BY u.id
             ORDER BY u.name
-            """
+            """  # nosec B608 — `where` is a literal
         ) as cursor:
             rows = await cursor.fetchall()
             return [_row_to_dict(r) for r in rows]
@@ -462,11 +464,14 @@ class Database:
                 " WHERE status != 'deleted_upstream'"
             )
         else:
+            # `placeholders` is a comma-joined string of `?` literals,
+            # NOT user input. Values flow through aiosqlite parameter
+            # binding via `active_ulp_ids`. Bandit B608 false positive.
             placeholders = ",".join("?" * len(active_ulp_ids))
             cursor = await self._db.execute(
                 f"UPDATE users SET status = 'deleted_upstream'"
                 f" WHERE ulp_id NOT IN ({placeholders})"
-                f"   AND status != 'deleted_upstream'",
+                f"   AND status != 'deleted_upstream'",  # nosec B608 — placeholders only
                 active_ulp_ids,
             )
         await self._db.commit()
@@ -748,11 +753,14 @@ class Database:
             conditions.append("timestamp >= ?")
             params.append(since)
 
+        # `conditions` only ever contains hardcoded fragments like
+        # `result = ?` / `timestamp >= ?` (built above this line); the
+        # actual values are bound via `params`. Bandit B608 false positive.
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         params.append(limit)
 
         async with self._db.execute(
-            f"SELECT * FROM access_log {where} ORDER BY timestamp DESC LIMIT ?",
+            f"SELECT * FROM access_log {where} ORDER BY timestamp DESC LIMIT ?",  # nosec B608 — hardcoded fragments
             params,
         ) as cursor:
             rows = await cursor.fetchall()
@@ -957,9 +965,14 @@ class Database:
         """Return entry devices grouped by lock_id for the given locks."""
         if not lock_ids:
             return {}
+        # `placeholders` is a comma-joined string of `?` literals (one per
+        # element), NOT user input. Values flow through aiosqlite's
+        # parameter binding via `lock_ids`. Bandit B608 can't see this
+        # through the f-string; the in-line suppression below acknowledges
+        # that.
         placeholders = ",".join("?" for _ in lock_ids)
         async with self._db.execute(
-            f"SELECT * FROM entry_devices WHERE lock_id IN ({placeholders}) ORDER BY lock_id, name",
+            f"SELECT * FROM entry_devices WHERE lock_id IN ({placeholders}) ORDER BY lock_id, name",  # nosec B608
             lock_ids,
         ) as cur:
             rows = await cur.fetchall()
@@ -1374,18 +1387,21 @@ class Database:
 
     async def prune_logs(self, retain_days: int = 90) -> dict[str, int]:
         """Delete access_log and admin_log rows older than retain_days. Returns counts."""
-        # Clamp retain_days to safe range to make the f-string injection-safe.
+        # `days` is cast to int and clamped to >= 1, so `cutoff_sql` only
+        # ever contains a SQLite datetime expression with an integer
+        # literal. Bandit B608 can't see through the f-string; the in-line
+        # suppressions below acknowledge that.
         days = max(1, int(retain_days))
         cutoff_sql = f"datetime('now', '-{days} days')"
         result: dict[str, int] = {"access_log": 0, "admin_log": 0}
 
         async with self._db.execute(
-            f"DELETE FROM access_log WHERE timestamp < {cutoff_sql}"
+            f"DELETE FROM access_log WHERE timestamp < {cutoff_sql}"  # nosec B608
         ) as cur:
             result["access_log"] = cur.rowcount or 0
 
         async with self._db.execute(
-            f"DELETE FROM admin_log WHERE timestamp < {cutoff_sql}"
+            f"DELETE FROM admin_log WHERE timestamp < {cutoff_sql}"  # nosec B608
         ) as cur:
             result["admin_log"] = cur.rowcount or 0
 
