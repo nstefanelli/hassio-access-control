@@ -31,7 +31,7 @@
         <tr class="text-gray-400 hover:bg-gray-800/30 transition-colors">
           <td class="py-1.5 font-mono text-xs whitespace-nowrap">{{ entry.timestamp[:16].replace('T', ' ') }}</td>
           <td class="py-1.5">{{ entry.user_name or '—' }}</td>
-          <td class="py-1.5 hidden sm:table-cell capitalize">{{ entry.method or '—' }}</td>
+          <td class="py-1.5 hidden sm:table-cell">{{ entry.method|credential_label }}</td>
           <td class="py-1.5">
             {% if entry.result == 'granted' %}
             <span class="badge-granted">granted</span>

@@ -42,6 +42,48 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
+
+# --- Jinja filters --------------------------------------------------------
+
+# Map raw credential / method strings (from UniFi event payloads + our
+# legacy paths) to human-readable display labels. Used by the Activity
+# Log and per-lock history pages so values render as `NFC` / `PIN` /
+# `Face` instead of `Nfc` / `Pin_code` / `Face`.
+_CREDENTIAL_LABELS: dict[str, str] = {
+    "nfc": "NFC",
+    "pin_code": "PIN",
+    "pin": "PIN",
+    "face": "Face",
+    "fingerprint": "Fingerprint",
+    "remote_unlock": "Remote unlock",
+    "device_auth": "Device auth",
+    "buzz": "Buzz",
+    "manual": "Manual",
+}
+
+
+def _credential_label(value: str | None) -> str:
+    """Display label for a credential / authentication method.
+
+    Unknown values fall back to a title-cased version of the raw string,
+    with underscores swapped for spaces — so a new UniFi method we don't
+    know about still renders reasonably.
+    """
+    if not value:
+        return "—"
+    key = str(value).strip().lower()
+    if key in _CREDENTIAL_LABELS:
+        return _CREDENTIAL_LABELS[key]
+    return str(value).replace("_", " ").strip().title()
+
+
+try:
+    templates.env.filters["credential_label"] = _credential_label
+except AttributeError:
+    # Test suites that stub fastapi.templating with a minimal class won't
+    # have an `env` attribute. Production Jinja2Templates always does.
+    pass
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -114,7 +156,7 @@ async def _render(template: str, request: Request, context: dict) -> HTMLRespons
     context["csrf_token"] = generate_csrf_token(effective_user) if effective_user else ""
     _inject_ingress_context(request, context)
 
-    response = templates.TemplateResponse(template, context)
+    response = templates.TemplateResponse(request, template, context)
     if user:
         refresh_session_cookie(response, request, user)
     return response
@@ -160,6 +202,7 @@ async def login_get(request: Request):
     if get_session_user(request) or getattr(request.state, "ingress_user", None):
         return _redirect(request, "/")
     return templates.TemplateResponse(
+        request,
         "login.html",
         _inject_ingress_context(request, {"request": request, "page": "login", "error": None}),
     )
@@ -176,7 +219,8 @@ async def login_post(
     db = request.app.state.db
     if await db.is_rate_limited("login", client_ip):
         return templates.TemplateResponse(
-            "login.html",
+        request,
+        "login.html",
             _inject_ingress_context(request, {"request": request, "error": "Too many failed attempts. Try again in 60 seconds."}),
             status_code=429,
         )
@@ -192,7 +236,8 @@ async def login_post(
     ):
         await db.record_rate_limit_failure("login", client_ip, **_LOGIN_RATE_LIMIT)
         return templates.TemplateResponse(
-            "login.html",
+        request,
+        "login.html",
             _inject_ingress_context(request, {
                 "request": request,
                 "page": "login",
@@ -220,6 +265,7 @@ async def setup_get(request: Request):
     if await db.get_config("admin_username") is not None:
         return _redirect(request, "/login")
     return templates.TemplateResponse(
+        request,
         "setup.html",
         _inject_ingress_context(request, {"request": request, "page": "setup", "error": None}),
     )
@@ -228,8 +274,8 @@ async def setup_get(request: Request):
 @router.post("/setup", response_class=HTMLResponse)
 async def setup_post(
     request: Request,
-    admin_username: str = Form(...),
-    admin_password: str = Form(...),
+    admin_username: str = Form(""),
+    admin_password: str = Form(""),
     unvr_host: str = Form(...),
     unvr_username: str = Form(...),
     unvr_password: str = Form(...),
@@ -241,10 +287,25 @@ async def setup_post(
 
     def _render_error(error: str) -> HTMLResponse:
         return templates.TemplateResponse(
-            "setup.html",
+        request,
+        "setup.html",
             _inject_ingress_context(request, {"request": request, "page": "setup", "error": error}),
             status_code=422,
         )
+
+    # Under HA SSO, the admin user is auto-created from the HA account
+    # signed into Supervisor — the legacy username/password fields are
+    # hidden in the template and unused thereafter. Generate a random
+    # password so the admin_password_hash row exists (downstream code
+    # assumes it does) but make it unreachable: /login is unreachable
+    # under ingress-only deployments, and SSO bypasses it anyway.
+    ingress_user = getattr(request.state, "ingress_user", None)
+    if ingress_user:
+        import secrets as _secrets
+        admin_username = ingress_user.get("name") or f"ha-{(ingress_user.get('id') or '')[:8]}"
+        admin_password = _secrets.token_urlsafe(48)
+    elif not admin_username or not admin_password:
+        return _render_error("Admin username and password are required.")
 
     # 1. Test UNVR connection
     access_client = AccessClient(unvr_host, unvr_username, unvr_password)

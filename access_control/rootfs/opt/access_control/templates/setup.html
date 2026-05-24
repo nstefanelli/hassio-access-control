@@ -36,7 +36,17 @@
 
     <form method="post" action="setup" class="space-y-6">
 
-      <!-- Admin Account -->
+      {% if ingress_active %}
+      <!-- Admin Account is auto-created from HA SSO. -->
+      <div class="card">
+        <div class="section-heading" style="margin-bottom:1rem;">Admin Account</div>
+        <p style="font-size:0.875rem; color:var(--text-secondary); margin:0;">
+          You're signed in via Home Assistant Single Sign-On. Your HA admin account
+          will be linked automatically — no separate password to manage here.
+        </p>
+      </div>
+      {% else %}
+      <!-- Admin Account (direct-port deployments only) -->
       <div class="card">
         <div class="section-heading" style="margin-bottom:1rem;">Admin Account</div>
         <div class="space-y-4">
@@ -50,6 +60,7 @@
           </div>
         </div>
       </div>
+      {% endif %}
 
       <!-- UNVR Console -->
       <div class="card">
