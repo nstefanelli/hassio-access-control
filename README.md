@@ -92,6 +92,16 @@ outage doesn't turn into a flood of failed requests. A scheduled-reboot
 timer cycles the app weekly if you want it, skipping the reboot if there's
 been a door event in the last 5 minutes.
 
+## Requirements
+
+| Requirement | Notes |
+|---|---|
+| **Home Assistant with Supervisor** | HAOS (Home Assistant Operating System) or Home Assistant Supervised on Debian. **HA Container is not supported** — it doesn't run Supervisor, so the app's API proxy and ingress routing don't exist. |
+| **UniFi Console** | A UDM / UDM-Pro / UDM-SE / UCG / UNVR running both **UniFi Access** and **UniFi Protect** applications. Split-console (Access on one, Protect on another) is also supported. |
+| **HA admin role** | The dashboard is admin-only via HA's SSO. Non-admin HA users get a 403. Promote household members to admin in HA's user settings if you want them to see the dashboard. |
+| **At least one HA lock or alarm entity** | Any `lock.*` entity HA can control (Aqara via Zigbee, Z-Wave, August, etc.) and optionally an `alarm_control_panel.*`. |
+| **G6 Entry Pro or other UniFi reader** *(recommended, not required)* | The app works with any UniFi Access setup but is most valuable with the G6's multi-credential events (face, NFC, PIN, fingerprint). |
+
 ## Install
 
 ### Add this repository to your HA app store

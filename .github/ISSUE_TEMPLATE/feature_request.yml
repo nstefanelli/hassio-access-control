@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest a new capability or improvement.
+title: "[feat] "
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What would you like to see?
+      description: Describe the capability you're imagining.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why?
+      description: |
+        What problem does this solve, or what does it unlock for you?
+        Concrete scenarios help a lot.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: |
+        Any workarounds, related HA integrations, or other approaches you
+        looked at — and why they didn't fit.
+    validations:
+      required: false

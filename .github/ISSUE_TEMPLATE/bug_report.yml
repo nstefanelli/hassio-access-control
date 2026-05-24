@@ -1,0 +1,73 @@
+name: Bug report
+description: Something's broken — file a report so it can be fixed.
+title: "[bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report.
+
+        **For security issues, please don't use this form.** See
+        [SECURITY.md](https://github.com/nstefanelli/hassio-access-control/blob/main/SECURITY.md)
+        for the private reporting channel instead.
+
+  - type: input
+    id: app-version
+    attributes:
+      label: Access Control version
+      description: Found on the app page in Home Assistant, or in `access_control/config.yaml`.
+      placeholder: "1.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: ha-version
+    attributes:
+      label: Home Assistant version
+      description: Settings → About in HA.
+      placeholder: "2026.5.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options:
+        - HAOS (Home Assistant Operating System)
+        - HA Supervised on Debian
+        - Other (please describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, and what did you see?
+      placeholder: |
+        1. Clicked "Buzz" on the Front Door card
+        2. Expected lock to relock after 30s
+        3. Lock stayed unlocked
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-expected
+    attributes:
+      label: What did you expect?
+      description: What should have happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / screenshots
+      description: |
+        Paste relevant log lines from the app's Supervisor log tab, or
+        attach screenshots. Redact any tokens or credentials before pasting.
+      render: text
+    validations:
+      required: false
