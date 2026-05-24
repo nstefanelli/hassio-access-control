@@ -4,6 +4,169 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-05-24
+
+A consolidation release covering the post-v1.1.0 hardening work: a full
+security audit closed 22 dependency CVEs and two Medium-severity code
+issues; a codebase-wide quality + security review fixed 19 more
+findings (3 Critical, 7 High, 9 Medium); CI gained Bandit + pip-audit
+gates; the in-app UI got several SSO-aware refinements.
+
+### Security
+
+- **CRITICAL**: `/setup` POST now hard-refuses (HTTP 404) once
+  first-run is complete. Previously, anyone able to reach the
+  dashboard URL could re-submit `/setup` and overwrite admin
+  credentials + rotate the encryption salt, orphaning every
+  previously-encrypted UNVR/HA token and visitor PIN. Under HA Ingress
+  this was reachable by any HA admin via the new SSO auto-admin flow;
+  under direct-port deployments by anyone on the LAN.
+- **CRITICAL**: `/setup` POST is now rate-limited (3 attempts /
+  5 min per IP, 5 min lockout). Closes brute-forcing UNVR or HA
+  credentials by repeated setup submissions.
+- **CSRF middleware now trusts SSO identity.** Before this release,
+  the middleware looked only at the session cookie — under HA Ingress
+  (where there is no cookie) it was effectively a no-op, leaving
+  per-route `Depends(require_csrf)` as the sole defense. Now binds to
+  the same `ha:<X-Remote-User-Name>` identity that `require_login`
+  returns.
+- **CSRF middleware caps body at 1 MiB** and rejects chunked
+  Transfer-Encoding without a `Content-Length` header. Previously,
+  `await request.body()` would buffer an arbitrarily-large POST,
+  enabling OOM via an authenticated session.
+- **WebSocket 401 storm protection.** Both `access_client` and
+  `protect_client` now count consecutive WS-upgrade 401s; after 5 in
+  a row, `_auth_permanently_failed` is set and reconnect stops.
+  Closes a credential-replay storm against a stuck (or
+  attacker-echoing) WS endpoint.
+- **`/api/health` now enforces an explicit API-key scope guard.**
+  Previously implicit "any valid key" — including narrow `locks_only`
+  keys — could read connection state, user count, and lock count.
+- **`uvicorn --forwarded-allow-ips`** locked to `127.0.0.1` +
+  Supervisor's `hassio` bridge IP. Was previously `*`, which let
+  X-Forwarded-For spoofing evade the login (5/5 min) and API (10/5
+  min) rate-limit lockouts in direct-port deployments.
+- **Sanitized upstream error surfaces** — UniFi Access, UniFi Protect,
+  and Home Assistant connection failures no longer echo raw exception
+  strings to the Settings page. Full text is logged at warning level
+  for diagnostics.
+- **TLS-validation trade-off documented inline** on both WebSocket
+  clients. UNVR self-signed certs mean cert verification is OFF;
+  rationale + mitigations (LAN trust assumption, WS-401 storm cap)
+  documented in `access_client.py` / `protect_client.py`.
+- **22 dependency CVEs closed** via version bumps:
+  - `fastapi` 0.115.0 → 0.136.3 (transitively bumps `starlette` to
+    1.1.0, closing PYSEC-2026-161 Host-header path bypass +
+    CVE-2024-47874, CVE-2025-54121, CVE-2025-62727)
+  - `aiohttp` 3.10.0 → 3.13.4 (6 CVEs)
+  - `jinja2` 3.1.4 → 3.1.6 (3 CVEs)
+  - `python-multipart` 0.0.9 → 0.0.27 (4 CVEs)
+  - `cryptography` 43.0.0 → 46.0.7 (4 CVEs incl. PYSEC-2026-35/36)
+  - `uvicorn` 0.30.0 → 0.32.1
+  - `pytest` (dev) 8.3.3 → 9.0.3 (CVE-2025-71176)
+
+### Added
+
+- **`docs/API.md`** — full reference for the `/api/*` Bearer-token
+  REST surface: scope model, rate limits, all 6 endpoints with
+  request/response schemas, error codes, three worked HA REST sensor
+  + automation examples, versioning policy.
+- **`docs/SECURITY-AUDIT.md`** — formal audit report with methodology,
+  findings table, fixes applied, accepted risks, threat model.
+- **`docs/REVIEW-PUNCH-LIST-2026-05-24.md`** — items deferred from the
+  codebase-wide review, each with documented rationale and a trigger
+  to revisit.
+- **`docs/social-preview.png`** — repo OpenGraph image.
+- **`SECURITY.md` / `CODE_OF_CONDUCT.md` / `CONTRIBUTING.md`** —
+  GitHub community-files baseline; SECURITY documents the data-at-
+  rest "treat `/data/access_control.db` as keychain" guidance and the
+  direct-port first-run setup-race mitigation.
+- **GitHub issue forms + PR template** in `.github/`.
+- **Dependabot configuration** in `.github/dependabot.yml` — weekly
+  updates for GitHub Actions, Docker base image, and Python deps with
+  minor+patch grouped.
+- **Auto-release workflow** in `.github/workflows/release.yaml` —
+  detects version bumps in `config.yaml` on push to main, extracts
+  the matching CHANGELOG section, creates the tag + GitHub Release.
+- **Bandit + pip-audit gating jobs** in CI. The build matrix won't
+  run if either finds an actionable finding.
+- **Credential-label Jinja filter** — Activity Log and per-lock
+  history render `NFC` / `PIN` / `Remote (UniFi app)` instead of
+  `Nfc` / `Pin_code` / `Remote_through_uah`.
+- **Repository topic tags + description** for GitHub discoverability.
+
+### Changed
+
+- **Setup wizard hides admin username/password fields under HA SSO.**
+  The admin row is auto-created from `X-Remote-User-Name` with a
+  random unguessable password (`secrets.token_urlsafe(48)`). Direct-
+  port deployments still see the fields.
+- **In-app "Restart Service" button hidden under ingress.** Replaced
+  with a one-liner pointing to Supervisor's restart control.
+  `RESTART_COMMAND=/bin/true` already neutered the button under the
+  app, but the UI now reflects that.
+- **`auth_engine`'s `can_disarm` override now honors group schedules.**
+  Previously a user with an out-of-schedule "can disarm" group still
+  bypassed an alarm-armed block from a separate blocking group.
+- **Circuit breaker now reserves the HALF_OPEN probe slot.** Two
+  concurrent callers can no longer both probe simultaneously. The
+  follow-up fix in this release also catches `asyncio.TimeoutError`
+  alongside `aiohttp.ClientError` so the new slot never gets stuck.
+- **Timestamp format consistency in SQLite.** New `_utc_now_sqlite()`
+  helper produces space-separated `YYYY-MM-DD HH:MM:SS` matching the
+  schema-default `datetime('now')`. Previously Python writes used
+  `T`-separated ISO format, breaking lexical range queries in
+  `prune_logs` and the `since` filter.
+- **README** rewritten for public consumption with 12 in-place
+  screenshots, use cases, full settings reference, architecture
+  diagram, security model, build-from-source.
+- **All user-facing docs** swept to the current HA terminology
+  ("app" instead of "add-on", "Settings → Apps" UI navigation).
+  Schema field names (`hassio_*`) kept unchanged for back-compat.
+- **`mark_deleted_users([])`** now logs a warning and returns 0
+  instead of mass-marking every local user as `deleted_upstream`.
+  Closes an operational footgun where a UniFi sync returning an empty
+  list would silently delete every user.
+- **Input validation:** date / time strings (`add_visitor`,
+  `extend_visitor`, `create_group`, `update_group`,
+  `update_schedule`) now reject malformed input with a friendly error
+  redirect instead of a 500. `set_group_locks` drops non-integer
+  values with a logged warning.
+
+### Fixed
+
+- **`protect_client.py`** runtime `NameError` on every Protect 401
+  (the sanitized "rejected the credentials" branch used `logger`
+  where the module defines `_LOGGER`).
+- **License badge** in the top-level README — was using shields.io's
+  dynamic-fetch endpoint which cached "repo not found" from when the
+  repo was private. Now a static `License: MIT` badge.
+- **Removed unused imports**: `auth_engine.HAClientError`,
+  `main.FormData`.
+- **Mypy-flagged type mismatches:** `delay` / `max_delay` now
+  correctly annotated as `float` in both WebSocket reconnect loops.
+
+### Internal
+
+- Repo flipped public; Private Vulnerability Reporting enabled.
+- Custom OpenGraph social preview image uploaded.
+- 6 Bandit B608 false positives in `database.py` suppressed inline
+  with documented rationale (every flagged f-string assembles
+  fragments from hardcoded literals or `?`-placeholder strings;
+  values bound via aiosqlite parameter lists).
+- **3 new regression tests** locked in for the security-critical
+  fixes: setup-re-execution refusal, circuit-breaker concurrent-probe
+  blocking, circuit-breaker probe slot release on failure.
+
+### Migration notes
+
+- No DB schema migration required.
+- API-key scopes are unchanged. Holders of `read_only` /
+  `locks_only` keys retain their access — `/api/health` is in their
+  scope set (per the new explicit guard).
+- The setup wizard's behavior change (hiding admin fields under SSO)
+  is forward-only; existing admin rows are untouched.
+
 ## [1.1.0] - 2026-05-23
 
 ### Added
