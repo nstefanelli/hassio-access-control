@@ -5,7 +5,7 @@
 **Bridge UniFi Access + Protect with Home Assistant for unified door, lock, and alarm control.**
 
 [![Latest release](https://img.shields.io/github/v/release/nstefanelli/hassio-access-control?style=flat-square&color=3b82f6)](https://github.com/nstefanelli/hassio-access-control/releases)
-[![License: MIT](https://img.shields.io/github/license/nstefanelli/hassio-access-control?style=flat-square)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![amd64](https://img.shields.io/badge/amd64-supported-2dd4a0?style=flat-square)](access_control/build.yaml)
 [![aarch64](https://img.shields.io/badge/aarch64-supported-2dd4a0?style=flat-square)](access_control/build.yaml)
 [![CI](https://img.shields.io/github/actions/workflow/status/nstefanelli/hassio-access-control/ci.yaml?style=flat-square&label=ci)](https://github.com/nstefanelli/hassio-access-control/actions/workflows/ci.yaml)
