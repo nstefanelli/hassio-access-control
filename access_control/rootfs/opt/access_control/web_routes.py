@@ -50,15 +50,27 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 # Log and per-lock history pages so values render as `NFC` / `PIN` /
 # `Face` instead of `Nfc` / `Pin_code` / `Face`.
 _CREDENTIAL_LABELS: dict[str, str] = {
+    # UniFi Access reader credentials (G6 Entry Pro, NFC pad, Hub)
     "nfc": "NFC",
     "pin_code": "PIN",
     "pin": "PIN",
     "face": "Face",
     "fingerprint": "Fingerprint",
+    # UniFi Access legacy / non-G6 method values
     "remote_unlock": "Remote unlock",
+    "remote_through_uah": "Remote (UniFi app)",
     "device_auth": "Device auth",
-    "buzz": "Buzz",
+    "access_device": "Reader",
+    # UniFi Protect (doorbell-driven flows)
+    "doorbell_ring": "Doorbell ring",
+    # Manual actions issued from the in-app dashboard
     "manual": "Manual",
+    "manual_unlock": "Manual unlock",
+    "manual_lock": "Manual lock",
+    "manual_buzz": "Manual buzz",
+    "buzz": "Buzz",
+    # Internal / synthetic events
+    "system": "System",
 }
 
 
@@ -219,8 +231,8 @@ async def login_post(
     db = request.app.state.db
     if await db.is_rate_limited("login", client_ip):
         return templates.TemplateResponse(
-        request,
-        "login.html",
+            request,
+            "login.html",
             _inject_ingress_context(request, {"request": request, "error": "Too many failed attempts. Try again in 60 seconds."}),
             status_code=429,
         )
@@ -236,8 +248,8 @@ async def login_post(
     ):
         await db.record_rate_limit_failure("login", client_ip, **_LOGIN_RATE_LIMIT)
         return templates.TemplateResponse(
-        request,
-        "login.html",
+            request,
+            "login.html",
             _inject_ingress_context(request, {
                 "request": request,
                 "page": "login",
@@ -287,8 +299,8 @@ async def setup_post(
 
     def _render_error(error: str) -> HTMLResponse:
         return templates.TemplateResponse(
-        request,
-        "setup.html",
+            request,
+            "setup.html",
             _inject_ingress_context(request, {"request": request, "page": "setup", "error": error}),
             status_code=422,
         )

@@ -97,11 +97,12 @@ jobs:
           python-version: "3.12"
       - name: Install bandit
         run: python -m pip install --upgrade pip bandit
-      - name: Run bandit (fail on Medium+)
-        # `-l` raises the floor to LOW severity; `-i HIGH` requires HIGH
-        # confidence to count. We want Medium+ severity at Medium+
-        # confidence to fail the build — false positives we've seen in
-        # database.py have inline `# nosec B608` suppressions documented.
+      - name: Run bandit (fail on Medium+ / Medium+)
+        # `--severity-level medium` filters out LOW-severity findings.
+        # `--confidence-level medium` filters out LOW-confidence findings.
+        # The build fails if any Medium+ severity AND Medium+ confidence
+        # finding remains. Known false positives in database.py carry
+        # inline `# nosec B608` suppressions with documented rationale.
         run: bandit -r ${{ matrix.addon }}/rootfs/opt/access_control -x ${{ matrix.addon }}/rootfs/opt/access_control/tests --severity-level medium --confidence-level medium
 
   pip-audit:
