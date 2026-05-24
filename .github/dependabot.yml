@@ -1,0 +1,60 @@
+version: 2
+
+updates:
+  # ----- GitHub Actions -----
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # ----- Docker base image (build-args BUILD_FROM) -----
+  - package-ecosystem: docker
+    directory: /access_control
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - docker
+    # Dependabot will track the ARG BUILD_FROM default; the actual
+    # multi-arch values are in build.yaml — those need to be bumped
+    # by hand alongside any Dependabot PR.
+
+  # ----- Python runtime dependencies -----
+  - package-ecosystem: pip
+    directory: /access_control/rootfs/opt/access_control
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - python
+    # Group patch + minor bumps to reduce PR noise; major bumps stay
+    # separate so they get individual review.
+    groups:
+      python-minor-patch:
+        update-types:
+          - minor
+          - patch
+    # Security advisories always open a PR regardless of the schedule.
+    # Ignored versions go here if/when we need to pin around a regression:
+    # ignore:
+    #   - dependency-name: "some-package"
+    #     versions: ["1.2.3"]
