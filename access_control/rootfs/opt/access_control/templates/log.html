@@ -29,7 +29,7 @@
             </td>
             <td class="px-4 py-3 text-gray-200 whitespace-nowrap">{{ entry.user_name or '—' }}</td>
             <td class="px-4 py-3 text-gray-400 hidden sm:table-cell whitespace-nowrap">{{ entry.lock_name or '—' }}</td>
-            <td class="px-4 py-3 text-gray-500 hidden sm:table-cell capitalize">{{ entry.method or '—' }}</td>
+            <td class="px-4 py-3 text-gray-500 hidden sm:table-cell">{{ entry.method|credential_label }}</td>
             <td class="px-4 py-3 whitespace-nowrap">
               {% if entry.result == 'granted' %}
                 <span class="badge-granted">Granted</span>

@@ -85,8 +85,10 @@ def _install_fastapi_stubs() -> None:
     class Jinja2Templates:
         def __init__(self, directory: str) -> None:
             self.directory = directory
+            self.env = SimpleNamespace(filters={})
 
-        def TemplateResponse(self, template: str, context: dict, status_code: int = 200):
+        def TemplateResponse(self, request, template: str, context: dict, status_code: int = 200):
+            # Modern Starlette signature: (request, name, context, status_code=200).
             return HTMLResponse(template, status_code=status_code)
 
     templating.Jinja2Templates = Jinja2Templates

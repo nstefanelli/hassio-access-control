@@ -205,6 +205,12 @@
   <!-- Service Control -->
   <div class="card space-y-4">
     <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Service Control</h2>
+    {% if ingress_active %}
+    <p class="text-sm text-gray-500">
+      Restarts are managed by Home Assistant. Use the <strong>Restart</strong> button on
+      the add-on page (Settings → Apps → Access Control) to restart the container.
+    </p>
+    {% else %}
     <div class="flex items-center justify-between">
       <div>
         <p class="text-sm text-gray-400">Restart the Access Control service. The page will reload automatically.</p>
@@ -219,6 +225,7 @@
         </button>
       </form>
     </div>
+    {% endif %}
 
     <!-- Scheduled reboot -->
     <form method="post" action="settings/reboot-schedule"
