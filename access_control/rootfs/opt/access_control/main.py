@@ -996,12 +996,25 @@ async def setup_guard(request: Request, call_next):
     return await call_next(request)
 
 
+# Hard cap on POST body size at the middleware level. None of the form
+# endpoints submit > 1 MB; reading bigger bodies into memory would let an
+# authenticated user (or a future-introduced unauthenticated POST) OOM
+# the container by streaming a huge body. Audit 2026-05-24, M2.
+_MAX_FORM_BODY = 1_048_576  # 1 MiB
+
+
 @app.middleware("http")
 async def csrf_protection(request: Request, call_next):
     """
     Validate CSRF token on all POST requests except:
     - /api/* (uses Bearer token auth)
     - /login and /setup (no session yet)
+
+    Under HA Ingress SSO there is no session cookie — the user identity
+    comes from request.state.ingress_user. We bind the CSRF token to
+    that identity too (using the same `ha:<name>` actor string
+    `require_login` returns) so SSO POSTs are still protected.
+    Audit 2026-05-24, M1.
     """
     if request.method == "POST":
         path = request.url.path
@@ -1013,11 +1026,25 @@ async def csrf_protection(request: Request, call_next):
         if not exempt:
             from .web_auth import get_session_user, validate_csrf_token
 
-            user = get_session_user(request)
+            ingress_user = getattr(request.state, "ingress_user", None)
+            cookie_user = get_session_user(request)
+            user = (
+                f"ha:{ingress_user['name']}" if ingress_user else cookie_user
+            )
             if user:
+                # Reject oversize bodies early so reading them doesn't
+                # OOM the container.
+                content_length = int(request.headers.get("content-length") or 0)
+                if content_length > _MAX_FORM_BODY:
+                    from fastapi.responses import HTMLResponse
+                    return HTMLResponse(
+                        "<h1>413 Payload Too Large</h1>"
+                        "<p>Request body exceeds the form-submission size limit.</p>",
+                        status_code=413,
+                    )
+
                 # Read body and cache it so downstream handlers can re-read it
                 body = await request.body()
-                from starlette.datastructures import FormData
                 from urllib.parse import parse_qs
                 parsed = parse_qs(body.decode(), keep_blank_values=True)
                 token = parsed.get("_csrf_token", [""])[0]

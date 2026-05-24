@@ -178,5 +178,48 @@ class TestCircuitBreakerStateMachine(unittest.TestCase):
             self.assertEqual(cb.state, CircuitBreaker.HALF_OPEN)
 
 
+class TestCircuitBreakerConcurrentProbeGuard(unittest.TestCase):
+    """Audit 2026-05-24, clients-#9. Two callers must NOT both get a
+    HALF_OPEN probe — only the first one gets through.
+    """
+
+    def test_only_first_caller_gets_half_open_probe(self):
+        cb = CircuitBreaker("t", failure_threshold=1, recovery_timeout=60.0)
+        # Trip to OPEN
+        with unittest.mock.patch("access_control.circuit_breaker.time.monotonic", return_value=100.0):
+            cb.record_failure()
+        self.assertEqual(cb.state, CircuitBreaker.OPEN)
+
+        # Recovery window has elapsed — first caller observes HALF_OPEN
+        # and reserves the probe slot.
+        with unittest.mock.patch("access_control.circuit_breaker.time.monotonic", return_value=170.0):
+            first = cb.is_open()
+            self.assertFalse(first)  # first caller may probe
+            self.assertEqual(cb.state, CircuitBreaker.HALF_OPEN)
+
+            # Concurrent caller (still inside the probe's in-flight window)
+            # must see is_open() == True so it bails.
+            second = cb.is_open()
+            self.assertTrue(second)
+
+        # Probe completes successfully — slot released, breaker closes.
+        cb.record_success()
+        self.assertEqual(cb.state, CircuitBreaker.CLOSED)
+
+    def test_probe_failure_releases_slot_and_reopens(self):
+        cb = CircuitBreaker("t", failure_threshold=1, recovery_timeout=60.0)
+        with unittest.mock.patch("access_control.circuit_breaker.time.monotonic", return_value=100.0):
+            cb.record_failure()
+
+        with unittest.mock.patch("access_control.circuit_breaker.time.monotonic", return_value=170.0):
+            self.assertFalse(cb.is_open())
+            # Probe fails — back to OPEN, slot released for next cycle.
+            cb.record_failure()
+            self.assertEqual(cb.state, CircuitBreaker.OPEN)
+            # _probe_in_flight cleared so the next recovery window can
+            # legitimately HALF_OPEN again.
+            self.assertFalse(cb._probe_in_flight)
+
+
 if __name__ == "__main__":
     unittest.main()

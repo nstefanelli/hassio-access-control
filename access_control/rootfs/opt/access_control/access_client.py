@@ -63,7 +63,20 @@ class AccessClient:
         self._last_event_at: float = 0.0
         self._reconnect_count: int = 0
 
-        # SSL context: TLS but no certificate verification (UNVR uses self-signed)
+        # SSL context: TLS but no certificate verification — UNVR ships
+        # with a self-signed certificate by default. We accept this in
+        # exchange for the simpler operator UX of not requiring users to
+        # pin a fingerprint or import a CA.
+        #
+        # SECURITY TRADE-OFF: a DNS-rebinding or on-path attacker who
+        # can intercept LAN traffic to the UNVR host can present any
+        # certificate and harvest the service-account credentials at
+        # every WebSocket reconnect. Mitigations:
+        #   1. Deploy the UNVR and the HA host on a trusted, isolated
+        #      VLAN where on-path attacks are not part of the threat model.
+        #   2. The WS-401 storm counter (this file's _ws_loop) caps
+        #      credential replays to 5 before refusing to reconnect.
+        # Audit 2026-05-24, clients-#5.
         self._ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         self._ssl_ctx.check_hostname = False
         self._ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -590,8 +603,9 @@ class AccessClient:
         Uses exponential backoff (5s → 10s → 20s → … → 300s max) on repeated failures.
         Resets to base delay after a successful connection.
         """
-        delay = WS_RECONNECT_DELAY
-        max_delay = 300  # 5 minutes max
+        delay: float = float(WS_RECONNECT_DELAY)
+        max_delay: float = 300.0  # 5 minutes max
+        ws_401_count = 0  # consecutive WS-upgrade 401s; see _ws_connect
 
         while self._running:
             if self._auth_permanently_failed:
@@ -601,11 +615,27 @@ class AccessClient:
                 await self._ws_connect()
                 # If we get here, connection was established and then closed normally
                 self._reconnect_count += 1  # connection closed normally, will reconnect
-                delay = WS_RECONNECT_DELAY  # reset on success
+                delay = float(WS_RECONNECT_DELAY)  # reset on success
+                ws_401_count = 0
             except asyncio.CancelledError:
                 break
+            except aiohttp.ClientResponseError as exc:
+                if exc.status == 401:
+                    # Bound the credential-replay storm on a stuck 401 loop.
+                    # See ProtectClient._ws_loop for the same logic + rationale.
+                    # Audit 2026-05-24, clients-#6.
+                    ws_401_count += 1
+                    if ws_401_count >= 5:
+                        logger.error(
+                            "Access WS returned 401 %d times in a row — refusing "
+                            "to continue. Re-enter UNVR credentials in Settings.",
+                            ws_401_count,
+                        )
+                        self._auth_permanently_failed = True
+                        break
+                logger.exception("WebSocket error — will retry in %.0fs", delay)
             except Exception:
-                logger.exception("WebSocket error — will retry in %ds", delay)
+                logger.exception("WebSocket error — will retry in %.0fs", delay)
             finally:
                 self._ws_connected = False
 

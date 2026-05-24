@@ -10,7 +10,7 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from fastapi import APIRouter, Depends, Form, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
@@ -102,11 +102,20 @@ except AttributeError:
 
 _DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _HA_ENTITY_ID_RE = re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
+# 24-hour HH:MM. Validated wherever schedule start/end strings are
+# accepted; the auth engine treats malformed values as "always inactive"
+# which fails closed, but rejecting at the form layer is friendlier.
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _LOCKS_CACHE_TTL = 30
 _VISITORS_CACHE_TTL = 30
 _ALARM_CACHE_TTL = 5
 _ACTION_RATE_LIMIT = {"max_attempts": 20, "window": 60, "lockout": 60}
 _LOGIN_RATE_LIMIT = {"max_attempts": 5, "window": 300, "lockout": 60}
+# /setup is intentionally CSRF + login exempt (first-run has no session
+# yet). Rate-limited harder than /login because every attempt drives a
+# live UNVR + HA connection test — attacker brute-forces upstream creds
+# through us if we don't cap. Audit 2026-05-24, C2.
+_SETUP_RATE_LIMIT = {"max_attempts": 3, "window": 300, "lockout": 300}
 
 
 def _log_task_exception(task: asyncio.Task) -> None:
@@ -175,7 +184,10 @@ async def _render(template: str, request: Request, context: dict) -> HTMLRespons
 
 
 def _client_ip(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
+    # Use getattr so test fixtures with stripped-down Request stand-ins
+    # (no `.client` attribute) don't crash this helper.
+    client = getattr(request, "client", None)
+    return client.host if client else "unknown"
 
 
 def _action_key(request: Request, user: str, action: str) -> str:
@@ -294,10 +306,39 @@ async def setup_post(
     ha_url: str = Form(...),
     ha_token: str = Form(...),
 ):
-    """Validate UNVR + HA connections, save encrypted config, generate initial API key."""
+    """Validate UNVR + HA connections, save encrypted config, generate initial API key.
+
+    Security: this route is intentionally exempt from CSRF + login (no
+    session exists during first-run). To prevent re-execution after the
+    app is configured — which would overwrite admin credentials, rotate
+    the encryption_salt (orphaning previously-encrypted UNVR/HA tokens
+    and visitor PINs), and emit new API keys — we hard-guard against
+    `configured=True` here and rate-limit unauthenticated POSTs.
+    """
     db = request.app.state.db
 
-    def _render_error(error: str) -> HTMLResponse:
+    # Code-review audit 2026-05-24, C1: hard refuse setup after configured.
+    if await db.get_config("admin_username") is not None:
+        logger.warning(
+            "Setup POST received after first-run completed; refusing. client_ip=%s",
+            _client_ip(request),
+        )
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # Code-review audit 2026-05-24, C2: rate-limit setup POSTs by client IP.
+    # Each attempt drives real UNVR + HA connection tests, so unmetered
+    # access lets an attacker brute-force those upstream credentials.
+    client_ip = _client_ip(request)
+    if await db.is_rate_limited("setup", client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many setup attempts. Try again in a minute.",
+        )
+
+    async def _render_error_and_record(error: str) -> HTMLResponse:
+        # Record a rate-limit failure on every error path so repeated
+        # bad-credential attempts get throttled (see C2).
+        await db.record_rate_limit_failure("setup", client_ip, **_SETUP_RATE_LIMIT)
         return templates.TemplateResponse(
             request,
             "setup.html",
@@ -317,7 +358,7 @@ async def setup_post(
         admin_username = ingress_user.get("name") or f"ha-{(ingress_user.get('id') or '')[:8]}"
         admin_password = _secrets.token_urlsafe(48)
     elif not admin_username or not admin_password:
-        return _render_error("Admin username and password are required.")
+        return await _render_error_and_record("Admin username and password are required.")
 
     # 1. Test UNVR connection
     access_client = AccessClient(unvr_host, unvr_username, unvr_password)
@@ -325,7 +366,7 @@ async def setup_post(
         await access_client.login()
     except AccessClientError as exc:
         logger.warning("Setup UNVR connection test failed: %s", exc)
-        return _render_error("Failed to connect to UNVR. Check host and credentials.")
+        return await _render_error_and_record("Failed to connect to UNVR. Check host and credentials.")
     finally:
         await access_client.close()
 
@@ -334,10 +375,10 @@ async def setup_post(
     try:
         ok = await ha_client.test_connection()
         if not ok:
-            return _render_error("Failed to connect to Home Assistant. Check URL and token.")
+            return await _render_error_and_record("Failed to connect to Home Assistant. Check URL and token.")
     except Exception as exc:
         logger.warning("Setup HA connection test failed: %s", exc)
-        return _render_error("Failed to connect to Home Assistant. Check URL and token.")
+        return await _render_error_and_record("Failed to connect to Home Assistant. Check URL and token.")
     finally:
         await ha_client.close()
 
@@ -373,7 +414,7 @@ async def setup_post(
     except Exception as exc:
         logger.exception("Setup completed but runtime initialization failed")
         request.app.state.configured = False
-        return _render_error(f"Setup saved, but runtime initialization failed: {exc}")
+        return await _render_error_and_record(f"Setup saved, but runtime initialization failed: {exc}")
 
     # Under SSO, send the admin straight into the dashboard — they're already
     # authenticated by HA, no need to bounce through the legacy /login form.
@@ -623,6 +664,13 @@ async def update_schedule(
     days_str = ",".join(selected_days) if selected_days else None
 
     enabled_flag = schedule_enabled.lower() in ("on", "1", "true", "yes")
+
+    # Reject malformed time strings up front so the auth engine never
+    # receives unparseable schedule bounds. Audit 2026-05-24, M2.
+    if schedule_start and not _TIME_RE.match(schedule_start):
+        return _redirect(request, f"/users/{user_id}?error=Invalid+start+time")
+    if schedule_end and not _TIME_RE.match(schedule_end):
+        return _redirect(request, f"/users/{user_id}?error=Invalid+end+time")
 
     await db.update_rule(
         rule_id,
@@ -1172,6 +1220,13 @@ async def create_group(request: Request, user: str = Depends(require_csrf)):
     form = await request.form()
     days = _extract_schedule_days(form)
     name = form.get("name", "")
+    schedule_start = form.get("schedule_start") or None
+    schedule_end = form.get("schedule_end") or None
+    # Reject malformed time strings up front. Audit 2026-05-24, M2.
+    if schedule_start and not _TIME_RE.match(schedule_start):
+        return _redirect(request, f"/groups?error={quote_plus('Invalid start time format.')}")
+    if schedule_end and not _TIME_RE.match(schedule_end):
+        return _redirect(request, f"/groups?error={quote_plus('Invalid end time format.')}")
     try:
         await db.create_group(
             name=name,
@@ -1182,12 +1237,11 @@ async def create_group(request: Request, user: str = Depends(require_csrf)):
             can_disarm=bool(form.get("can_disarm")),
             schedule_enabled=bool(form.get("schedule_enabled")),
             schedule_days=days,
-            schedule_start=form.get("schedule_start") or None,
-            schedule_end=form.get("schedule_end") or None,
+            schedule_start=schedule_start,
+            schedule_end=schedule_end,
         )
     except sqlite3.IntegrityError:
         return _redirect(request, f"/groups?error={quote_plus('Group name already exists.')}")
-    name = form.get("name", "")
     await db.log_admin_action(user, "group_create", name)
     return _redirect(request, "/groups")
 
@@ -1255,6 +1309,12 @@ async def update_group(group_id: int, request: Request, user: str = Depends(requ
     db = request.app.state.db
     form = await request.form()
     days = _extract_schedule_days(form)
+    schedule_start = form.get("schedule_start") or None
+    schedule_end = form.get("schedule_end") or None
+    if schedule_start and not _TIME_RE.match(schedule_start):
+        return _redirect(request, f"/groups/{group_id}?error={quote_plus('Invalid start time format.')}")
+    if schedule_end and not _TIME_RE.match(schedule_end):
+        return _redirect(request, f"/groups/{group_id}?error={quote_plus('Invalid end time format.')}")
     try:
         await db.update_group(
             group_id,
@@ -1266,8 +1326,8 @@ async def update_group(group_id: int, request: Request, user: str = Depends(requ
             can_disarm=bool(form.get("can_disarm")),
             schedule_enabled=bool(form.get("schedule_enabled")),
             schedule_days=days,
-            schedule_start=form.get("schedule_start") or None,
-            schedule_end=form.get("schedule_end") or None,
+            schedule_start=schedule_start,
+            schedule_end=schedule_end,
         )
     except sqlite3.IntegrityError:
         return _redirect(request, f"/groups/{group_id}?error={quote_plus('Group name already exists.')}")
@@ -1282,7 +1342,16 @@ async def set_group_locks(group_id: int, request: Request, user: str = Depends(r
         return limited
     db = request.app.state.db
     form = await request.form()
-    lock_ids = [int(v) for k, v in form.multi_items() if k == "lock_ids"]
+    # Drop non-integer entries instead of crashing on bad input.
+    # Audit 2026-05-24, M3.
+    lock_ids: list[int] = []
+    for k, v in form.multi_items():
+        if k != "lock_ids":
+            continue
+        try:
+            lock_ids.append(int(v))
+        except (TypeError, ValueError):
+            logger.warning("set_group_locks ignoring non-integer lock_id %r", v)
     await db.set_group_locks(group_id, lock_ids)
     return _redirect(request, f"/groups/{group_id}")
 
@@ -1363,8 +1432,13 @@ async def add_visitor(
         return _redirect(request, "/visitors?error=Access+client+not+available")
 
     local_tz = ZoneInfo("America/New_York")
-    start_dt = dt.strptime(f"{start_date} {start_time}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
-    end_dt = dt.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+    # Defensive parse — malformed date/time input must not crash the
+    # route with an uncaught ValueError. Audit 2026-05-24, M1.
+    try:
+        start_dt = dt.strptime(f"{start_date} {start_time}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+        end_dt = dt.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+    except ValueError:
+        return _redirect(request, "/visitors?error=Invalid+date+or+time+format")
 
     # Validate time window
     if end_dt <= start_dt:
@@ -1443,7 +1517,11 @@ async def extend_visitor(
         return _redirect(request, "/visitors?error=Access+client+not+available")
 
     local_tz = ZoneInfo("America/New_York")
-    end_dt = dt.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+    # Defensive parse — same as add_visitor. Audit 2026-05-24, M1.
+    try:
+        end_dt = dt.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+    except ValueError:
+        return _redirect(request, "/visitors?error=Invalid+date+or+time+format")
     if end_dt <= dt.now(local_tz):
         return _redirect(request, "/visitors")
     end_unix = int(end_dt.timestamp())
@@ -1640,7 +1718,11 @@ async def update_unvr(
     try:
         await test_client.login()
     except AccessClientError as exc:
-        return await _settings_with_result(request, user, db, enc_key, f"UNVR connection failed: {exc}")
+        # Sanitize the user-facing message; the AccessClient already
+        # logs the raw upstream response body at warning level.
+        # Audit 2026-05-24, H1.
+        logger.warning("UNVR connection test failed during settings update: %s", exc)
+        return await _settings_with_result(request, user, db, enc_key, "UNVR connection failed. Check host and credentials.")
     finally:
         await test_client.close()
 
@@ -1719,7 +1801,10 @@ async def update_ha(
         if not ok:
             return await _settings_with_result(request, user, db, enc_key, "HA connection failed. Check URL and token.")
     except Exception as exc:
-        return await _settings_with_result(request, user, db, enc_key, f"HA connection failed: {exc}")
+        # Sanitize: don't surface raw aiohttp / SSL / token-validation
+        # exception strings to the dashboard. Audit 2026-05-24, H1.
+        logger.warning("HA connection test failed during settings update: %s", exc)
+        return await _settings_with_result(request, user, db, enc_key, "HA connection failed. Check URL and token.")
     finally:
         await test_client.close()
 
@@ -1795,9 +1880,11 @@ async def update_access_console(
     try:
         await test_client.login()
     except Exception as exc:
+        # Sanitize: don't surface raw upstream errors. Audit 2026-05-24, H1.
+        logger.warning("Access console connection test failed during settings update: %s", exc)
         return await _settings_with_result(
             request, user, db, enc_key,
-            f"Access console connection failed: {exc}",
+            "Access console connection failed. Check host and credentials.",
         )
     finally:
         await test_client.close()
