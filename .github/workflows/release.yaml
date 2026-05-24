@@ -1,0 +1,133 @@
+name: Release
+
+# Runs after a push to main. If the version in access_control/config.yaml
+# changed AND there's no existing tag for that version, this workflow
+# creates a git tag and a GitHub Release. Release notes are extracted
+# from access_control/CHANGELOG.md by scraping the section header that
+# matches the version. The CI workflow's `Build & publish app` job
+# already publishes container images to ghcr.io on every push to main,
+# so this workflow only handles the GitHub-side tag/release artefact.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - access_control/config.yaml
+      - access_control/CHANGELOG.md
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  tag-and-release:
+    name: Tag + release if version bumped
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # We need full history so we can compare config.yaml across
+          # the parent commit and inspect existing tags.
+
+      - name: Read current version
+        id: ver
+        run: |
+          set -euo pipefail
+          VERSION=$(yq '.version' access_control/config.yaml)
+          if [ -z "${VERSION}" ] || [ "${VERSION}" = "null" ]; then
+            echo "::error::Could not read version from config.yaml"
+            exit 1
+          fi
+          # Strip surrounding quotes if yq returns them (depends on style)
+          VERSION="${VERSION%\"}"
+          VERSION="${VERSION#\"}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "Detected version: ${VERSION}"
+
+      - name: Check if tag already exists
+        id: tag-check
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "Tag ${TAG} already exists locally — nothing to do."
+          elif git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "Tag ${TAG} already exists on origin — nothing to do."
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+            echo "Tag ${TAG} does not exist — proceeding with release."
+          fi
+
+      - name: Extract release notes from CHANGELOG
+        if: steps.tag-check.outputs.exists == 'false'
+        id: notes
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Find the "## [VERSION]" section and everything until the next
+          # "## [" header. Output goes to a file so we can pass it to the
+          # release action without shell-escaping headaches.
+          CHANGELOG=access_control/CHANGELOG.md
+          if [ ! -f "${CHANGELOG}" ]; then
+            echo "::error::${CHANGELOG} not found"
+            exit 1
+          fi
+          # Use awk to extract the section. Match the version header
+          # literally; stop at the next ## [ ... ] header or EOF.
+          BODY=$(awk -v v="[${VERSION}]" '
+            $0 ~ "^## " v {found=1; next}
+            found && /^## \[/ {exit}
+            found {print}
+          ' "${CHANGELOG}")
+          if [ -z "${BODY}" ]; then
+            echo "::warning::No CHANGELOG section found for version ${VERSION}. Using placeholder."
+            BODY="See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/access_control/CHANGELOG.md) for details."
+          fi
+          # Append the published image references at the bottom for convenience
+          {
+            echo "${BODY}"
+            echo ""
+            echo "---"
+            echo ""
+            echo "**Container images:**"
+            echo ""
+            echo "- \`ghcr.io/${{ github.repository_owner }}/hassio-access-control-amd64:${VERSION}\`"
+            echo "- \`ghcr.io/${{ github.repository_owner }}/hassio-access-control-aarch64:${VERSION}\`"
+          } > /tmp/release-notes.md
+          echo "Generated /tmp/release-notes.md ($(wc -l < /tmp/release-notes.md) lines)"
+
+      - name: Create tag
+        if: steps.tag-check.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Use the GitHub Actions bot identity so the tag isn't
+          # attributed to a maintainer account.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+
+      - name: Create GitHub Release
+        if: steps.tag-check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          body_path: /tmp/release-notes.md
+          draft: false
+          prerelease: false
+          # Don't fail if the release already exists (idempotent re-runs)
+          fail_on_unmatched_files: false
