@@ -46,6 +46,16 @@ Medium:
   `_probe_in_flight` so two concurrent callers can't both probe
 - `_client_ip()` defensive `getattr` for test stand-ins missing `.client`
 
+Final-review round caught two more (also fixed in this PR):
+- `ha_client.py` `except aiohttp.ClientError` blocks (7 sites) expanded
+  to `except (aiohttp.ClientError, asyncio.TimeoutError)`. Without this
+  a `TimeoutError` from an HA call would bypass `record_failure()` and
+  the new `_probe_in_flight` slot would stay reserved forever → the
+  circuit-breaker would wedge permanently in HALF_OPEN.
+- CSRF middleware body-size cap also rejects chunked Transfer-Encoding
+  without a Content-Length header (would have bypassed the 1 MiB cap
+  on `await request.body()`).
+
 Plus new regression tests for the security-critical fixes:
 - `test_setup_post_refuses_when_already_configured`
 - `test_only_first_caller_gets_half_open_probe`

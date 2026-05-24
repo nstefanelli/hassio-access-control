@@ -1033,8 +1033,21 @@ async def csrf_protection(request: Request, call_next):
             )
             if user:
                 # Reject oversize bodies early so reading them doesn't
-                # OOM the container.
+                # OOM the container. We also reject chunked Transfer-
+                # Encoding without Content-Length, which would otherwise
+                # bypass the size cap (the body would still be buffered
+                # in full by `await request.body()`). Audit 2026-05-24
+                # (codebase review), CSRF middleware finding.
                 content_length = int(request.headers.get("content-length") or 0)
+                transfer_encoding = request.headers.get("transfer-encoding", "").lower()
+                if "chunked" in transfer_encoding and content_length == 0:
+                    from fastapi.responses import HTMLResponse
+                    return HTMLResponse(
+                        "<h1>411 Length Required</h1>"
+                        "<p>Chunked transfer-encoding is not accepted for form POSTs; "
+                        "include a Content-Length header.</p>",
+                        status_code=411,
+                    )
                 if content_length > _MAX_FORM_BODY:
                     from fastapi.responses import HTMLResponse
                     return HTMLResponse(
