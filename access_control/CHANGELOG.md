@@ -4,6 +4,19 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-05-25
+
+### Fixed
+
+- **AppArmor profile blocked s6-overlay init.** v1.2.1's profile only
+  allowed execution from `/bin/**`, `/sbin/**`, `/usr/bin/**`,
+  `/usr/sbin/**`, and `/usr/lib/**`. The HA base image's container
+  entrypoint is `/init` (s6-overlay), so AppArmor denied execve and
+  the container died at startup with
+  `/bin/sh: can't open '/init': Permission denied` looping forever.
+  Profile now uses `file,` (matching every official HA addon) while
+  retaining the inet-only network restriction.
+
 ## [1.2.1] - 2026-05-25
 
 ### Fixed
