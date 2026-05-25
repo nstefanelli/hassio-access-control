@@ -4,6 +4,26 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.6] - 2026-05-25
+
+### Fixed
+
+- **Runtime initialization still failed under the Supervisor proxy**
+  with `HA credentials are incomplete in the database` even though
+  1.2.5's setup correctly skipped persisting them. `main.py`'s
+  `initialize_configured_state` read `ha_url`/`ha_token` from the
+  DB and raised *before* it consulted the env-var fallback —
+  effectively requiring a DB-stored copy on top of the env vars.
+  Env-var resolution now happens first, with the DB used only as a
+  fallback (preserving the direct-port path). A clearer error
+  message names both lookup paths if neither yields creds.
+
+  **Existing 1.2.5 installs that hit this error:** the prior setup
+  wrote everything except the HA creds to the DB and the addon is
+  already in `configured` state from the DB side. Updating to
+  1.2.6 and restarting the addon completes the runtime init from
+  the Supervisor env vars — no need to re-run `/setup`.
+
 ## [1.2.5] - 2026-05-25
 
 ### Fixed

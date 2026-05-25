@@ -395,16 +395,30 @@ async def lifespan(app: FastAPI):
             a_user = unvr_username
             a_pass = unvr_password
 
-        ha_url = await db.get_config("ha_url")
-        ha_token_enc = await db.get_config("ha_token")
-        if not all([ha_url, ha_token_enc]):
-            raise RuntimeError("HA credentials are incomplete in the database.")
+        # Resolve HA creds with env-var override taking precedence over the
+        # DB, so the Supervisor-proxy path (run.sh exports both env vars and
+        # setup_post intentionally does NOT persist them) works without
+        # tripping the "incomplete" guard. Direct-port deployments fall
+        # through to the DB-stored creds.
+        env_ha_url = os.environ.get("ACCESS_CONTROL_HA_URL")
+        env_ha_token = os.environ.get("ACCESS_CONTROL_HA_TOKEN")
+        db_ha_url = await db.get_config("ha_url")
+        db_ha_token_enc = await db.get_config("ha_token")
 
-        ha_token = decrypt_value(ha_token_enc, enc_key)
-        if os.environ.get("ACCESS_CONTROL_HA_URL"):
-            ha_url = os.environ["ACCESS_CONTROL_HA_URL"]
-        if os.environ.get("ACCESS_CONTROL_HA_TOKEN"):
-            ha_token = os.environ["ACCESS_CONTROL_HA_TOKEN"]
+        ha_url = env_ha_url or db_ha_url
+        if env_ha_token:
+            ha_token = env_ha_token
+        elif db_ha_token_enc:
+            ha_token = decrypt_value(db_ha_token_enc, enc_key)
+        else:
+            ha_token = None
+
+        if not ha_url or not ha_token:
+            raise RuntimeError(
+                "HA credentials are incomplete: neither env vars "
+                "(ACCESS_CONTROL_HA_URL/_TOKEN) nor DB-stored "
+                "ha_url/ha_token were available."
+            )
 
         # Stash UNVR creds — the supervisor loops use these to recover
         # if Access or Protect was unreachable at boot.
