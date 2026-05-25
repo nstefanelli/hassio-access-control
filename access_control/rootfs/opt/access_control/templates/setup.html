@@ -81,7 +81,17 @@
         </div>
       </div>
 
-      <!-- Home Assistant -->
+      {% if supervisor_proxy_active %}
+      <!-- HA URL + token are injected by Supervisor — no user entry needed. -->
+      <div class="card">
+        <div class="section-heading" style="margin-bottom:1rem;">Home Assistant</div>
+        <p style="font-size:0.875rem; color:var(--text-secondary); margin:0;">
+          Home Assistant access is provided automatically by the Supervisor proxy.
+          No URL or long-lived token is required here.
+        </p>
+      </div>
+      {% else %}
+      <!-- Home Assistant (direct-port / non-supervisor deployments only) -->
       <div class="card">
         <div class="section-heading" style="margin-bottom:1rem;">Home Assistant</div>
         <div class="space-y-4">
@@ -95,6 +105,7 @@
           </div>
         </div>
       </div>
+      {% endif %}
 
       <button type="submit" class="btn-primary" style="width:100%; justify-content:center; padding:0.625rem; font-size:0.875rem;">
         Finish Setup
