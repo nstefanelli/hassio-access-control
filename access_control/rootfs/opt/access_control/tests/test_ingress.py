@@ -148,6 +148,24 @@ class TestIngressMiddleware(unittest.IsolatedAsyncioTestCase):
         # display name so downstream auth has something non-empty.
         self.assertEqual(req.state.ingress_user, {"id": "abc-def", "name": "abc-def"})
 
+    async def test_missing_admin_header_trusts_panel_admin(self):
+        # Real-world: current HA Supervisor sends X-Remote-User-Id and
+        # X-Remote-User-Name but NO admin-flag header. The middleware must
+        # trust the ingress request (relying on `panel_admin: true` in
+        # config.yaml as the admin-only sidebar gate) instead of 403'ing.
+        req = _fake_request({
+            "X-Ingress-Path": "/api/hassio_ingress/realtoken123",
+            "X-Remote-User-Id": "d530895bc4834c5ca929071edb8339c9",
+            "X-Remote-User-Name": "nstefanelli",
+            "X-Remote-User-Display-Name": "Nick",
+        })
+        resp = await ingress_middleware(req, _passthrough)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            req.state.ingress_user,
+            {"id": "d530895bc4834c5ca929071edb8339c9", "name": "nstefanelli"},
+        )
+
     async def test_non_admin_via_supervisor_gets_403(self):
         req = _fake_request({
             "X-Ingress-Path": "/api/hassio_ingress/realtoken123",
