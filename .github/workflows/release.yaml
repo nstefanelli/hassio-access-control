@@ -33,7 +33,7 @@ jobs:
     name: Tag + release if version bumped
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           # We need full history so we can compare config.yaml across
@@ -126,7 +126,7 @@ jobs:
 
       - name: Create GitHub Release
         if: steps.tag-check.outputs.exists == 'false'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ${{ steps.ver.outputs.tag }}
