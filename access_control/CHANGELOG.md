@@ -4,6 +4,26 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-05-25
+
+### Fixed
+
+- **CI: container image was never actually published.** Two bugs in
+  `.github/workflows/ci.yaml` combined to make every v1.x install
+  fail with `403 denied` from `ghcr.io`:
+  1. The HA builder received both `--image "ghcr.io/..."` and
+     `--docker-hub ghcr.io`, producing a doubled
+     `ghcr.io/ghcr.io/nstefanelli/...` push target that GHCR
+     silently rejected.
+  2. The image name was templated from `slug` (`access_control`,
+     underscore) while `config.yaml`'s `image:` field uses
+     `hassio-access-control-{arch}` (hyphens) — so even a
+     successful push would have landed at a name Supervisor
+     never tries to pull.
+  Both build steps now derive `--image` and `--docker-hub` by
+  parsing `config.yaml`'s `image:` field, making it the single
+  source of truth.
+
 ## [1.2.0] - 2026-05-24
 
 A consolidation release covering the post-v1.1.0 hardening work: a full

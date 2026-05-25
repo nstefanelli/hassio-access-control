@@ -220,8 +220,18 @@ jobs:
           set -euo pipefail
           VERSION=$(yq '.version' "${{ matrix.addon }}/config.yaml")
           SLUG=$(yq '.slug' "${{ matrix.addon }}/config.yaml")
+          # Derive --image / --docker-hub from config.yaml's `image:` field
+          # so the published image name is always the one Supervisor will
+          # pull. Splitting registry/owner from repo name avoids the
+          # double-prefix trap where `--docker-hub ghcr.io` + a fully
+          # qualified `--image ghcr.io/...` produces `ghcr.io/ghcr.io/...`.
+          IMAGE_FULL=$(yq '.image' "${{ matrix.addon }}/config.yaml")
+          IMAGE_NAME="${IMAGE_FULL##*/}"
+          DOCKER_HUB="${IMAGE_FULL%/*}"
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "slug=${SLUG}" >> "${GITHUB_OUTPUT}"
+          echo "image_name=${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "docker_hub=${DOCKER_HUB}" >> "${GITHUB_OUTPUT}"
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -238,7 +248,8 @@ jobs:
           args: |
             --${{ matrix.arch }} \
             --target /data/${{ matrix.addon }} \
-            --image "ghcr.io/${{ github.repository_owner }}/hassio-${{ steps.meta.outputs.slug }}-{arch}" \
+            --image "${{ steps.meta.outputs.image_name }}" \
+            --docker-hub "${{ steps.meta.outputs.docker_hub }}" \
             --version "${{ steps.meta.outputs.version }}" \
             --addon \
             --test
@@ -250,9 +261,9 @@ jobs:
           args: |
             --${{ matrix.arch }} \
             --target /data/${{ matrix.addon }} \
-            --image "ghcr.io/${{ github.repository_owner }}/hassio-${{ steps.meta.outputs.slug }}-{arch}" \
+            --image "${{ steps.meta.outputs.image_name }}" \
+            --docker-hub "${{ steps.meta.outputs.docker_hub }}" \
             --docker-hub-check \
-            --docker-hub ghcr.io \
             --version "${{ steps.meta.outputs.version }}" \
             --addon
 
