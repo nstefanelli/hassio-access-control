@@ -4,6 +4,21 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] - 2026-05-25
+
+### Fixed
+
+- **HA admins were rejected by the SSO middleware with "Admin access
+  required".** The ingress middleware only treated the literal string
+  `"true"` as admin and only read `X-Remote-User-*` headers — but HA
+  Supervisor has shipped both `"1"`/`"0"` and `"true"`/`"false"` for
+  the admin flag across versions, and Core ingress uses `X-Hass-*`
+  header names rather than `X-Remote-User-*`. The middleware now
+  accepts both header schemes and any of `"1"`, `"true"`, `"yes"`
+  (case-insensitive). When a request is rejected, it logs the actual
+  header set received so future Supervisor header churn is debuggable
+  without code spelunking.
+
 ## [1.2.2] - 2026-05-25
 
 ### Fixed

@@ -113,6 +113,41 @@ class TestIngressMiddleware(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(req.state.ingress_active)
         self.assertEqual(req.state.ingress_user, {"id": "abc-def", "name": "Nick"})
 
+    async def test_admin_value_one_accepted(self):
+        # Supervisor serializes is_admin as "1"/"0" in current versions.
+        req = _fake_request({
+            "X-Ingress-Path": "/api/hassio_ingress/realtoken123",
+            "X-Remote-User-Id": "abc-def",
+            "X-Remote-User-Name": "Nick",
+            "X-Remote-User-Is-Admin": "1",
+        })
+        resp = await ingress_middleware(req, _passthrough)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(req.state.ingress_user, {"id": "abc-def", "name": "Nick"})
+
+    async def test_admin_value_zero_rejected(self):
+        req = _fake_request({
+            "X-Ingress-Path": "/api/hassio_ingress/realtoken123",
+            "X-Remote-User-Id": "abc-def",
+            "X-Remote-User-Name": "Guest",
+            "X-Remote-User-Is-Admin": "0",
+        })
+        resp = await ingress_middleware(req, _passthrough)
+        self.assertEqual(resp.status_code, 403)
+
+    async def test_x_hass_header_scheme_accepted(self):
+        # Older Core ingress uses X-Hass-* instead of X-Remote-User-*.
+        req = _fake_request({
+            "X-Ingress-Path": "/api/hassio_ingress/realtoken123",
+            "X-Hass-User-Id": "abc-def",
+            "X-Hass-Is-Admin": "1",
+        })
+        resp = await ingress_middleware(req, _passthrough)
+        self.assertEqual(resp.status_code, 200)
+        # No name header sent — middleware should fall back to id for the
+        # display name so downstream auth has something non-empty.
+        self.assertEqual(req.state.ingress_user, {"id": "abc-def", "name": "abc-def"})
+
     async def test_non_admin_via_supervisor_gets_403(self):
         req = _fake_request({
             "X-Ingress-Path": "/api/hassio_ingress/realtoken123",
