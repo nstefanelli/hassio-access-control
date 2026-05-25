@@ -10,10 +10,11 @@ enabled. Each request gets these headers:
   X-Hass-User-Id:        HA user UUID (only when auth_api: true)
 - X-Remote-User-Name /
   X-Remote-User-Display-Name: HA user display name
-- X-Remote-User-Is-Admin /
-  X-Hass-Is-Admin:       admin flag — Supervisor has serialized this as
-                         both `"1"`/`"0"` and `"true"`/`"false"` across
-                         versions, so we accept any common truthy form.
+
+Note: current Supervisor does NOT send an admin-flag header at all.
+We honor X-Remote-User-Is-Admin / X-Hass-Is-Admin if a future build
+reinstates one, but otherwise rely on `panel_admin: true` in
+config.yaml to gate sidebar visibility to admin users.
 
 The middleware here does two jobs:
 
@@ -156,13 +157,23 @@ async def ingress_middleware(request: Request, call_next):
     )
 
     if user_id:
-        if is_admin_raw.strip().lower() not in _ADMIN_TRUE_VALUES:
-            # Log what we actually saw so future header-naming churn from
-            # Supervisor is debuggable without code spelunking.
+        # Empirically, current HA Supervisor (verified on HAOS 2026.4.2)
+        # sends only X-Ingress-Path, X-Hass-Source, X-Remote-User-Id,
+        # X-Remote-User-Name, X-Remote-User-Display-Name. There is NO
+        # admin-flag header. HA's addon docs ("Currently, Home Assistant
+        # doesn't pass any user information to the add-on") explicitly
+        # designate `panel_admin: true` (in config.yaml) as the
+        # admin-only gate — it hides the sidebar entry from non-admins.
+        #
+        # We therefore trust the ingress request when no admin header
+        # arrives. If a future Supervisor version reinstates the header,
+        # we still honor it: an explicit non-admin value (e.g. "0",
+        # "false") rejects; an unset value trusts panel_admin.
+        if is_admin_raw and is_admin_raw.strip().lower() not in _ADMIN_TRUE_VALUES:
             _log.warning(
                 "Ingress request rejected: user_id=%r user_name=%r "
-                "is_admin_raw=%r (expected one of %s, case-insensitive). "
-                "Header keys present: %s",
+                "is_admin_raw=%r (expected one of %s, case-insensitive, "
+                "or missing). Header keys present: %s",
                 user_id,
                 user_name,
                 is_admin_raw,

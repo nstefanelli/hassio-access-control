@@ -4,6 +4,23 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4] - 2026-05-25
+
+### Fixed
+
+- **HA admins still rejected after 1.2.3 — root cause: Supervisor
+  doesn't send an admin header at all.** The diagnostic logging in
+  1.2.3 proved it: current HAOS Supervisor sends `X-Ingress-Path`,
+  `X-Hass-Source`, `X-Remote-User-Id`, `X-Remote-User-Name`, and
+  `X-Remote-User-Display-Name` — but no `X-Remote-User-Is-Admin`
+  and no `X-Hass-Is-Admin`. HA's own addon docs confirm that admin
+  gating is delegated to the `panel_admin: true` flag in
+  `config.yaml`, which hides the sidebar entry from non-admins.
+  The middleware now trusts any well-formed ingress request that
+  arrives with a user id. If a future Supervisor version
+  reinstates an admin header, an explicit non-admin value still
+  rejects the request.
+
 ## [1.2.3] - 2026-05-25
 
 ### Fixed
