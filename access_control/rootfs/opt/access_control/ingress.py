@@ -6,9 +6,14 @@ enabled. Each request gets these headers:
 
 - X-Ingress-Path:        the URL prefix Supervisor stripped before forwarding
                          (e.g. /api/hassio_ingress/<base64url-token>)
-- X-Remote-User-Id:      HA user UUID (only when auth_api: true)
-- X-Remote-User-Name:    HA user display name
-- X-Remote-User-Is-Admin: "true" / "false"
+- X-Remote-User-Id /
+  X-Hass-User-Id:        HA user UUID (only when auth_api: true)
+- X-Remote-User-Name /
+  X-Remote-User-Display-Name: HA user display name
+- X-Remote-User-Is-Admin /
+  X-Hass-Is-Admin:       admin flag — Supervisor has serialized this as
+                         both `"1"`/`"0"` and `"true"`/`"false"` across
+                         versions, so we accept any common truthy form.
 
 The middleware here does two jobs:
 
@@ -32,10 +37,17 @@ the legacy session-cookie auth path.
 """
 from __future__ import annotations
 
+import logging
 import re
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse
+
+_log = logging.getLogger(__name__)
+
+# Values Supervisor has historically emitted to mean "is admin = true".
+# `"True"`/`"False"` covered by .lower(); `"yes"` covered by some forks.
+_ADMIN_TRUE_VALUES = frozenset({"1", "true", "yes"})
 
 # /api/hassio_ingress/<base64url-token>. The token portion is what
 # Supervisor signs per HA session; it's unguessable from outside that
@@ -125,13 +137,39 @@ async def ingress_middleware(request: Request, call_next):
     request.scope["root_path"] = ingress_path
     request.state.ingress_active = True
 
-    user_id = request.headers.get("X-Remote-User-Id", "")
-    user_name = request.headers.get("X-Remote-User-Name", "")
-    is_admin_raw = request.headers.get("X-Remote-User-Is-Admin", "")
+    # Header names differ across HA Supervisor versions: newer builds use
+    # X-Remote-User-*, older Core ingress uses X-Hass-*. Read both.
+    user_id = (
+        request.headers.get("X-Remote-User-Id")
+        or request.headers.get("X-Hass-User-Id")
+        or ""
+    )
+    user_name = (
+        request.headers.get("X-Remote-User-Name")
+        or request.headers.get("X-Remote-User-Display-Name")
+        or ""
+    )
+    is_admin_raw = (
+        request.headers.get("X-Remote-User-Is-Admin")
+        or request.headers.get("X-Hass-Is-Admin")
+        or ""
+    )
 
-    if user_id and user_name:
-        if is_admin_raw.lower() != "true":
+    if user_id:
+        if is_admin_raw.strip().lower() not in _ADMIN_TRUE_VALUES:
+            # Log what we actually saw so future header-naming churn from
+            # Supervisor is debuggable without code spelunking.
+            _log.warning(
+                "Ingress request rejected: user_id=%r user_name=%r "
+                "is_admin_raw=%r (expected one of %s, case-insensitive). "
+                "Header keys present: %s",
+                user_id,
+                user_name,
+                is_admin_raw,
+                sorted(_ADMIN_TRUE_VALUES),
+                sorted(request.headers.keys()),
+            )
             return HTMLResponse(_FORBIDDEN_BODY, status_code=403)
-        request.state.ingress_user = {"id": user_id, "name": user_name}
+        request.state.ingress_user = {"id": user_id, "name": user_name or user_id}
 
     return await call_next(request)
