@@ -150,16 +150,33 @@ def _redirect(request: Request, url: str, *, delete_cookie: bool = False) -> Red
     return resp
 
 
+def _supervisor_proxy_active() -> bool:
+    """True when run.sh exported the Supervisor proxy creds (use_supervisor_api).
+
+    When this is True, the addon talks to HA via `http://supervisor/core` with
+    the per-addon SUPERVISOR_TOKEN — no user-entered URL + long-lived token
+    needed. Templates use this to hide the HA fields in the setup/settings
+    forms; setup_post uses it to skip user-entered HA validation.
+    """
+    return bool(
+        os.environ.get("ACCESS_CONTROL_HA_URL")
+        and os.environ.get("ACCESS_CONTROL_HA_TOKEN")
+    )
+
+
 def _inject_ingress_context(request: Request, context: dict) -> dict:
     """
-    Mutate `context` to include `ingress_path` and `ingress_active` so every
-    template knows where to point `<base href>` and whether to hide UI
-    elements that don't make sense under HA SSO (e.g. the logout button).
+    Mutate `context` to include `ingress_path`, `ingress_active`, and
+    `supervisor_proxy_active` so every template knows where to point
+    `<base href>`, whether to hide UI elements that don't make sense under
+    HA SSO (e.g. the logout button), and whether to hide the HA URL + token
+    fields (when Supervisor injects them automatically).
 
     Returns the same dict (for convenient chaining).
     """
     context["ingress_active"] = bool(getattr(request.state, "ingress_active", False))
     context["ingress_path"] = request.scope.get("root_path", "") or ""
+    context["supervisor_proxy_active"] = _supervisor_proxy_active()
     return context
 
 
@@ -303,8 +320,8 @@ async def setup_post(
     unvr_host: str = Form(...),
     unvr_username: str = Form(...),
     unvr_password: str = Form(...),
-    ha_url: str = Form(...),
-    ha_token: str = Form(...),
+    ha_url: str = Form(""),
+    ha_token: str = Form(""),
 ):
     """Validate UNVR + HA connections, save encrypted config, generate initial API key.
 
@@ -370,8 +387,29 @@ async def setup_post(
     finally:
         await access_client.close()
 
-    # 2. Test HA connection
-    ha_client = HAClient(ha_url, ha_token)
+    # 2. Test HA connection.
+    #
+    # When the addon runs under Supervisor with `use_supervisor_api: true`
+    # (the default), run.sh exports ACCESS_CONTROL_HA_URL=http://supervisor/core
+    # and ACCESS_CONTROL_HA_TOKEN=$SUPERVISOR_TOKEN. In that mode the user
+    # doesn't need to enter URL/token in the form, and we test against the
+    # Supervisor proxy. ha_url/ha_token form fields are left blank → we
+    # skip persisting them so main.py's env-var fallback (already wired)
+    # keeps working across Supervisor token rotations.
+    if _supervisor_proxy_active() and not ha_url and not ha_token:
+        ha_url_for_test = os.environ["ACCESS_CONTROL_HA_URL"]
+        ha_token_for_test = os.environ["ACCESS_CONTROL_HA_TOKEN"]
+        persist_ha_creds = False
+    else:
+        if not ha_url or not ha_token:
+            return await _render_error_and_record(
+                "Home Assistant URL and Long-Lived Access Token are required."
+            )
+        ha_url_for_test = ha_url
+        ha_token_for_test = ha_token
+        persist_ha_creds = True
+
+    ha_client = HAClient(ha_url_for_test, ha_token_for_test)
     try:
         ok = await ha_client.test_connection()
         if not ok:
@@ -396,8 +434,9 @@ async def setup_post(
     await db.set_config("unvr_host", unvr_host)
     await db.set_config("unvr_username", encrypt_value(unvr_username, enc_key))
     await db.set_config("unvr_password", encrypt_value(unvr_password, enc_key))
-    await db.set_config("ha_url", ha_url)
-    await db.set_config("ha_token", encrypt_value(ha_token, enc_key))
+    if persist_ha_creds:
+        await db.set_config("ha_url", ha_url)
+        await db.set_config("ha_token", encrypt_value(ha_token, enc_key))
 
     # 5. Generate initial API key
     raw_key = generate_api_key()

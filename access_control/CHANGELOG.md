@@ -4,6 +4,24 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.5] - 2026-05-25
+
+### Fixed
+
+- **Setup form demanded HA URL + long-lived token even under the
+  Supervisor proxy.** `run.sh` exports
+  `ACCESS_CONTROL_HA_URL=http://supervisor/core` and
+  `ACCESS_CONTROL_HA_TOKEN=$SUPERVISOR_TOKEN` whenever
+  `use_supervisor_api: true` (the default), and `main.py` already
+  honored those as env-var fallbacks — but the setup form still
+  required the user to type a URL + token, then persisted them to
+  the DB (shadowing the env vars and breaking after Supervisor
+  rotated the token). The `Home Assistant` section is now hidden
+  when the Supervisor proxy is active; the POST handler skips the
+  user-credential branch, tests the Supervisor URL instead, and
+  does not write `ha_url`/`ha_token` to the DB so the env-var
+  fallback stays authoritative across token rotations.
+
 ## [1.2.4] - 2026-05-25
 
 ### Fixed
