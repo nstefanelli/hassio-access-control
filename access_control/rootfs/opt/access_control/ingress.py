@@ -11,10 +11,13 @@ enabled. Each request gets these headers:
 - X-Remote-User-Name /
   X-Remote-User-Display-Name: HA user display name
 
-Note: current Supervisor does NOT send an admin-flag header at all.
-We honor X-Remote-User-Is-Admin / X-Hass-Is-Admin if a future build
-reinstates one, but otherwise rely on `panel_admin: true` in
-config.yaml to gate sidebar visibility to admin users.
+Note: Supervisor does NOT send an admin-flag header. `panel_admin: true`
+in config.yaml is the documented admin gate — it both hides the sidebar
+entry from non-admins and prevents Supervisor from issuing ingress
+sessions to non-admins against the addon. We honor
+X-Remote-User-Is-Admin / X-Hass-Is-Admin as defense-in-depth if a
+future Supervisor version reinstates one: an explicit non-admin value
+("0", "false") rejects; an unset value continues to trust panel_admin.
 
 The middleware here does two jobs:
 
@@ -46,8 +49,8 @@ from fastapi.responses import HTMLResponse
 
 _log = logging.getLogger(__name__)
 
-# Values Supervisor has historically emitted to mean "is admin = true".
-# `"True"`/`"False"` covered by .lower(); `"yes"` covered by some forks.
+# Truthy values Supervisor and forks have emitted for the admin flag.
+# Compared case-insensitively and whitespace-stripped below.
 _ADMIN_TRUE_VALUES = frozenset({"1", "true", "yes"})
 
 # /api/hassio_ingress/<base64url-token>. The token portion is what
@@ -157,23 +160,14 @@ async def ingress_middleware(request: Request, call_next):
     )
 
     if user_id:
-        # Empirically, current HA Supervisor (verified on HAOS 2026.4.2)
-        # sends only X-Ingress-Path, X-Hass-Source, X-Remote-User-Id,
-        # X-Remote-User-Name, X-Remote-User-Display-Name. There is NO
-        # admin-flag header. HA's addon docs ("Currently, Home Assistant
-        # doesn't pass any user information to the add-on") explicitly
-        # designate `panel_admin: true` (in config.yaml) as the
-        # admin-only gate — it hides the sidebar entry from non-admins.
-        #
-        # We therefore trust the ingress request when no admin header
-        # arrives. If a future Supervisor version reinstates the header,
-        # we still honor it: an explicit non-admin value (e.g. "0",
-        # "false") rejects; an unset value trusts panel_admin.
+        # No admin-header → trust panel_admin (see module docstring).
+        # If a future Supervisor reinstates the header, an explicit
+        # non-admin value rejects here.
         if is_admin_raw and is_admin_raw.strip().lower() not in _ADMIN_TRUE_VALUES:
             _log.warning(
                 "Ingress request rejected: user_id=%r user_name=%r "
-                "is_admin_raw=%r (expected one of %s, case-insensitive, "
-                "or missing). Header keys present: %s",
+                "is_admin_raw=%r (got a value but it isn't one of %s, "
+                "case-insensitive). Header keys present: %s",
                 user_id,
                 user_name,
                 is_admin_raw,

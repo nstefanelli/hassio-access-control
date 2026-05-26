@@ -150,18 +150,40 @@ def _redirect(request: Request, url: str, *, delete_cookie: bool = False) -> Red
     return resp
 
 
-def _supervisor_proxy_active() -> bool:
-    """True when run.sh exported the Supervisor proxy creds (use_supervisor_api).
+_LOGGED_PARTIAL_ENV_INJECTION = False
 
-    When this is True, the addon talks to HA via `http://supervisor/core` with
-    the per-addon SUPERVISOR_TOKEN — no user-entered URL + long-lived token
-    needed. Templates use this to hide the HA fields in the setup/settings
-    forms; setup_post uses it to skip user-entered HA validation.
+
+def _supervisor_proxy_active() -> bool:
+    """True when both Supervisor-proxy env vars are present.
+
+    `run.sh` exports `ACCESS_CONTROL_HA_URL=http://supervisor/core` and
+    `ACCESS_CONTROL_HA_TOKEN=$SUPERVISOR_TOKEN` when `use_supervisor_api`
+    is true. Both arrive together or neither does — that's the contract.
+
+    A partial injection (exactly one set) is a misconfiguration: a
+    Supervisor regression, a typoed env-export, or a downstream
+    workflow that strips one. Treating it as "off" would silently fall
+    back to user creds and pair them with a Supervisor URL on the next
+    boot, producing an addon that looks healthy but 401s every HA call.
+    Log loudly (once per process) and fail closed.
     """
-    return bool(
-        os.environ.get("ACCESS_CONTROL_HA_URL")
-        and os.environ.get("ACCESS_CONTROL_HA_TOKEN")
-    )
+    global _LOGGED_PARTIAL_ENV_INJECTION
+    url = os.environ.get("ACCESS_CONTROL_HA_URL")
+    token = os.environ.get("ACCESS_CONTROL_HA_TOKEN")
+    if bool(url) != bool(token):
+        if not _LOGGED_PARTIAL_ENV_INJECTION:
+            logger.error(
+                "Partial Supervisor env injection detected: "
+                "ACCESS_CONTROL_HA_URL set=%s, ACCESS_CONTROL_HA_TOKEN set=%s. "
+                "Both must be set or neither. Treating as 'not active' and "
+                "falling back to user-entered creds. Fix run.sh / Supervisor "
+                "env injection — this state is unsupported.",
+                bool(url),
+                bool(token),
+            )
+            _LOGGED_PARTIAL_ENV_INJECTION = True
+        return False
+    return bool(url and token)
 
 
 def _inject_ingress_context(request: Request, context: dict) -> dict:

@@ -79,6 +79,10 @@ async def lifespan(app: FastAPI):
     app.state.on_access_event = None
     app.state.on_protect_event = None
     app.state.initialize_configured_state = None
+    # HA health flag — None until initialize_configured_state() runs; then
+    # True/False from the boot-time test_connection(). Supervisor loops and
+    # /api/health may read this to surface a degraded state.
+    app.state.ha_unhealthy = None
     # Stash creds + ws restart helpers so the supervisor loops can use them after
     # initial bring-up failures or platform reboots.
     app.state.unvr_creds = None  # (host, user, pass)
@@ -395,30 +399,56 @@ async def lifespan(app: FastAPI):
             a_user = unvr_username
             a_pass = unvr_password
 
-        # Resolve HA creds with env-var override taking precedence over the
-        # DB, so the Supervisor-proxy path (run.sh exports both env vars and
-        # setup_post intentionally does NOT persist them) works without
-        # tripping the "incomplete" guard. Direct-port deployments fall
-        # through to the DB-stored creds.
+        # Resolve HA creds. Env vars and DB are two *complete* sources;
+        # mixing them (env URL + DB token, or vice versa) produces a silent
+        # zombie config — the Supervisor proxy URL only accepts
+        # SUPERVISOR_TOKEN, so a stale env URL paired with a DB long-lived
+        # token 401s every HA call while the addon claims to be healthy.
+        # Either both env vars are set (Supervisor proxy path, default for
+        # addon deployments) or neither is (direct-port path, DB is the
+        # source of truth). A *partial* env injection is a misconfig — we
+        # log it loudly and fall back to DB so the operator can at least
+        # see the addon boot.
         env_ha_url = os.environ.get("ACCESS_CONTROL_HA_URL")
         env_ha_token = os.environ.get("ACCESS_CONTROL_HA_TOKEN")
         db_ha_url = await db.get_config("ha_url")
         db_ha_token_enc = await db.get_config("ha_token")
 
-        ha_url = env_ha_url or db_ha_url
-        if env_ha_token:
+        if env_ha_url and env_ha_token:
+            ha_url = env_ha_url
             ha_token = env_ha_token
-        elif db_ha_token_enc:
+            creds_source = "env"
+        elif env_ha_url or env_ha_token:
+            logger.error(
+                "Partial HA env-var injection: ACCESS_CONTROL_HA_URL set=%s "
+                "ACCESS_CONTROL_HA_TOKEN set=%s. Both must be set or neither. "
+                "Refusing to cross-source env+DB; falling back to DB-stored "
+                "creds. Fix run.sh / Supervisor env injection.",
+                bool(env_ha_url),
+                bool(env_ha_token),
+            )
+            ha_url = db_ha_url
+            ha_token = decrypt_value(db_ha_token_enc, enc_key) if db_ha_token_enc else None
+            creds_source = "db (env partial — see error above)"
+        elif db_ha_url and db_ha_token_enc:
+            ha_url = db_ha_url
             ha_token = decrypt_value(db_ha_token_enc, enc_key)
+            creds_source = "db"
         else:
-            ha_token = None
-
-        if not ha_url or not ha_token:
             raise RuntimeError(
                 "HA credentials are incomplete: neither env vars "
                 "(ACCESS_CONTROL_HA_URL/_TOKEN) nor DB-stored "
                 "ha_url/ha_token were available."
             )
+
+        if not ha_url or not ha_token:
+            # Partial-env fallback to DB hit a DB miss — surface clearly.
+            raise RuntimeError(
+                "HA credentials are incomplete after env-partial fallback: "
+                "DB ha_url=%s, ha_token=%s. Re-run setup or fix the "
+                "Supervisor env injection." % (bool(ha_url), bool(ha_token))
+            )
+        logger.info("HA credentials resolved from: %s", creds_source)
 
         # Stash UNVR creds — the supervisor loops use these to recover
         # if Access or Protect was unreachable at boot.
@@ -436,9 +466,16 @@ async def lifespan(app: FastAPI):
         ha_client = HAClient(url=ha_url, token=ha_token)
         ha_ok = await ha_client.test_connection()
         if not ha_ok:
-            logger.warning("HA connection test failed — proceeding anyway.")
+            logger.warning(
+                "HA connection test failed — proceeding anyway "
+                "(creds_source=%s). app.state.ha_unhealthy is now True; "
+                "health endpoints and supervisor loops should react.",
+                creds_source,
+            )
+            app.state.ha_unhealthy = True
         else:
             logger.info("HAClient connected to %s", ha_url)
+            app.state.ha_unhealthy = False
         app.state.ha_client = ha_client
 
         # RelockManager wraps the relock-task dict and persists pending relocks
