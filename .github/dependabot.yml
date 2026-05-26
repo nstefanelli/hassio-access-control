@@ -54,7 +54,12 @@ updates:
           - minor
           - patch
     # Security advisories always open a PR regardless of the schedule.
-    # Ignored versions go here if/when we need to pin around a regression:
-    # ignore:
-    #   - dependency-name: "some-package"
-    #     versions: ["1.2.3"]
+    ignore:
+      # fastapi 0.136.3 ships an undocumented `fastar` dependency in its
+      # [standard] extras (OSV MAL-2026-4750, published 2026-05-23). We
+      # don't use the [standard] extras, so the typosquat never resolved
+      # for us — but pip-audit blocks any install of 0.136.3 and there's
+      # no fix version yet. Block the bot from re-bumping until upstream
+      # ships a clean successor; remove this entry then.
+      - dependency-name: "fastapi"
+        versions: ["0.136.3"]
