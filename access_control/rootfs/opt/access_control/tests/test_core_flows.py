@@ -306,7 +306,7 @@ config = importlib.import_module("access_control.config")
 web_auth = importlib.import_module("access_control.web_auth")
 web_routes = importlib.import_module("access_control.web_routes")
 auth_engine_module = importlib.import_module("access_control.auth_engine")
-main_module = importlib.import_module("access_control.main")
+ha_creds_module = importlib.import_module("access_control.ha_creds")
 
 
 class FakeDB:
@@ -679,7 +679,7 @@ class ResolveHaCredsTests(unittest.TestCase):
         self.decrypt = lambda enc: f"dec:{enc}"
 
     def test_env_only(self) -> None:
-        url, token, source = main_module._resolve_ha_creds(
+        url, token, source = ha_creds_module.resolve_ha_creds(
             env_url="http://supervisor/core",
             env_token="env-tok",
             db_url=None,
@@ -691,7 +691,7 @@ class ResolveHaCredsTests(unittest.TestCase):
         self.assertEqual(source, "env")
 
     def test_db_only(self) -> None:
-        url, token, source = main_module._resolve_ha_creds(
+        url, token, source = ha_creds_module.resolve_ha_creds(
             env_url=None,
             env_token=None,
             db_url="http://ha.local",
@@ -703,7 +703,7 @@ class ResolveHaCredsTests(unittest.TestCase):
         self.assertEqual(source, "db")
 
     def test_env_preferred_over_db(self) -> None:
-        url, token, source = main_module._resolve_ha_creds(
+        url, token, source = ha_creds_module.resolve_ha_creds(
             env_url="http://supervisor/core",
             env_token="env-tok",
             db_url="http://ha.local",
@@ -726,7 +726,7 @@ class ResolveHaCredsTests(unittest.TestCase):
                 captured.append(msg % args if args else msg)
 
         log = _Capture("test")
-        url, token, source = main_module._resolve_ha_creds(
+        url, token, source = ha_creds_module.resolve_ha_creds(
             env_url="http://supervisor/core",
             env_token=None,
             db_url="http://ha.local",
@@ -740,7 +740,7 @@ class ResolveHaCredsTests(unittest.TestCase):
         self.assertTrue(any("Partial HA env-var injection" in m for m in captured))
 
     def test_partial_env_token_only_falls_back_to_db(self) -> None:
-        url, _, source = main_module._resolve_ha_creds(
+        url, _, source = ha_creds_module.resolve_ha_creds(
             env_url=None,
             env_token="env-tok",
             db_url="http://ha.local",
@@ -752,7 +752,7 @@ class ResolveHaCredsTests(unittest.TestCase):
 
     def test_partial_env_falls_through_to_runtime_error_when_db_empty(self) -> None:
         with self.assertRaises(RuntimeError) as ctx:
-            main_module._resolve_ha_creds(
+            ha_creds_module.resolve_ha_creds(
                 env_url="http://supervisor/core",
                 env_token=None,
                 db_url=None,
@@ -763,7 +763,7 @@ class ResolveHaCredsTests(unittest.TestCase):
 
     def test_neither_source_raises_runtime_error(self) -> None:
         with self.assertRaises(RuntimeError) as ctx:
-            main_module._resolve_ha_creds(
+            ha_creds_module.resolve_ha_creds(
                 env_url=None,
                 env_token=None,
                 db_url=None,
