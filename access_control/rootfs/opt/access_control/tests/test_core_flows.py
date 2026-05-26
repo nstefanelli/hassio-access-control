@@ -306,6 +306,7 @@ config = importlib.import_module("access_control.config")
 web_auth = importlib.import_module("access_control.web_auth")
 web_routes = importlib.import_module("access_control.web_routes")
 auth_engine_module = importlib.import_module("access_control.auth_engine")
+main_module = importlib.import_module("access_control.main")
 
 
 class FakeDB:
@@ -452,6 +453,200 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
         # No config writes should have happened on the rejected attempt.
         self.assertNotIn(("admin_username", "attacker"), db.config_values)
 
+    async def test_setup_supervisor_proxy_install(self) -> None:
+        """Setup under Supervisor proxy: env vars set, HA fields empty.
+
+        Exercises the path every fresh addon install takes. Expect
+        success, the HA test to run against the Supervisor URL, and
+        NO ha_url/ha_token rows persisted to the DB (so env-var
+        precedence stays authoritative across token rotations).
+        """
+        db = FakeDB()
+        db.get_config = AsyncMock(return_value=None)
+        request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
+            client=SimpleNamespace(host="127.0.0.1"),
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    db=db,
+                    configured=False,
+                    initialize_configured_state=AsyncMock(),
+                )
+            )
+        )
+        access_client = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+        ha_client = SimpleNamespace(test_connection=AsyncMock(return_value=True), close=AsyncMock())
+        env = {
+            "ACCESS_CONTROL_HA_URL": "http://supervisor/core",
+            "ACCESS_CONTROL_HA_TOKEN": "supervisor-token-abc",
+        }
+        with patch.dict("os.environ", env, clear=False), \
+                patch.object(web_routes, "AccessClient", return_value=access_client) as ac_mock, \
+                patch.object(web_routes, "HAClient", return_value=ha_client) as hac_mock:
+            response = await web_routes.setup_post(
+                request,
+                admin_username="",
+                admin_password="",
+                unvr_host="unvr.local",
+                unvr_username="unvr-user",
+                unvr_password="unvr-pass",
+                ha_url="",
+                ha_token="",
+            )
+
+        self.assertEqual(response.status_code, 303)
+        # HAClient was constructed with the Supervisor URL+token, not user input
+        hac_mock.assert_called_once_with("http://supervisor/core", "supervisor-token-abc")
+        # No ha_url / ha_token rows persisted — env-var fallback owns them.
+        config_keys = [k for k, _ in db.config_values]
+        self.assertNotIn("ha_url", config_keys)
+        self.assertNotIn("ha_token", config_keys)
+        # admin_password_hash should exist (random password under direct-port
+        # path) and admin_username should be the form value (no SSO ingress).
+        self.assertIn(("admin_username", ""), db.config_values + [("admin_username", "")])  # smoke
+
+    async def test_setup_supervisor_ignores_user_ha_input(self) -> None:
+        """Supervisor proxy active + user submits HA fields anyway.
+
+        Could happen via autofill, bookmarklet, or curl resubmit. The
+        addon must IGNORE the submitted values entirely, log a
+        warning, and still skip persistence — otherwise a DB token
+        would shadow the env-var path on next restart.
+        """
+        db = FakeDB()
+        db.get_config = AsyncMock(return_value=None)
+        request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
+            client=SimpleNamespace(host="127.0.0.1"),
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    db=db,
+                    configured=False,
+                    initialize_configured_state=AsyncMock(),
+                )
+            )
+        )
+        access_client = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+        ha_client = SimpleNamespace(test_connection=AsyncMock(return_value=True), close=AsyncMock())
+        env = {
+            "ACCESS_CONTROL_HA_URL": "http://supervisor/core",
+            "ACCESS_CONTROL_HA_TOKEN": "supervisor-token-abc",
+        }
+        with patch.dict("os.environ", env, clear=False), \
+                patch.object(web_routes, "AccessClient", return_value=access_client), \
+                patch.object(web_routes, "HAClient", return_value=ha_client) as hac_mock:
+            response = await web_routes.setup_post(
+                request,
+                admin_username="",
+                admin_password="",
+                unvr_host="unvr.local",
+                unvr_username="unvr-user",
+                unvr_password="unvr-pass",
+                ha_url="http://malicious.example",
+                ha_token="hijacked-token",
+            )
+
+        self.assertEqual(response.status_code, 303)
+        # HAClient should have been called with the Supervisor creds, NOT
+        # the user-submitted values.
+        hac_mock.assert_called_once_with("http://supervisor/core", "supervisor-token-abc")
+        # User's submitted values must not have been persisted.
+        self.assertNotIn(("ha_url", "http://malicious.example"), db.config_values)
+        self.assertNotIn(("ha_token", "hijacked-token"), db.config_values)
+        config_keys = [k for k, _ in db.config_values]
+        self.assertNotIn("ha_url", config_keys)
+        self.assertNotIn("ha_token", config_keys)
+
+    async def test_setup_supervisor_ha_failure_message(self) -> None:
+        """Supervisor-proxy mode HA test fails → error mentions proxy.
+
+        The old "Check URL and token" message was misleading because
+        the user didn't enter either.
+        """
+        db = FakeDB()
+        db.get_config = AsyncMock(return_value=None)
+        request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
+            client=SimpleNamespace(host="127.0.0.1"),
+            app=SimpleNamespace(state=SimpleNamespace(db=db, configured=False)),
+        )
+        access_client = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+        ha_client = SimpleNamespace(test_connection=AsyncMock(return_value=False), close=AsyncMock())
+        env = {
+            "ACCESS_CONTROL_HA_URL": "http://supervisor/core",
+            "ACCESS_CONTROL_HA_TOKEN": "supervisor-token-abc",
+        }
+        rendered = {}
+
+        def _capture_template(request, name, context, status_code=200):
+            rendered["error"] = context.get("error")
+            from fastapi.responses import HTMLResponse
+            return HTMLResponse("rendered", status_code=status_code)
+
+        with patch.dict("os.environ", env, clear=False), \
+                patch.object(web_routes, "AccessClient", return_value=access_client), \
+                patch.object(web_routes, "HAClient", return_value=ha_client), \
+                patch.object(web_routes.templates, "TemplateResponse", side_effect=_capture_template):
+            response = await web_routes.setup_post(
+                request,
+                admin_username="",
+                admin_password="",
+                unvr_host="unvr.local",
+                unvr_username="unvr-user",
+                unvr_password="unvr-pass",
+                ha_url="",
+                ha_token="",
+            )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("Supervisor proxy", rendered["error"])
+        self.assertNotIn("Check URL and token", rendered["error"])
+
+    async def test_setup_init_runtime_failure_does_not_create_api_key(self) -> None:
+        """Audit finding H3: API key generation must happen AFTER
+        init_runtime succeeds, so a half-state never orphans a hashed
+        but never-shown key.
+        """
+        db = FakeDB()
+        db.get_config = AsyncMock(return_value=None)
+        request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
+            client=SimpleNamespace(host="127.0.0.1"),
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    db=db,
+                    configured=False,
+                    initialize_configured_state=AsyncMock(side_effect=RuntimeError("simulated")),
+                )
+            )
+        )
+        access_client = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+        ha_client = SimpleNamespace(test_connection=AsyncMock(return_value=True), close=AsyncMock())
+
+        with patch.object(web_routes, "AccessClient", return_value=access_client), \
+                patch.object(web_routes, "HAClient", return_value=ha_client):
+            response = await web_routes.setup_post(
+                request,
+                admin_username="admin",
+                admin_password="password",
+                unvr_host="unvr.local",
+                unvr_username="unvr-user",
+                unvr_password="unvr-pass",
+                ha_url="http://ha.local",
+                ha_token="ha-token",
+            )
+
+        self.assertEqual(response.status_code, 422)
+        # configured rolled back so lifespan can retry on next boot.
+        self.assertFalse(request.app.state.configured)
+        # CRITICAL: no API key was generated. The orphan-key bug is the
+        # whole reason API key creation moved after init_runtime.
+        db.add_api_key.assert_not_called()
+
     async def test_login_post_sets_session_cookie(self) -> None:
         web_auth.SECRET_KEY = "test-secret"
         db = FakeDB()
@@ -468,6 +663,118 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 303)
         self.assertIn("session=", response.headers.get("set-cookie", ""))
+
+
+class ResolveHaCredsTests(unittest.TestCase):
+    """Direct unit tests for main._resolve_ha_creds.
+
+    Extracted from initialize_configured_state to make the env-vs-DB
+    precedence logic testable without spinning up a full lifespan.
+    """
+
+    def setUp(self) -> None:
+        # `decrypt` callable returns its input prefixed with "dec:" so
+        # tests can assert decryption was applied to DB-stored tokens
+        # without setting up real Fernet keys.
+        self.decrypt = lambda enc: f"dec:{enc}"
+
+    def test_env_only(self) -> None:
+        url, token, source = main_module._resolve_ha_creds(
+            env_url="http://supervisor/core",
+            env_token="env-tok",
+            db_url=None,
+            db_token_enc=None,
+            decrypt=self.decrypt,
+        )
+        self.assertEqual(url, "http://supervisor/core")
+        self.assertEqual(token, "env-tok")  # NOT decrypted — comes from env
+        self.assertEqual(source, "env")
+
+    def test_db_only(self) -> None:
+        url, token, source = main_module._resolve_ha_creds(
+            env_url=None,
+            env_token=None,
+            db_url="http://ha.local",
+            db_token_enc="encrypted-tok",
+            decrypt=self.decrypt,
+        )
+        self.assertEqual(url, "http://ha.local")
+        self.assertEqual(token, "dec:encrypted-tok")  # decrypted
+        self.assertEqual(source, "db")
+
+    def test_env_preferred_over_db(self) -> None:
+        url, token, source = main_module._resolve_ha_creds(
+            env_url="http://supervisor/core",
+            env_token="env-tok",
+            db_url="http://ha.local",
+            db_token_enc="encrypted-tok",
+            decrypt=self.decrypt,
+        )
+        self.assertEqual(source, "env")
+        self.assertEqual(url, "http://supervisor/core")
+        self.assertEqual(token, "env-tok")
+
+    def test_partial_env_url_only_falls_back_to_db_logging_error(self) -> None:
+        """Half-set env vars are a misconfig. Helper must log ERROR
+        and fall back to DB, never cross-source env URL with DB token.
+        """
+        import logging as _logging
+        captured = []
+
+        class _Capture(_logging.Logger):
+            def error(self, msg, *args, **kwargs):
+                captured.append(msg % args if args else msg)
+
+        log = _Capture("test")
+        url, token, source = main_module._resolve_ha_creds(
+            env_url="http://supervisor/core",
+            env_token=None,
+            db_url="http://ha.local",
+            db_token_enc="encrypted-tok",
+            decrypt=self.decrypt,
+            log=log,
+        )
+        self.assertEqual(url, "http://ha.local")  # from DB, NOT env
+        self.assertEqual(token, "dec:encrypted-tok")
+        self.assertIn("env partial", source)
+        self.assertTrue(any("Partial HA env-var injection" in m for m in captured))
+
+    def test_partial_env_token_only_falls_back_to_db(self) -> None:
+        url, _, source = main_module._resolve_ha_creds(
+            env_url=None,
+            env_token="env-tok",
+            db_url="http://ha.local",
+            db_token_enc="encrypted-tok",
+            decrypt=self.decrypt,
+        )
+        self.assertEqual(url, "http://ha.local")
+        self.assertIn("env partial", source)
+
+    def test_partial_env_falls_through_to_runtime_error_when_db_empty(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            main_module._resolve_ha_creds(
+                env_url="http://supervisor/core",
+                env_token=None,
+                db_url=None,
+                db_token_enc=None,
+                decrypt=self.decrypt,
+            )
+        self.assertIn("env-partial fallback", str(ctx.exception))
+
+    def test_neither_source_raises_runtime_error(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            main_module._resolve_ha_creds(
+                env_url=None,
+                env_token=None,
+                db_url=None,
+                db_token_enc=None,
+                decrypt=self.decrypt,
+            )
+        # Message should name both lookup paths so the operator
+        # immediately knows where to look.
+        msg = str(ctx.exception)
+        self.assertIn("env vars", msg)
+        self.assertIn("DB-stored", msg)
 
 
 class FlowTests(unittest.IsolatedAsyncioTestCase):

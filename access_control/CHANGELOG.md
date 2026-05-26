@@ -4,6 +4,64 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-05-26
+
+### Fixed (setup robustness)
+
+Round-2 fixes from the same code-review pass that produced 1.3.0:
+
+- **Setup form ignores user-submitted HA creds under Supervisor proxy.**
+  When the Supervisor proxy is active, `setup_post` now refuses to
+  persist any `ha_url`/`ha_token` submitted in the form (regardless
+  of whether they're empty) — autofill, bookmarklet, or curl
+  resubmission can no longer poison the DB with values that would
+  shadow the env-var path. Logs a warning if non-empty values were
+  submitted.
+- **`admin_username` now keys on HA UUID instead of HA username.**
+  Usernames are mutable (admin rename, backup restore against a
+  different HA instance) and would collide on the existing config
+  row. The HA user UUID is stable — fixes the collision case the
+  reviewer flagged. Display name still surfaces via
+  `request.state.ingress_user["name"]` on every request.
+- **Initial API key generated AFTER `init_runtime()` succeeds.**
+  Setup previously persisted the hashed API key before runtime
+  initialization. If `init_runtime()` failed, the raw key was never
+  shown to the user but the hash sat in the DB — orphan key,
+  unrecoverable. API key now lands only on the success path; the
+  failure path leaves credentials persisted (so the next-boot
+  env-var-fallback can recover) but no orphan key.
+- **Setup error message branches on `persist_ha_creds`.** Under
+  Supervisor proxy, an HA test failure no longer tells the user to
+  "check URL and token" they never entered — instead names the
+  Supervisor URL, the `homeassistant_api: true` requirement, and
+  the `ACCESS_CONTROL_HA_*` env vars.
+- **`ingress.py` logs a warning when `X-Remote-User-Id` and
+  `X-Hass-User-Id` arrive with different values.** Divergence is a
+  strong signal that something upstream is wrong (proxy chain, a
+  sibling addon attempting to spoof one half). Defense-in-depth
+  visibility — the `X-Ingress-Path` regex is still the real spoof
+  barrier.
+
+### Changed
+
+- **`_resolve_ha_creds()` extracted to module level** in `main.py`.
+  Previously embedded in `initialize_configured_state`'s body and
+  untestable in isolation; now a pure helper with a `decrypt`
+  callable parameter for test stubbing. No behavior change in
+  production code paths.
+
+### Tests
+
+- 4 new `setup_post` tests: Supervisor install, Supervisor + ignored
+  user input, Supervisor HA-failure error message, `init_runtime`
+  failure does not generate API key.
+- 7 new `_resolve_ha_creds` tests: env-only, db-only, env preferred
+  over db, partial-env (URL-only / token-only) falls back to db,
+  partial-env + no db raises, neither source raises.
+- 2 new ingress tests: whitespace/case admin value pinned to
+  accept; conflicting user-id headers warns and uses
+  `X-Remote-User-Id`.
+
 ## [1.3.0] - 2026-05-26
 
 ### Fixed (safety hardening — "fail loud, not silent")

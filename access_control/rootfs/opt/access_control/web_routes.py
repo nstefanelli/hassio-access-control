@@ -391,10 +391,20 @@ async def setup_post(
     # password so the admin_password_hash row exists (downstream code
     # assumes it does) but make it unreachable: /login is unreachable
     # under ingress-only deployments, and SSO bypasses it anyway.
+    #
+    # Key on the HA user UUID rather than the username — usernames are
+    # mutable (admin rename, backup restore against a different HA
+    # instance) and would collide; UUIDs are stable per HA user. The
+    # display name still surfaces via request.state.ingress_user["name"]
+    # on every request, so the UI doesn't show a raw UUID.
     ingress_user = getattr(request.state, "ingress_user", None)
     if ingress_user:
         import secrets as _secrets
-        admin_username = ingress_user.get("name") or f"ha-{(ingress_user.get('id') or '')[:8]}"
+        admin_username = (
+            ingress_user.get("id")
+            or ingress_user.get("name")
+            or f"ha-unknown-{_secrets.token_hex(4)}"
+        )
         admin_password = _secrets.token_urlsafe(48)
     elif not admin_username or not admin_password:
         return await _render_error_and_record("Admin username and password are required.")
@@ -411,14 +421,20 @@ async def setup_post(
 
     # 2. Test HA connection.
     #
-    # When the addon runs under Supervisor with `use_supervisor_api: true`
-    # (the default), run.sh exports ACCESS_CONTROL_HA_URL=http://supervisor/core
-    # and ACCESS_CONTROL_HA_TOKEN=$SUPERVISOR_TOKEN. In that mode the user
-    # doesn't need to enter URL/token in the form, and we test against the
-    # Supervisor proxy. ha_url/ha_token form fields are left blank → we
-    # skip persisting them so main.py's env-var fallback (already wired)
-    # keeps working across Supervisor token rotations.
-    if _supervisor_proxy_active() and not ha_url and not ha_token:
+    # When the Supervisor proxy is active (default for addon deployments),
+    # we ALWAYS test against the Supervisor URL and ignore any form-
+    # submitted ha_url/ha_token — the template doesn't render those
+    # fields in that mode, but stray values from autofill, a bookmarklet,
+    # or a curl resubmission could otherwise persist a long-lived token
+    # to the DB. A persisted DB token shadows the Supervisor env var on
+    # restart and breaks the addon after the next token rotation.
+    if _supervisor_proxy_active():
+        if ha_url or ha_token:
+            logger.warning(
+                "Setup form submitted ha_url/ha_token while Supervisor "
+                "proxy is active — ignoring (template should have hidden "
+                "those fields)."
+            )
         ha_url_for_test = os.environ["ACCESS_CONTROL_HA_URL"]
         ha_token_for_test = os.environ["ACCESS_CONTROL_HA_TOKEN"]
         persist_ha_creds = False
@@ -434,13 +450,25 @@ async def setup_post(
     ha_client = HAClient(ha_url_for_test, ha_token_for_test)
     try:
         ok = await ha_client.test_connection()
-        if not ok:
-            return await _render_error_and_record("Failed to connect to Home Assistant. Check URL and token.")
     except Exception as exc:
         logger.warning("Setup HA connection test failed: %s", exc)
-        return await _render_error_and_record("Failed to connect to Home Assistant. Check URL and token.")
+        ok = False
     finally:
         await ha_client.close()
+    if not ok:
+        # Branch the message on which mode we're in — telling a user who
+        # never entered HA creds to "check URL and token" is misleading.
+        if persist_ha_creds:
+            err = "Failed to connect to Home Assistant. Check URL and token."
+        else:
+            err = (
+                "Failed to reach Home Assistant via the Supervisor proxy "
+                "(http://supervisor/core). Verify the addon has "
+                "`homeassistant_api: true` in config.yaml, that Supervisor "
+                "is healthy, and that ACCESS_CONTROL_HA_URL / _TOKEN are "
+                "set (run.sh exports both when use_supervisor_api: true)."
+            )
+        return await _render_error_and_record(err)
 
     # 3. Generate a random secret_key (used for session signing) and encryption salt
     import secrets
@@ -448,7 +476,9 @@ async def setup_post(
     salt = os.urandom(16)
     enc_key = derive_key(secret_key, salt)
 
-    # 4. Save credentials to config
+    # 4. Save credentials to config. init_runtime() below re-reads these
+    # from the DB to bring up the runtime clients (AccessClient, HAClient,
+    # etc.), so the writes have to land before init_runtime() runs.
     await db.set_config("admin_username", admin_username)
     await db.set_config("admin_password_hash", hash_password(admin_password))
     await db.set_config("secret_key", secret_key)
@@ -460,12 +490,11 @@ async def setup_post(
         await db.set_config("ha_url", ha_url)
         await db.set_config("ha_token", encrypt_value(ha_token, enc_key))
 
-    # 5. Generate initial API key
-    raw_key = generate_api_key()
-    await db.add_api_key("default", hash_api_key(raw_key))
-
-    # Mark app as configured so the setup-guard middleware stops redirecting,
-    # then initialize the same runtime state used on a normal configured startup.
+    # 5. Run runtime initialization. The API key is generated AFTER this
+    # succeeds so a failed init doesn't orphan a hashed-but-never-shown
+    # key in the DB. If init fails, the addon recovers on next restart
+    # via lifespan() — credentials are already persisted — but the user
+    # will need to generate an API key from the Settings page manually.
     request.app.state.configured = True
     try:
         init_runtime = getattr(request.app.state, "initialize_configured_state", None)
@@ -475,7 +504,16 @@ async def setup_post(
     except Exception as exc:
         logger.exception("Setup completed but runtime initialization failed")
         request.app.state.configured = False
-        return await _render_error_and_record(f"Setup saved, but runtime initialization failed: {exc}")
+        return await _render_error_and_record(
+            f"Setup saved, but runtime initialization failed: {exc}. "
+            "Credentials were persisted — restart the addon to retry "
+            "(env-var fallback will pick up Supervisor-proxy creds) and "
+            "generate an API key from Settings once it comes up."
+        )
+
+    # 6. Generate the initial API key now that runtime init has succeeded.
+    raw_key = generate_api_key()
+    await db.add_api_key("default", hash_api_key(raw_key))
 
     # Under SSO, send the admin straight into the dashboard — they're already
     # authenticated by HA, no need to bounce through the legacy /login form.

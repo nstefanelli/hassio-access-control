@@ -142,12 +142,23 @@ async def ingress_middleware(request: Request, call_next):
     request.state.ingress_active = True
 
     # Header names differ across HA Supervisor versions: newer builds use
-    # X-Remote-User-*, older Core ingress uses X-Hass-*. Read both.
-    user_id = (
-        request.headers.get("X-Remote-User-Id")
-        or request.headers.get("X-Hass-User-Id")
-        or ""
-    )
+    # X-Remote-User-*, older Core ingress uses X-Hass-*. Read both, and
+    # warn on divergence — same Supervisor request emitting two different
+    # user IDs is a strong signal something upstream is wrong (proxy
+    # chain, addon-on-the-bridge attempting to spoof one half of the
+    # pair, etc.). The X-Ingress-Path check above is still the real
+    # spoof barrier; this is defense-in-depth visibility.
+    rid = request.headers.get("X-Remote-User-Id")
+    hid = request.headers.get("X-Hass-User-Id")
+    if rid and hid and rid != hid:
+        _log.warning(
+            "Conflicting user-id headers in ingress request: "
+            "X-Remote-User-Id=%r X-Hass-User-Id=%r. Trusting "
+            "X-Remote-User-Id (the modern Supervisor scheme).",
+            rid, hid,
+        )
+    user_id = rid or hid or ""
+
     user_name = (
         request.headers.get("X-Remote-User-Name")
         or request.headers.get("X-Remote-User-Display-Name")
