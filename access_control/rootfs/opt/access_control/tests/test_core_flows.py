@@ -463,9 +463,14 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
         """
         db = FakeDB()
         db.get_config = AsyncMock(return_value=None)
+        # Supervisor proxy install: HA Ingress provides the SSO identity,
+        # so request.state.ingress_user is populated. admin_username +
+        # password come from the SSO flow, not the form.
         request = SimpleNamespace(
             scope={},
-            state=SimpleNamespace(),
+            state=SimpleNamespace(
+                ingress_user={"id": "ha-uuid-abc", "name": "nstefanelli"},
+            ),
             client=SimpleNamespace(host="127.0.0.1"),
             app=SimpleNamespace(
                 state=SimpleNamespace(
@@ -516,9 +521,14 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
         """
         db = FakeDB()
         db.get_config = AsyncMock(return_value=None)
+        # Supervisor proxy install: HA Ingress provides the SSO identity,
+        # so request.state.ingress_user is populated. admin_username +
+        # password come from the SSO flow, not the form.
         request = SimpleNamespace(
             scope={},
-            state=SimpleNamespace(),
+            state=SimpleNamespace(
+                ingress_user={"id": "ha-uuid-abc", "name": "nstefanelli"},
+            ),
             client=SimpleNamespace(host="127.0.0.1"),
             app=SimpleNamespace(
                 state=SimpleNamespace(
@@ -569,7 +579,9 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
         db.get_config = AsyncMock(return_value=None)
         request = SimpleNamespace(
             scope={},
-            state=SimpleNamespace(),
+            state=SimpleNamespace(
+                ingress_user={"id": "ha-uuid-abc", "name": "nstefanelli"},
+            ),
             client=SimpleNamespace(host="127.0.0.1"),
             app=SimpleNamespace(state=SimpleNamespace(db=db, configured=False)),
         )
