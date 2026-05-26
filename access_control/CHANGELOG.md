@@ -42,6 +42,21 @@ does nothing for HA integration. Each layer now fails loud:
   before the builder action runs if config.yaml's `.image` field is
   malformed.
 
+### Security
+
+- **Rolled back `fastapi==0.136.3` → `0.136.1`.** OSV advisory
+  [MAL-2026-4750](https://osv.dev/MAL-2026-4750) (published
+  2026-05-23, picked up by pip-audit 2026-05-26) reports that
+  `fastapi 0.136.3` added an undocumented `fastar>=0.9.0` dependency
+  to its `[standard]` extras group — a typosquat / dependency-
+  confusion vector against `fastapi`'s installed namespace. We don't
+  use `fastapi[standard]` in `requirements.txt`, so the typosquat
+  was never actually pulled in, but pip-audit (correctly) flags any
+  install of 0.136.3 as the affected release. 0.136.1 still
+  transitively pulls starlette 1.1.0 (no regression on
+  PYSEC-2026-161). Will revisit once upstream ships a clean
+  successor.
+
 ### Changed
 
 - `ingress.py` module docstring and reject-log message cleaned up:
