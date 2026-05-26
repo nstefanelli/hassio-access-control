@@ -148,6 +148,57 @@ class TestIngressMiddleware(unittest.IsolatedAsyncioTestCase):
         # display name so downstream auth has something non-empty.
         self.assertEqual(req.state.ingress_user, {"id": "abc-def", "name": "abc-def"})
 
+    async def test_admin_value_whitespace_and_mixed_case_accepted(self):
+        # Pin .strip().lower() behavior — a future refactor that drops
+        # either would silently 403 admins in a Supervisor build that
+        # emits padded or capitalized values.
+        for raw in ("  true  ", "True", "TRUE", "\tyes\n", "1\n"):
+            req = _fake_request({
+                "X-Ingress-Path": "/api/hassio_ingress/realtoken123",
+                "X-Remote-User-Id": "uid",
+                "X-Remote-User-Name": "Nick",
+                "X-Remote-User-Is-Admin": raw,
+            })
+            resp = await ingress_middleware(req, _passthrough)
+            self.assertEqual(
+                resp.status_code, 200,
+                f"expected raw {raw!r} to be treated as admin",
+            )
+            self.assertEqual(req.state.ingress_user["id"], "uid")
+
+    async def test_conflicting_user_id_headers_warns_and_uses_remote(self):
+        # X-Remote-User-Id is the modern Supervisor scheme; X-Hass-User-Id
+        # is the legacy alias. If both arrive with different values, log
+        # a warning and trust X-Remote-User-Id.
+        import logging
+        captured_warnings = []
+
+        class _Capture(logging.Logger):
+            def warning(self, msg, *args, **kwargs):
+                captured_warnings.append(msg % args if args else msg)
+
+        # Hot-swap the module-level logger
+        import access_control.ingress as ing_module
+        original_log = ing_module._log
+        ing_module._log = _Capture("test")
+        try:
+            req = _fake_request({
+                "X-Ingress-Path": "/api/hassio_ingress/realtoken123",
+                "X-Remote-User-Id": "modern-uuid",
+                "X-Hass-User-Id": "legacy-uuid",  # different — divergence
+                "X-Remote-User-Name": "Nick",
+            })
+            resp = await ingress_middleware(req, _passthrough)
+        finally:
+            ing_module._log = original_log
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(req.state.ingress_user["id"], "modern-uuid")
+        self.assertTrue(
+            any("Conflicting user-id headers" in m for m in captured_warnings),
+            f"expected divergence warning, got: {captured_warnings}",
+        )
+
     async def test_missing_admin_header_trusts_panel_admin(self):
         # Real-world: current HA Supervisor sends X-Remote-User-Id and
         # X-Remote-User-Name but NO admin-flag header. The middleware must

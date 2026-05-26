@@ -26,6 +26,7 @@ from .api_routes import router as api_router
 from .auth_engine import AuthEngine
 from .config import decrypt_value, derive_key
 from .database import Database
+from .ha_creds import resolve_ha_creds as _resolve_ha_creds
 from .protect_client import ProtectClient
 from .ha_client import HAClient
 from .relock_manager import RelockManager
@@ -35,6 +36,11 @@ from . import web_auth
 logger = logging.getLogger(__name__)
 
 _HERE = Path(__file__).parent
+
+# `_resolve_ha_creds` lives in `ha_creds.py` so the env-vs-DB precedence
+# logic can be unit-tested without dragging FastAPI (and main.py's whole
+# import surface) into the test process. Re-exported here under the same
+# name so the call site below reads naturally.
 
 
 def _log_task_exception(task: asyncio.Task) -> None:
@@ -399,55 +405,16 @@ async def lifespan(app: FastAPI):
             a_user = unvr_username
             a_pass = unvr_password
 
-        # Resolve HA creds. Env vars and DB are two *complete* sources;
-        # mixing them (env URL + DB token, or vice versa) produces a silent
-        # zombie config — the Supervisor proxy URL only accepts
-        # SUPERVISOR_TOKEN, so a stale env URL paired with a DB long-lived
-        # token 401s every HA call while the addon claims to be healthy.
-        # Either both env vars are set (Supervisor proxy path, default for
-        # addon deployments) or neither is (direct-port path, DB is the
-        # source of truth). A *partial* env injection is a misconfig — we
-        # log it loudly and fall back to DB so the operator can at least
-        # see the addon boot.
-        env_ha_url = os.environ.get("ACCESS_CONTROL_HA_URL")
-        env_ha_token = os.environ.get("ACCESS_CONTROL_HA_TOKEN")
-        db_ha_url = await db.get_config("ha_url")
-        db_ha_token_enc = await db.get_config("ha_token")
-
-        if env_ha_url and env_ha_token:
-            ha_url = env_ha_url
-            ha_token = env_ha_token
-            creds_source = "env"
-        elif env_ha_url or env_ha_token:
-            logger.error(
-                "Partial HA env-var injection: ACCESS_CONTROL_HA_URL set=%s "
-                "ACCESS_CONTROL_HA_TOKEN set=%s. Both must be set or neither. "
-                "Refusing to cross-source env+DB; falling back to DB-stored "
-                "creds. Fix run.sh / Supervisor env injection.",
-                bool(env_ha_url),
-                bool(env_ha_token),
-            )
-            ha_url = db_ha_url
-            ha_token = decrypt_value(db_ha_token_enc, enc_key) if db_ha_token_enc else None
-            creds_source = "db (env partial — see error above)"
-        elif db_ha_url and db_ha_token_enc:
-            ha_url = db_ha_url
-            ha_token = decrypt_value(db_ha_token_enc, enc_key)
-            creds_source = "db"
-        else:
-            raise RuntimeError(
-                "HA credentials are incomplete: neither env vars "
-                "(ACCESS_CONTROL_HA_URL/_TOKEN) nor DB-stored "
-                "ha_url/ha_token were available."
-            )
-
-        if not ha_url or not ha_token:
-            # Partial-env fallback to DB hit a DB miss — surface clearly.
-            raise RuntimeError(
-                "HA credentials are incomplete after env-partial fallback: "
-                "DB ha_url=%s, ha_token=%s. Re-run setup or fix the "
-                "Supervisor env injection." % (bool(ha_url), bool(ha_token))
-            )
+        # Resolve HA creds via the module-level helper — see
+        # _resolve_ha_creds() above for the env-vs-DB precedence rules.
+        ha_url, ha_token, creds_source = _resolve_ha_creds(
+            env_url=os.environ.get("ACCESS_CONTROL_HA_URL"),
+            env_token=os.environ.get("ACCESS_CONTROL_HA_TOKEN"),
+            db_url=await db.get_config("ha_url"),
+            db_token_enc=await db.get_config("ha_token"),
+            decrypt=lambda enc: decrypt_value(enc, enc_key),
+            log=logger,
+        )
         logger.info("HA credentials resolved from: %s", creds_source)
 
         # Stash UNVR creds — the supervisor loops use these to recover
