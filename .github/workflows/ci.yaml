@@ -226,8 +226,29 @@ jobs:
           # double-prefix trap where `--docker-hub ghcr.io` + a fully
           # qualified `--image ghcr.io/...` produces `ghcr.io/ghcr.io/...`.
           IMAGE_FULL=$(yq '.image' "${{ matrix.addon }}/config.yaml")
+
+          # Fail loud on parser garbage. yq returns literal "null" for a
+          # missing key; parameter expansion silently produces empty
+          # strings for empty input; a bare image name (no slash) would
+          # duplicate into both --image and --docker-hub fields. The
+          # original 1.2.0 publish-failure bug class returns the moment
+          # this guard is removed.
+          if [[ -z "${IMAGE_FULL}" || "${IMAGE_FULL}" == "null" || "${IMAGE_FULL}" != */* ]]; then
+            echo "::error::config.yaml '.image' must be a registry-qualified path like ghcr.io/owner/repo-{arch} (got: '${IMAGE_FULL}')"
+            exit 1
+          fi
+
           IMAGE_NAME="${IMAGE_FULL##*/}"
           DOCKER_HUB="${IMAGE_FULL%/*}"
+
+          # Defence against the specific regression we hit in 1.2.0: the
+          # IMAGE_NAME shouldn't itself contain a registry host or we'll
+          # re-introduce the doubled `ghcr.io/ghcr.io/...` push target.
+          if [[ "${DOCKER_HUB}/${IMAGE_NAME}" == *ghcr.io/ghcr.io/* ]]; then
+            echo "::error::doubled ghcr.io prefix in computed image path: ${DOCKER_HUB}/${IMAGE_NAME}"
+            exit 1
+          fi
+
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "slug=${SLUG}" >> "${GITHUB_OUTPUT}"
           echo "image_name=${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"

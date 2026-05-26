@@ -4,6 +4,52 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-05-26
+
+### Fixed (safety hardening — "fail loud, not silent")
+
+Post-1.2.6 code review surfaced a stack of three soft-fallback paths
+that together could let a misconfigured Supervisor env injection
+produce an addon that boots, looks healthy in the panel, and silently
+does nothing for HA integration. Each layer now fails loud:
+
+- **`_supervisor_proxy_active()` now XOR-checks the env vars.** When
+  exactly one of `ACCESS_CONTROL_HA_URL` / `ACCESS_CONTROL_HA_TOKEN`
+  is set (broken Supervisor injection, typoed env-export, or a
+  workflow that strips one), we log `ERROR` once and return False
+  rather than silently treating it as direct-port mode.
+- **`initialize_configured_state` requires env vars as a pair.** A
+  stale env URL can no longer pair with a DB-stored long-lived token
+  (which would 401 every HA call against `http://supervisor/core`).
+  Sources are env-only, db-only, or a logged-error fallback to DB on
+  partial env injection. The selected source is logged at INFO so
+  startup diagnostics are explicit.
+- **`app.state.ha_unhealthy` now surfaces the boot-time HA test
+  result.** Previously the `test_connection()` failure path only
+  emitted a `WARNING` and continued; supervisor loops and health
+  endpoints had no flag to react to. Set to `True`/`False`/`None`
+  (initial) so downstream code can degrade gracefully.
+
+### Fixed (CI fail-fast)
+
+- **`.github/workflows/ci.yaml`** now refuses to publish on parser
+  garbage. `yq '.image'` returns the literal string `"null"` if the
+  field is missing, empty input slides through `${IMAGE_FULL##*/}`
+  unchanged, and a bare image name (no `/`) duplicates into both
+  `--image` and `--docker-hub`. Added explicit guards plus a doubled
+  `ghcr.io/ghcr.io/` regression check in the same workflow that
+  introduced the 1.2.0 publish-failure bug. The job now errors
+  before the builder action runs if config.yaml's `.image` field is
+  malformed.
+
+### Changed
+
+- `ingress.py` module docstring and reject-log message cleaned up:
+  dropped the HAOS-version anchor (the behavior has been stable for
+  years and the anchor invited needless re-verification), corrected
+  the rejection-log phrasing which previously claimed "or missing"
+  for a branch that never sees a missing value.
+
 ## [1.2.6] - 2026-05-25
 
 ### Fixed
