@@ -65,7 +65,7 @@ async def toggle_lockdown(request: Request, auth: dict = Depends(verify_api_key)
     """Toggle lockdown mode."""
     _require_scope(auth, "full")
     engine = request.app.state.auth_engine
-    engine.lockdown = not engine.lockdown
+    await engine.set_lockdown(not engine.lockdown)
     return {"lockdown": engine.lockdown}
 
 

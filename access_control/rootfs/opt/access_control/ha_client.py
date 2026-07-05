@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 import aiohttp
 
@@ -52,8 +53,19 @@ class HAClient:
             self._session = aiohttp.ClientSession()
 
     def _headers(self) -> dict[str, str]:
+        # Resolve the token env-first on EVERY call. Supervisor rotates
+        # SUPERVISOR_TOKEN periodically; run.sh re-exports it as
+        # ACCESS_CONTROL_HA_TOKEN, but the value captured at construction
+        # goes stale and would 401 every lock/unlock until an add-on
+        # restart (the circuit breaker treats 401 as "HA responded", so it
+        # never opens and never self-recovers). Env presence means the
+        # Supervisor-proxy path is active — mirror the app's env-first
+        # credential precedence and always use the freshest value.
+        # Non-Supervisor deployments have no env var and fall back to the
+        # DB-configured long-lived token captured at construction.
+        token = os.environ.get("ACCESS_CONTROL_HA_TOKEN") or self._token
         return {
-            "Authorization": f"Bearer {self._token}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
 

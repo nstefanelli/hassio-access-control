@@ -343,6 +343,8 @@ def make_db(
         get_group_locks=AsyncMock(return_value=group_locks or []),
         get_all_alarm_panels=AsyncMock(return_value=alarm_panels or []),
         log_access=AsyncMock(return_value=1),
+        get_config=AsyncMock(return_value=None),
+        set_config=AsyncMock(return_value=None),
     )
 
 
@@ -401,7 +403,7 @@ class TestAuthEngineLockdown(unittest.IsolatedAsyncioTestCase):
         user = make_active_user()
         db = make_db(user=user)
         engine = make_engine(db)
-        engine.lockdown = True
+        await engine.set_lockdown(True)
         result = await engine.process_event("ulp-1", "door-1", method="nfc")
         self.assertFalse(result["granted"])
         self.assertIn("Lockdown", result["reason"])
@@ -555,6 +557,107 @@ class TestAuthEngineCanDisarmTriggersDisarm(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["granted"])
         ha.unlock.assert_awaited_once_with("lock.front")
         ha.alarm_disarm.assert_awaited_once_with("alarm_control_panel.main", code=None)
+
+
+class TestAuthEngineRestrictiveAlarmStates(unittest.IsolatedAsyncioTestCase):
+    """Regression: armed_night / arming / pending must block like armed_away.
+
+    Before the 2026-07-05 fix, _get_alarm_state() could return these states
+    but the block gate only recognised triggered/armed_away/armed_home/unknown,
+    so a blocked-when-armed user walked in during night-arm or the entry/exit
+    delay window (and could auto-disarm on a single tap).
+    """
+
+    def _blocked_group(self):
+        return {
+            "id": 20, "name": "Cleaners", "all_locks": True,
+            "schedule_enabled": False,
+            "blocked_when_armed_away": True, "blocked_when_armed_home": False,
+            "can_disarm": False,
+        }
+
+    async def test_armed_night_blocks(self) -> None:
+        user = make_active_user()
+        panel = {"entity_id": "alarm_control_panel.main"}
+        ha = make_ha(alarm_state="armed_night")
+        db = make_db(user=user, groups=[self._blocked_group()],
+                     locks=[make_lock()], alarm_panels=[panel])
+        engine = make_engine(db, ha=ha)
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+        self.assertFalse(result["granted"])
+        self.assertIn("armed night", result["reason"])
+        ha.unlock.assert_not_awaited()
+
+    async def test_pending_entry_delay_blocks(self) -> None:
+        user = make_active_user()
+        panel = {"entity_id": "alarm_control_panel.main"}
+        ha = make_ha(alarm_state="pending")
+        db = make_db(user=user, groups=[self._blocked_group()],
+                     locks=[make_lock()], alarm_panels=[panel])
+        engine = make_engine(db, ha=ha)
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+        self.assertFalse(result["granted"])
+        ha.unlock.assert_not_awaited()
+
+    async def test_arming_exit_delay_blocks(self) -> None:
+        user = make_active_user()
+        panel = {"entity_id": "alarm_control_panel.main"}
+        ha = make_ha(alarm_state="arming")
+        db = make_db(user=user, groups=[self._blocked_group()],
+                     locks=[make_lock()], alarm_panels=[panel])
+        engine = make_engine(db, ha=ha)
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+        self.assertFalse(result["granted"])
+        ha.unlock.assert_not_awaited()
+
+    async def test_armed_night_no_autodisarm_for_blocked_can_disarm_group(self) -> None:
+        """M1: a can_disarm group that is blocked for the state must neither
+        grant nor auto-disarm the panel. Before the fix, armed_night skipped
+        the block gate and the bare any(can_disarm) auto-disarmed from night."""
+        user = make_active_user()
+        group = {
+            "id": 21, "name": "BlockedButCanDisarm", "all_locks": True,
+            "schedule_enabled": False,
+            "blocked_when_armed_away": True, "blocked_when_armed_home": False,
+            "can_disarm": True,
+        }
+        panel = {"entity_id": "alarm_control_panel.main"}
+        ha = make_ha(alarm_state="armed_night")
+        db = make_db(user=user, groups=[group], locks=[make_lock()],
+                     alarm_panels=[panel])
+        engine = make_engine(db, ha=ha)
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+        self.assertFalse(result["granted"])
+        ha.unlock.assert_not_awaited()
+        ha.alarm_disarm.assert_not_awaited()
+
+
+class TestAuthEngineLockdownPersistence(unittest.IsolatedAsyncioTestCase):
+    """Regression: lockdown must persist across restart (2026-07-05 fix)."""
+
+    async def test_set_lockdown_persists_to_config(self) -> None:
+        db = make_db(user=make_active_user())
+        engine = make_engine(db)
+        await engine.set_lockdown(True)
+        self.assertTrue(engine.lockdown)
+        db.set_config.assert_awaited_once_with("lockdown", "1")
+        await engine.set_lockdown(False)
+        db.set_config.assert_awaited_with("lockdown", "0")
+
+    async def test_load_persisted_lockdown_restores_enabled(self) -> None:
+        db = make_db(user=make_active_user())
+        db.get_config = AsyncMock(return_value="1")
+        engine = make_engine(db)
+        self.assertFalse(engine.lockdown)
+        await engine.load_persisted_lockdown()
+        self.assertTrue(engine.lockdown)
+
+    async def test_load_persisted_lockdown_defaults_disabled(self) -> None:
+        db = make_db(user=make_active_user())
+        db.get_config = AsyncMock(return_value=None)
+        engine = make_engine(db)
+        await engine.load_persisted_lockdown()
+        self.assertFalse(engine.lockdown)
 
 
 if __name__ == "__main__":

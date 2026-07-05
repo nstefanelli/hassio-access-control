@@ -79,6 +79,58 @@ Mitigations:
 - For direct-port deployments, complete setup over a trusted network
   (e.g. localhost via SSH tunnel) before exposing the port
 
+### TLS certificate verification to the UNVR is disabled
+
+The UniFi Access and Protect clients connect to the UNVR console over
+HTTPS with **certificate verification disabled** (`ssl.CERT_NONE`,
+`check_hostname = False`). UNVR consoles ship a self-signed certificate,
+and there is no supported way to pin or trust it per-host.
+
+Trade-off: a DNS-rebinding or on-path attacker who can intercept LAN
+traffic to the UNVR host can present any certificate and harvest the
+service-account credentials at every WebSocket reconnect. Mitigations:
+
+- Deploy the UNVR and the HA host on a trusted, isolated VLAN where
+  on-path attacks are outside the threat model (this app's assumed
+  deployment).
+- The service account should be a least-privilege UniFi Access/Protect
+  account, not a full admin, so a harvested credential is contained.
+- The WS-401 storm counter caps credential replays to 5 consecutive
+  upgrade-401s before refusing to reconnect.
+
+This is a deliberate, documented trade-off — see the rationale block in
+`access_client.py` / `protect_client.py`.
+
+### Co-resident add-ons are within the trust boundary
+
+Under HA Ingress the app authenticates users from the `X-Remote-User-*`
+headers Supervisor injects, gated by a well-formed `X-Ingress-Path`. That
+gate validates the header's **shape only** — it does not (and cannot)
+verify the per-session ingress token, which is a secret shared between HA
+Core and Supervisor, not with this container. The app listens on
+`0.0.0.0:8080` on the shared `hassio` Docker bridge, so a **malicious or
+compromised add-on running on the same HA instance** can connect to this
+container directly and present forged `X-Remote-User-*` headers to be
+trusted as an admin — i.e. unlock doors.
+
+This is treated as an **accepted risk**, not a defended boundary, because:
+
+- Exploiting it requires another add-on already installed and running on
+  the same HA instance. Installing an add-on is an admin action, and
+  add-ons already run as root in their container with whatever API scopes
+  they request — a malicious co-resident add-on is already a serious
+  compromise of the HA host.
+- Every HA admin already has full control of this app by design (there is
+  no per-user authorization inside it); the marginal escalation is from
+  "malicious add-on installed" to "can drive this app's locks".
+
+If your threat model includes untrusted co-resident add-ons, do not rely
+on ingress SSO alone. A future hardening (tracked) would bind SSO-header
+trust to the Supervisor proxy's TCP peer address; it is not implemented
+because uvicorn's `--proxy-headers` rewrites `request.client`, so it needs
+the raw socket peer rather than the post-proxy client, and must not break
+legitimate ingress traffic (which arrives with a rewritten client IP).
+
 ## What's in scope
 
 - The Access Control app's Python code (`access_control/rootfs/opt/access_control/`)

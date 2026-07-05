@@ -78,6 +78,21 @@ Every push to `main` and every PR triggers:
 
 All checks must pass before a PR can merge.
 
+### First publish: make the GHCR package public (one-time, manual)
+
+A newly-created GHCR package is **private by default**. Home Assistant's
+Supervisor pulls the image anonymously (it has no GHCR credentials), so an
+install fails with `pull access denied` / `403` until the package is made
+public — with no in-HA hint that this is the cause. After the first CI push
+of each architecture, the maintainer must flip visibility:
+
+`https://github.com/users/<owner>/packages/container/<image-name>/settings`
+→ **Change visibility** → **Public**.
+
+This is one-time per package per arch — `hassio-access-control-amd64` and
+`hassio-access-control-aarch64` are **separate packages**, so both need it.
+There is no non-PAT API path on the free tier, so it isn't automated.
+
 ## Style notes
 
 - **Python**: roughly PEP 8. No formatter is enforced yet; new code

@@ -4,6 +4,66 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-07-05
+
+### Fixed (security / physical-access correctness)
+
+From a full end-to-end review. Three door-safety defects, each with a
+regression test that fails on the pre-fix code:
+
+- **Auto-relock is now retried while HA stays connected.** A relock that
+  exhausted its two retries (e.g. the lock entity was momentarily
+  `unavailable` — a routine Z-Wave/Zigbee hiccup) previously left its
+  `pending_relocks` row to be retried only on the next HA
+  disconnected→connected transition or restart. If HA never dropped, the
+  door stayed physically unlocked indefinitely with only an ERROR log. The
+  HA health loop now calls `RelockManager.sweep_overdue()` every tick while
+  connected, retrying any past-due row that has no live task, and an
+  `access_control_relock_failed` HA event is fired when a relock first
+  exhausts its retries so automations can alert.
+- **Alarm-armed access block now covers `armed_night`, `arming`, and
+  `pending`.** `_get_alarm_state()` ranks these as armed, but the block gate
+  only recognised `triggered`/`armed_away`/`armed_home`/`unknown`, so a
+  user flagged blocked-when-armed could enter during night-arm or the
+  exit/entry-delay windows (and auto-disarm on a single tap). The gate now
+  fires for any non-disarmed state, and auto-disarm reuses the same guarded
+  `can_disarm` predicate rather than a bare `any(can_disarm)` — a group
+  that is blocked for the current state can no longer trigger a disarm.
+- **Lockdown mode now persists across restarts.** Lockdown was in-memory
+  only; a scheduled reboot, Supervisor watchdog, or HAOS update silently
+  cleared it mid-incident. It is now written to the `config` table via
+  `AuthEngine.set_lockdown()` and restored on startup via
+  `load_persisted_lockdown()`.
+
+### Fixed (resilience)
+
+- **Supervisor token rotation no longer wedges the HA client.** `HAClient`
+  captured the token at construction; when Supervisor rotated
+  `SUPERVISOR_TOKEN`, every lock/unlock 401'd until an add-on restart (the
+  circuit breaker treats 401 as "HA responded", so it never opened). The
+  token is now resolved env-first on every request.
+- **Request timeouts on all UniFi REST calls.** `access_client` and
+  `protect_client` set no `aiohttp` timeout, so a half-open socket to the
+  UNVR could hang `login()`/`_request()` indefinitely — and because
+  `login()` holds `_login_lock`, one hung call stalled every door event.
+  All REST calls now use a 15s total timeout; `login()` clears half-set
+  auth state on timeout so the next call re-authenticates cleanly. The
+  WebSocket keeps its existing `heartbeat` + backoff for liveness.
+- **`protect_client.get_cameras` guards against a non-list response** —
+  an error object or `{"data": [...]}` wrapper no longer crashes the loop.
+
+### Tests / harness
+
+- 14 new regression tests (auth-engine restrictive alarm states + lockdown
+  persistence; relock overdue-sweep + failure-event; HA client env-first
+  token). Suite: **84 passed, 0 skipped**.
+- **Fixed the test harness running against fakes.** A new `conftest.py`
+  imports the real dependencies before the stub-injecting unit modules, so
+  the suite no longer silently shadows fastapi/aiohttp with mocks and the
+  end-to-end `TestClient` tests no longer skip. The CSRF end-to-end test
+  now uses an `https` base URL so the `Secure` session cookie round-trips
+  (it previously asserted a code path it never reached).
+
 ## [1.3.1] - 2026-05-26
 
 ### Fixed (setup robustness)

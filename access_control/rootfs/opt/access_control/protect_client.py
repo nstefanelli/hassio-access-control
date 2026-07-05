@@ -20,6 +20,12 @@ API_WS = "/proxy/protect/ws/updates"
 
 WS_RECONNECT_DELAY = 5  # base delay, exponential backoff up to 300s
 
+# Bound REST calls — aiohttp defaults to no total timeout, so a half-open
+# socket to the UNVR would hang login()/get_cameras() indefinitely (login
+# holds _login_lock). The WebSocket has its own heartbeat + backoff loop.
+# (Audit 2026-07-05.)
+_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
 
 class ProtectClient:
     """UniFi Protect API client — camera listing and doorbell ring WebSocket."""
@@ -80,7 +86,7 @@ class ProtectClient:
             session = self._get_session()
             async with session.post(
                 url, json={"username": self._username, "password": self._password},
-                ssl=self._ssl_ctx,
+                ssl=self._ssl_ctx, timeout=_HTTP_TIMEOUT,
             ) as resp:
                 if resp.status == 401:
                     self._auth_permanently_failed = True
@@ -131,11 +137,19 @@ class ProtectClient:
         session = self._get_session()
         async with session.get(
             self._base_url() + API_CAMERAS,
-            headers=self._headers(), ssl=self._ssl_ctx,
+            headers=self._headers(), ssl=self._ssl_ctx, timeout=_HTTP_TIMEOUT,
         ) as resp:
             if resp.status != 200:
                 return []
             cameras = await resp.json(content_type=None)
+
+        # Defensive: the endpoint normally returns a JSON array, but an error
+        # object or {"data": [...]} wrapper (firmware change) would make the
+        # loop below iterate dict keys (str) and crash on cam.get(). Match the
+        # list-vs-dict guarding access_client already does for user fetch.
+        if not isinstance(cameras, list):
+            _LOGGER.warning("Protect cameras response was %s, not a list — returning []", type(cameras).__name__)
+            return []
 
         result = []
         for cam in cameras:

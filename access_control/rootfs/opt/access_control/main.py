@@ -468,6 +468,10 @@ async def lifespan(app: FastAPI):
             relock_manager=app.state.relock_manager,
         )
 
+        # Restore lockdown mode persisted before a restart (incident control
+        # must survive a reboot). Fail-safe: stays disabled if unreadable.
+        await app.state.auth_engine.load_persisted_lockdown()
+
         await sync_users()
 
         # Lock-state seeding — also used by the HA recovery loop when HA
@@ -647,6 +651,20 @@ async def lifespan(app: FastAPI):
                             logger.exception("Relock rehydrate after HA recovery failed")
                 elif previous_connected and not now_connected:
                     logger.warning("HA connection lost — %s", ha.last_error)
+                elif now_connected:
+                    # Steady-state while connected: sweep any overdue relocks
+                    # that exhausted their retries so a door doesn't stay
+                    # unlocked until the next reconnect/restart. (The recovery
+                    # branch above already runs rehydrate(), which covers the
+                    # transition tick.)
+                    rm = app.state.relock_manager
+                    if rm is not None:
+                        try:
+                            swept = await rm.sweep_overdue()
+                            if swept:
+                                logger.info("Swept %d overdue relock(s)", swept)
+                        except Exception:
+                            logger.exception("Overdue relock sweep failed")
                 previous_connected = now_connected
 
         resilience_tasks.append(asyncio.create_task(

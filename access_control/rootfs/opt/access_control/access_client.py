@@ -28,6 +28,14 @@ API_USER = "/proxy/access/api/v2/users"
 
 SUPPORTED_DEVICE_TYPES = ("UA-Hub-Door-Mini", "UAH", "UA-ULTRA", "UVC G6 Pro Entry")
 
+# Bound every REST call. aiohttp's default is no total timeout, so a
+# half-open socket to the UNVR (console reboot, firewall silently dropping)
+# would hang login()/_request() indefinitely. login() holds _login_lock, so
+# one hung call would stall every subsequent door event. The WebSocket keeps
+# its own liveness via heartbeat= + the reconnect backoff loop, so this
+# applies to REST only. (Audit 2026-07-05.)
+_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
 WS_RECONNECT_DELAY = 5  # seconds
 
 
@@ -135,7 +143,7 @@ class AccessClient:
             session.cookie_jar.clear()
 
             try:
-                async with session.post(url, json=payload, ssl=self._ssl_ctx) as resp:
+                async with session.post(url, json=payload, ssl=self._ssl_ctx, timeout=_HTTP_TIMEOUT) as resp:
                     if resp.status == 401:
                         self._auth_permanently_failed = True
                         text = await resp.text()
@@ -180,7 +188,13 @@ class AccessClient:
                         raise AccessClientError("TOKEN cookie not found in login response")
 
                     logger.info("Logged in to UniFi Access at %s", self._host)
-            except aiohttp.ClientError as exc:
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                # asyncio.TimeoutError (from _HTTP_TIMEOUT) is NOT an
+                # aiohttp.ClientError subclass — catch it explicitly, and
+                # clear any half-set auth state so the next call re-logs in
+                # cleanly rather than sending a stale CSRF token / cookie.
+                self._csrf_token = None
+                self._auth_cookie = None
                 raise AccessClientError(f"Network error during login: {exc}") from exc
 
     # ------------------------------------------------------------------
@@ -228,9 +242,10 @@ class AccessClient:
                     url,
                     headers=headers,
                     ssl=self._ssl_ctx,
+                    timeout=kwargs.pop("timeout", _HTTP_TIMEOUT),
                     **kwargs,
                 )
-            except aiohttp.ClientError as exc:
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 raise AccessClientError(f"Network error for {method} {path}: {exc}") from exc
 
             if resp.status == 401 and attempt == 0:

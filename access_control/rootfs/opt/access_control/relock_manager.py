@@ -170,9 +170,82 @@ class RelockManager:
                 )
                 self._tasks[entity_id] = task
 
+    async def sweep_overdue(self) -> int:
+        """
+        Retry past-due pending relocks that have no live task.
+
+        Called periodically by the HA health loop while HA is connected.
+        This closes the gap where a relock that exhausted its retries (DB
+        row retained) would otherwise only be retried on the next HA
+        disconnected→connected transition or restart — leaving a door
+        physically unlocked indefinitely if HA never drops.
+
+        Only rows whose deadline has passed AND that have no live in-memory
+        task are swept: a future-dated row is owned by its scheduled task,
+        and a live task is already handling that entity. Returns the number
+        of relocks successfully fired.
+        """
+        rows = await self._db.get_pending_relocks()
+        if not rows:
+            return 0
+        now = time.time()
+        swept = 0
+        for row in rows:
+            entity_id = row["entity_id"]
+            deadline = float(row["deadline"])
+            if deadline > now:
+                continue  # a scheduled task owns future-dated rows
+            async with self._lock:
+                existing = self._tasks.get(entity_id)
+                if existing and not existing.done():
+                    continue  # a live task is already handling this entity
+            lock_name = row.get("lock_name") or entity_id
+            _LOGGER.warning(
+                "Sweeping overdue re-lock for %s (deadline %.0fs ago) — retrying now",
+                lock_name, now - deadline,
+            )
+            ok = await self._call_ha_lock(entity_id, lock_name)
+            if not ok:
+                # Still failing — leave the row for the next sweep. The
+                # failure event was already fired when the relock first
+                # exhausted its retries; don't re-fire every 30s.
+                continue
+            # Deadline-conditional delete protects a concurrent schedule()
+            # that wrote a fresh row while we were locking; only fire
+            # on_locked when we actually removed our row.
+            async with self._lock:
+                removed = await self._db.remove_pending_relock_at_deadline(
+                    entity_id, deadline
+                )
+            if removed and self._on_locked is not None:
+                try:
+                    self._on_locked(entity_id)
+                except Exception:
+                    _LOGGER.exception("on_locked callback raised for %s", entity_id)
+            if removed:
+                swept += 1
+        return swept
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    async def _notify_relock_failed(self, entity_id: str, lock_name: str) -> None:
+        """
+        Fire an ``access_control_relock_failed`` HA event so automations can
+        alert on a door that failed to re-lock. Best-effort — a failure to
+        fire the event must not raise into the relock task.
+        """
+        ha = self._get_ha()
+        if not ha:
+            return
+        try:
+            await ha.fire_event(
+                "access_control_relock_failed",
+                {"entity_id": entity_id, "lock_name": lock_name},
+            )
+        except Exception:
+            _LOGGER.exception("Failed to fire relock-failed event for %s", entity_id)
 
     def _cancel_locked(self, entity_id: str) -> None:
         """
@@ -200,6 +273,7 @@ class RelockManager:
         # schedule() / cancel() may have replaced or removed our slot
         # while we were inside _call_ha_lock — in that case we must NOT
         # touch _tasks, the DB row, or the on_locked cache.
+        notify_failed = False
         async with self._lock:
             current = asyncio.current_task()
             if self._tasks.get(entity_id) is not current:
@@ -225,12 +299,21 @@ class RelockManager:
                         "Failed to clear pending_relock row for %s", entity_id
                     )
             else:
-                # All retries exhausted. Leave the DB row so the HA recovery
-                # loop's rehydrate() will retry once HA is healthy.
+                # All retries exhausted. Leave the DB row so the periodic
+                # sweep_overdue() (HA health loop) retries even while HA
+                # stays connected — otherwise the door stays unlocked until
+                # the next restart. Alert via an HA event, fired below
+                # outside the lock so the network call can't stall other
+                # schedule/cancel operations.
                 _LOGGER.error(
-                    "Re-lock FAILED for %s after %d retries — DB row retained for recovery",
+                    "Re-lock FAILED for %s after %d retries — DB row retained; "
+                    "sweep will retry and an HA event has been fired",
                     lock_name, _LOCK_RETRIES,
                 )
+                notify_failed = True
+
+        if notify_failed:
+            await self._notify_relock_failed(entity_id, lock_name)
 
     async def _call_ha_lock(self, entity_id: str, lock_name: str) -> bool:
         """
