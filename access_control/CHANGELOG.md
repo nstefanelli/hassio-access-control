@@ -64,6 +64,12 @@ regression test that fails on the pre-fix code:
   now uses an `https` base URL so the `Secure` session cookie round-trips
   (it previously asserted a code path it never reached).
 
+### Security (dependencies)
+
+- Bumped `aiohttp` 3.13.4 → 3.14.1, `cryptography` 46.0.7 → 48.0.1, and
+  `python-multipart` 0.0.27 → 0.0.31 to clear 15 disclosed CVEs
+  (`pip-audit --strict` is green again on both requirements files).
+
 ## [1.3.1] - 2026-05-26
 
 ### Fixed (setup robustness)
