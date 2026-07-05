@@ -65,7 +65,9 @@ requests**; you can poll as often as you want, within reason.
 
 ### `GET /api/health`
 
-System health snapshot. Any scope.
+System health snapshot. Requires the `full`, `read_only`, or `locks_only`
+scope — every issued scope, but the guard is explicit so a future
+narrower scope must opt in rather than inherit access.
 
 **Response 200:**
 

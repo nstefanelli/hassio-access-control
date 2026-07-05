@@ -116,7 +116,12 @@ class IntegrationTests(unittest.TestCase):
              patch("access_control.protect_client.ProtectClient.login", new=AsyncMock(return_value=None)), \
              patch("access_control.protect_client.ProtectClient.start_websocket", new=AsyncMock(return_value=None)), \
              patch("access_control.ha_client.HAClient.test_connection", new=AsyncMock(return_value=False)):
-            with TestClient(app_module.app) as client:
+            # base_url MUST be https: the session cookie is Secure, so over a
+            # plain-http test transport httpx would drop it and the follow-up
+            # POST would arrive unauthenticated (303 login-redirect) instead of
+            # exercising the CSRF middleware (403). This is what previously made
+            # the end-to-end CSRF assertion unreachable.
+            with TestClient(app_module.app, base_url="https://testserver") as client:
                 login_page = client.get("/login")
                 self.assertEqual(login_page.status_code, 200)
 
@@ -128,6 +133,8 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(login_response.status_code, 303)
                 self.assertEqual(login_response.headers["location"], "/")
 
+                # Authenticated (cookie now round-trips) but no CSRF token —
+                # the CSRF middleware must reject with 403.
                 csrf_fail = client.post("/sync-users", data={}, follow_redirects=False)
                 self.assertEqual(csrf_fail.status_code, 403)
 

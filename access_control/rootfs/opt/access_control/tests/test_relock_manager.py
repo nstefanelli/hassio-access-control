@@ -5,6 +5,7 @@ import asyncio
 import importlib
 import importlib.util
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -44,6 +45,7 @@ def _make_db() -> MagicMock:
 def _make_ha(ok: bool = True) -> MagicMock:
     ha = MagicMock()
     ha.lock = AsyncMock(return_value=ok)
+    ha.fire_event = AsyncMock(return_value=True)
     return ha
 
 
@@ -299,6 +301,87 @@ class TestRelockManagerRehydrate(unittest.TestCase):
             await asyncio.sleep(0)
             self.assertTrue(first_task.cancelled() or first_task.done())
             await mgr.cancel("lock.foo")
+        _run(go())
+
+
+class TestRelockManagerSweepOverdue(unittest.TestCase):
+    """Regression (2026-07-05): a failed relock must be retried while HA stays
+    connected — not only on a reconnect transition — or a door stays unlocked
+    until the next restart."""
+
+    def test_sweep_locks_past_due_row_with_no_task(self) -> None:
+        async def go():
+            db = _make_db()
+            db.get_pending_relocks = AsyncMock(return_value=[
+                {"entity_id": "lock.foo", "lock_name": "Foo",
+                 "deadline": time.time() - 100},
+            ])
+            ha = _make_ha(ok=True)
+            seen: list[str] = []
+            mgr = RelockManager(db=db, ha_client_getter=lambda: ha,
+                                on_locked=seen.append)
+            swept = await mgr.sweep_overdue()
+            self.assertEqual(swept, 1)
+            ha.lock.assert_awaited_once_with("lock.foo")
+            db.remove_pending_relock_at_deadline.assert_awaited_once()
+            self.assertEqual(seen, ["lock.foo"])
+        _run(go())
+
+    def test_sweep_skips_future_dated_rows(self) -> None:
+        async def go():
+            db = _make_db()
+            db.get_pending_relocks = AsyncMock(return_value=[
+                {"entity_id": "lock.bar", "lock_name": "Bar",
+                 "deadline": time.time() + 100},
+            ])
+            ha = _make_ha(ok=True)
+            mgr = RelockManager(db=db, ha_client_getter=lambda: ha)
+            swept = await mgr.sweep_overdue()
+            self.assertEqual(swept, 0)
+            ha.lock.assert_not_awaited()
+        _run(go())
+
+    def test_sweep_skips_entity_with_live_task(self) -> None:
+        async def go():
+            db = _make_db()
+            ha = _make_ha(ok=True)
+            mgr = RelockManager(db=db, ha_client_getter=lambda: ha)
+            # A live scheduled task owns lock.foo (fires in 60s)
+            await mgr.schedule(entity_id="lock.foo", duration=60,
+                               lock_id=1, lock_name="Foo", source="buzz")
+            # A past-due DB row for the same entity must be left to the task
+            db.get_pending_relocks = AsyncMock(return_value=[
+                {"entity_id": "lock.foo", "lock_name": "Foo",
+                 "deadline": time.time() - 100},
+            ])
+            swept = await mgr.sweep_overdue()
+            self.assertEqual(swept, 0)
+            ha.lock.assert_not_awaited()
+            await mgr.cancel("lock.foo")
+        _run(go())
+
+
+class TestRelockManagerFailureEvent(unittest.TestCase):
+    """Regression: a relock that exhausts its retries must fire an HA event so
+    automations can alert on a door that failed to re-lock."""
+
+    def test_failed_relock_fires_ha_event(self) -> None:
+        async def go():
+            db = _make_db()
+            ha = _make_ha(ok=False)
+            mgr = RelockManager(db=db, ha_client_getter=lambda: ha)
+            rm_module._LOCK_RETRY_DELAY = 0.01
+            try:
+                await mgr.schedule(entity_id="lock.foo", duration=0.01,
+                                   lock_id=1, lock_name="Foo", source="buzz")
+                await asyncio.sleep(0.2)
+            finally:
+                rm_module._LOCK_RETRY_DELAY = 1.5
+            ha.fire_event.assert_awaited_once()
+            event_type = ha.fire_event.await_args.args[0]
+            self.assertEqual(event_type, "access_control_relock_failed")
+            # Row retained for the sweep to retry
+            db.remove_pending_relock.assert_not_awaited()
         _run(go())
 
 

@@ -30,14 +30,24 @@ The middleware here does two jobs:
    admin. Downstream auth dependencies can check that state to bypass
    the legacy session-cookie login flow.
 
-**Defense against header injection:** other add-ons on the same Docker
-bridge network could reach this container directly and try to set
-X-Remote-User-* headers themselves. The Supervisor's X-Ingress-Path
-follows a strict format that no other addon can forge without
-guessing the per-session token — we validate the format before
-trusting any SSO header. Without a valid X-Ingress-Path, all
-X-Remote-User-* headers are ignored and the request falls through to
-the legacy session-cookie auth path.
+**X-Ingress-Path is a ROUTING gate, not authentication.** We only read
+X-Remote-User-* headers when the request carries a well-formed
+X-Ingress-Path, so those headers are ignored on non-ingress requests
+(direct-port mode, or anything not pretending to be ingress), which
+fall through to the legacy session-cookie auth path.
+
+But the format check does NOT prove the request came from Supervisor.
+The regex matches any attacker-supplied string of the right shape (e.g.
+`/api/hassio_ingress/x`); we cannot verify the per-session token because
+it is a secret shared between HA Core and Supervisor, not with this
+container. A malicious/compromised add-on on the same Docker bridge can
+therefore reach this container's port directly and present forged
+X-Remote-User-* headers to be trusted as an admin. This is an **accepted
+risk**: co-resident add-ons are within this app's trust boundary — see
+SECURITY.md, "Co-resident add-ons are within the trust boundary". Real
+isolation would require binding trust to the Supervisor proxy's TCP peer
+(uvicorn's --proxy-headers rewrites request.client, so this needs the
+raw peer, not request.client) — a tracked follow-up, not done here.
 """
 from __future__ import annotations
 
@@ -53,13 +63,12 @@ _log = logging.getLogger(__name__)
 # Compared case-insensitively and whitespace-stripped below.
 _ADMIN_TRUE_VALUES = frozenset({"1", "true", "yes"})
 
-# /api/hassio_ingress/<base64url-token>. The token portion is what
-# Supervisor signs per HA session; it's unguessable from outside that
-# session, so requiring a well-formed X-Ingress-Path means we'll only
-# trust SSO headers that came through the real ingress proxy.
-# Use \A and \Z anchors (instead of ^ / $) so a trailing newline injected
-# into the header value can't bypass the format check — `$` matches before
-# `\n` at end-of-string by default.
+# /api/hassio_ingress/<base64url-token>. This validates the SHAPE of the
+# header only — it is a routing gate, NOT proof the request came through
+# Supervisor (the token is not verified; see the module docstring's
+# accepted-risk note). Use \A and \Z anchors (instead of ^ / $) so a
+# trailing newline injected into the header value can't bypass the format
+# check — `$` matches before `\n` at end-of-string by default.
 INGRESS_PATH_RE = re.compile(r"\A/api/hassio_ingress/[A-Za-z0-9_-]+\Z")
 
 _FORBIDDEN_BODY = (

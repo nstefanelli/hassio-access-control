@@ -21,6 +21,19 @@ _LOGGER = logging.getLogger(__name__)
 # Maps weekday() index (0=Monday) to short day name used in schedule_days
 DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
+# Non-disarmed alarm states with no dedicated per-state blocking flag.
+# These are treated as fully restrictive: a user is blocked if they hold
+# ANY blocking flag (blocked_when_armed_away OR blocked_when_armed_home).
+#   - triggered / unknown: already handled this way historically.
+#   - armed_night: no dedicated flag exists; blocking must still apply.
+#   - arming / pending: the exit-delay and entry-delay windows — a blocked
+#     user tapping here would otherwise slip in (and auto-disarm) before the
+#     panel ever trips. _get_alarm_state() ranks all of these as armed, so
+#     the block gate below must recognise them too (audit 2026-07-05).
+_FULLY_RESTRICTIVE_ALARM_STATES = frozenset(
+    {"triggered", "unknown", "armed_night", "arming", "pending"}
+)
+
 
 class AuthEngine:
     """
@@ -63,10 +76,42 @@ class AuthEngine:
         """When True, all access requests are denied regardless of rules."""
         return self._lockdown
 
-    @lockdown.setter
-    def lockdown(self, value: bool) -> None:
+    async def set_lockdown(self, value: bool) -> None:
+        """
+        Set lockdown mode AND persist it to the config table.
+
+        Lockdown is an incident-response control: it must survive a restart
+        (scheduled reboot, Supervisor watchdog, HAOS update). Persisting here
+        — rather than in a synchronous property setter that can't await a DB
+        write — is what keeps the door locked across a restart mid-incident.
+        Callers MUST use this instead of assigning `.lockdown` directly.
+        """
         self._lockdown = bool(value)
         _LOGGER.warning("Lockdown mode %s", "ENABLED" if self._lockdown else "DISABLED")
+        try:
+            await self._db.set_config("lockdown", "1" if self._lockdown else "0")
+        except Exception:
+            # Fail loud but don't crash the toggle — the in-memory flag is set,
+            # and an operator enabling lockdown during an incident must not get
+            # an error back. The persistence gap is logged for follow-up.
+            _LOGGER.exception("Failed to persist lockdown state to config table")
+
+    async def load_persisted_lockdown(self) -> None:
+        """
+        Restore lockdown mode from the config table on startup.
+
+        Fail-safe: if the row can't be read, lockdown stays disabled (the
+        prior behavior), but a persisted ENABLED state is honored so an
+        incident lockdown is not silently dropped by a restart.
+        """
+        try:
+            value = await self._db.get_config("lockdown")
+        except Exception:
+            _LOGGER.exception("Failed to read persisted lockdown — leaving disabled")
+            return
+        self._lockdown = value == "1"
+        if self._lockdown:
+            _LOGGER.warning("Lockdown mode restored as ENABLED from persisted state")
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -148,21 +193,25 @@ class AuthEngine:
             if not g.get("schedule_enabled") or self._check_schedule(g)
         ]
 
-        if alarm_state in ("triggered", "armed_away", "armed_home", "unknown"):
+        # can_disarm is computed under the armed branch below and reused for
+        # the auto-disarm decision after a grant. Default False so a disarmed
+        # panel (nothing to disarm) never triggers auto-disarm.
+        can_disarm = False
+        if alarm_state != "disarmed":
             # Block-when-armed always applies regardless of schedule (a
             # blocking group blocks deny-first). can_disarm overrides only
             # from schedule-active groups.
             any_blocking = any(
                 (alarm_state == "armed_away" and g.get("blocked_when_armed_away"))
                 or (alarm_state == "armed_home" and g.get("blocked_when_armed_home"))
-                or (alarm_state in ("triggered", "unknown") and (g.get("blocked_when_armed_away") or g.get("blocked_when_armed_home")))
+                or (alarm_state in _FULLY_RESTRICTIVE_ALARM_STATES and (g.get("blocked_when_armed_away") or g.get("blocked_when_armed_home")))
                 for g in user_groups
             )
             can_disarm = any(
                 g.get("can_disarm")
                 and not (alarm_state == "armed_away" and g.get("blocked_when_armed_away"))
                 and not (alarm_state == "armed_home" and g.get("blocked_when_armed_home"))
-                and not (alarm_state in ("triggered", "unknown") and (g.get("blocked_when_armed_away") or g.get("blocked_when_armed_home")))
+                and not (alarm_state in _FULLY_RESTRICTIVE_ALARM_STATES and (g.get("blocked_when_armed_away") or g.get("blocked_when_armed_home")))
                 for g in active_groups
             )
 
@@ -291,11 +340,15 @@ class AuthEngine:
                 method=method,
                 locks=granted_locks,
             )
-            # Only auto-disarm if an active (schedule-valid) group has can_disarm
-            if any(g.get("can_disarm") for g in active_groups):
+            # Auto-disarm reuses the SAME guarded predicate computed above:
+            # a group that is blocked-when-armed for the current state must
+            # not be able to trigger a disarm (otherwise a blocked user could
+            # auto-disarm the panel on a single tap). can_disarm is False when
+            # the panel is already disarmed, so this is a no-op then.
+            if can_disarm:
                 await self._auto_disarm(user_name)
             else:
-                _LOGGER.info("Skipping auto-disarm — user %s has no can_disarm group", user_name)
+                _LOGGER.info("Skipping auto-disarm — user %s has no eligible can_disarm group", user_name)
             return {
                 "granted": True,
                 "user_name": user_name,
