@@ -33,7 +33,7 @@ jobs:
     name: Tag + release if version bumped
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           # We need full history so we can compare config.yaml across
