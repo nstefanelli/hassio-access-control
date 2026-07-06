@@ -32,8 +32,8 @@ jobs:
     name: yamllint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: frenck/action-yamllint@v1.5.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: frenck/action-yamllint@34b4bbcaeabedcfefad6adea8c5bbc42af0e2d47 # v1.5.0
 
   hadolint:
     name: hadolint (${{ matrix.addon }})
@@ -42,8 +42,8 @@ jobs:
       matrix:
         addon: [access_control]
     steps:
-      - uses: actions/checkout@v6
-      - uses: hadolint/hadolint-action@v3.3.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
         with:
           dockerfile: ${{ matrix.addon }}/Dockerfile
 
@@ -51,8 +51,8 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: ludeeus/action-shellcheck@2.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
         env:
           SHELLCHECK_OPTS: "-e SC1008 -s bash"
         with:
@@ -69,8 +69,8 @@ jobs:
       matrix:
         addon: [access_control]
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
           cache: pip
@@ -91,8 +91,8 @@ jobs:
       matrix:
         addon: [access_control]
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
       - name: Install bandit
@@ -112,8 +112,8 @@ jobs:
       matrix:
         addon: [access_control]
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
       - name: Install pip-audit
@@ -133,7 +133,7 @@ jobs:
       changed_addons: ${{ steps.detect.outputs.addons }}
       changed: ${{ steps.detect.outputs.changed }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
       - name: Detect changed apps
@@ -203,7 +203,10 @@ jobs:
     name: Build ${{ matrix.addon }} (${{ matrix.arch }})
     needs: init
     if: needs.init.outputs.changed == 'true'
-    runs-on: ubuntu-latest
+    # aarch64 builds natively on GitHub's arm64 runners. This is not just a
+    # speed win: the composable build-image action does NOT set up QEMU, so
+    # cross-building aarch64 on an amd64 runner would fail outright.
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -212,7 +215,7 @@ jobs:
           - amd64
           - aarch64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Read app metadata
         id: meta
@@ -220,19 +223,24 @@ jobs:
           set -euo pipefail
           VERSION=$(yq '.version' "${{ matrix.addon }}/config.yaml")
           SLUG=$(yq '.slug' "${{ matrix.addon }}/config.yaml")
-          # Derive --image / --docker-hub from config.yaml's `image:` field
-          # so the published image name is always the one Supervisor will
-          # pull. Splitting registry/owner from repo name avoids the
-          # double-prefix trap where `--docker-hub ghcr.io` + a fully
-          # qualified `--image ghcr.io/...` produces `ghcr.io/ghcr.io/...`.
+          NAME=$(yq '.name' "${{ matrix.addon }}/config.yaml")
+          # Folded scalars are single-line, but flatten defensively: a
+          # newline here would corrupt the GITHUB_OUTPUT / build-args
+          # line-oriented formats.
+          DESCRIPTION=$(yq '.description' "${{ matrix.addon }}/config.yaml" | tr '\n' ' ')
+          # Derive the image name / registry prefix from config.yaml's
+          # `image:` field so the published image name is always the one
+          # Supervisor will pull. Splitting registry/owner from repo name
+          # avoids the double-prefix trap where a registry host + a fully
+          # qualified image produces `ghcr.io/ghcr.io/...`.
           IMAGE_FULL=$(yq '.image' "${{ matrix.addon }}/config.yaml")
 
           # Fail loud on parser garbage. yq returns literal "null" for a
           # missing key; parameter expansion silently produces empty
           # strings for empty input; a bare image name (no slash) would
-          # duplicate into both --image and --docker-hub fields. The
-          # original 1.2.0 publish-failure bug class returns the moment
-          # this guard is removed.
+          # collapse the registry prefix into the repo name. The original
+          # 1.2.0 publish-failure bug class returns the moment this guard
+          # is removed.
           if [[ -z "${IMAGE_FULL}" || "${IMAGE_FULL}" == "null" || "${IMAGE_FULL}" != */* ]]; then
             echo "::error::config.yaml '.image' must be a registry-qualified path like ghcr.io/owner/repo-{arch} (got: '${IMAGE_FULL}')"
             exit 1
@@ -240,6 +248,16 @@ jobs:
 
           IMAGE_NAME="${IMAGE_FULL##*/}"
           DOCKER_HUB="${IMAGE_FULL%/*}"
+
+          # Unlike the legacy builder, build-image does NOT substitute the
+          # {arch} placeholder — do it here, and fail loud if any brace
+          # survives, because Supervisor pulls <name>-<arch> literally and
+          # a name skew bricks the install.
+          IMAGE_NAME="${IMAGE_NAME//\{arch\}/${{ matrix.arch }}}"
+          if [[ "${IMAGE_NAME}" == *[{}]* ]]; then
+            echo "::error::unsubstituted placeholder in image name: ${IMAGE_NAME}"
+            exit 1
+          fi
 
           # Defence against the specific regression we hit in 1.2.0: the
           # IMAGE_NAME shouldn't itself contain a registry host or we'll
@@ -249,44 +267,54 @@ jobs:
             exit 1
           fi
 
+          # Per-arch base image for the BUILD_FROM build-arg (the legacy
+          # builder read build.yaml itself; build-image does not).
+          BUILD_FROM=$(yq ".build_from.${{ matrix.arch }}" "${{ matrix.addon }}/build.yaml")
+          if [[ -z "${BUILD_FROM}" || "${BUILD_FROM}" == "null" ]]; then
+            echo "::error::build.yaml has no build_from entry for arch '${{ matrix.arch }}'"
+            exit 1
+          fi
+
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "slug=${SLUG}" >> "${GITHUB_OUTPUT}"
+          echo "name=${NAME}" >> "${GITHUB_OUTPUT}"
+          echo "description=${DESCRIPTION}" >> "${GITHUB_OUTPUT}"
           echo "image_name=${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
           echo "docker_hub=${DOCKER_HUB}" >> "${GITHUB_OUTPUT}"
+          echo "build_from=${BUILD_FROM}" >> "${GITHUB_OUTPUT}"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${GITHUB_OUTPUT}"
 
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
+      # build-image logs into the registry itself when push=true, so no
+      # separate docker/login-action step is needed. BUILD_ARCH and
+      # BUILD_VERSION build-args plus the io.hass.arch / io.hass.version /
+      # org.opencontainers.image.{created,source,version} labels are
+      # injected by the action; the remaining BUILD_* args below populate
+      # the Dockerfile's LABEL block (io.hass.name, OCI title/description/
+      # revision/licenses), which covers everything build.yaml's `labels:`
+      # key used to add. PRs build both arches but never push.
+      - name: Build image (push on non-PR)
+        uses: home-assistant/builder/actions/build-image@4de35182ce1e329181bffcbcc84d33db5e2c7e10 # 2026.06.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build app (PR test)
-        if: github.event_name == 'pull_request'
-        uses: home-assistant/builder@2026.03.2
-        with:
-          args: |
-            --${{ matrix.arch }} \
-            --target /data/${{ matrix.addon }} \
-            --image "${{ steps.meta.outputs.image_name }}" \
-            --docker-hub "${{ steps.meta.outputs.docker_hub }}" \
-            --version "${{ steps.meta.outputs.version }}" \
-            --addon \
-            --test
-
-      - name: Build & publish app
-        if: github.event_name != 'pull_request'
-        uses: home-assistant/builder@2026.03.2
-        with:
-          args: |
-            --${{ matrix.arch }} \
-            --target /data/${{ matrix.addon }} \
-            --image "${{ steps.meta.outputs.image_name }}" \
-            --docker-hub "${{ steps.meta.outputs.docker_hub }}" \
-            --docker-hub-check \
-            --version "${{ steps.meta.outputs.version }}" \
-            --addon
+          arch: ${{ matrix.arch }}
+          image: ${{ steps.meta.outputs.docker_hub }}/${{ steps.meta.outputs.image_name }}
+          image-tags: |
+            ${{ steps.meta.outputs.version }}
+            latest
+          version: ${{ steps.meta.outputs.version }}
+          context: ${{ matrix.addon }}
+          file: ${{ matrix.addon }}/Dockerfile
+          build-args: |
+            BUILD_FROM=${{ steps.meta.outputs.build_from }}
+            BUILD_NAME=${{ steps.meta.outputs.name }}
+            BUILD_DESCRIPTION=${{ steps.meta.outputs.description }}
+            BUILD_REF=${{ github.sha }}
+            BUILD_REPOSITORY=${{ github.repository }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-gha-scope: ${{ matrix.addon }}
+          container-registry: ghcr.io
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          push: ${{ github.event_name != 'pull_request' }}
+          cosign: false
 
   # ---- Aggregation gate: enforces that every matrix leg succeeded ----
 

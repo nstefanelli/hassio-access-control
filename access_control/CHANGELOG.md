@@ -4,6 +4,28 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-07-06
+
+### Changed (CI only — no runtime/app changes)
+
+- **Migrated CI off the deprecated monolithic `home-assistant/builder`
+  action** to the composable
+  `home-assistant/builder/actions/build-image` action (2026.06.0). The
+  legacy action's container image is no longer published, which broke
+  builds with `manifest unknown` (Dependabot PR #32). Per-arch images are
+  still published separately as
+  `ghcr.io/nstefanelli/hassio-access-control-amd64` and `-aarch64` with
+  the same version + `latest` tags, so Supervisor pulls are unaffected.
+- aarch64 images now build natively on GitHub's `ubuntu-24.04-arm`
+  runners instead of under QEMU emulation.
+- All third-party GitHub Actions in CI and Release workflows are now
+  pinned to full commit SHAs (Dependabot keeps them current);
+  `actions/checkout` bumped v6 → v7.
+- Behaviour note: pushes to `main` now rebuild and re-push the current
+  version tag and move `latest` on every build (the legacy
+  `--docker-hub-check` skip-if-already-published behaviour is gone).
+  Pull requests build both architectures without pushing.
+
 ## [1.4.0] - 2026-07-05
 
 ### Fixed (security / physical-access correctness)
