@@ -66,6 +66,19 @@ falling back to user-entered HA credentials"
     fi
 fi
 
+# The schema allows HA's full level list (trace..fatal) but uvicorn only
+# accepts critical|error|warning|info|debug|trace — passing `notice` or
+# `fatal` straight through made uvicorn exit at startup, crash-looping
+# the add-on from a supported config value (e2e review 2026-07-12). Map
+# the two HA-only levels; the app reads the unmapped value via
+# APP_LOG_LEVEL so its own loggers honor the option too.
+export APP_LOG_LEVEL="${LOG_LEVEL}"
+case "${LOG_LEVEL}" in
+    notice) UVICORN_LOG_LEVEL=info ;;
+    fatal)  UVICORN_LOG_LEVEL=critical ;;
+    *)      UVICORN_LOG_LEVEL="${LOG_LEVEL}" ;;
+esac
+
 bashio::log.info "Starting Access Control on port ${PORT} (log level: ${LOG_LEVEL})"
 
 # `--app-dir /opt` so uvicorn imports `access_control` as a package
@@ -74,7 +87,7 @@ exec python3 -m uvicorn access_control.main:app \
     --app-dir /opt \
     --host 0.0.0.0 \
     --port "${PORT}" \
-    --log-level "${LOG_LEVEL}" \
+    --log-level "${UVICORN_LOG_LEVEL}" \
     --no-server-header \
     --proxy-headers \
     --forwarded-allow-ips='127.0.0.1,172.30.32.2'

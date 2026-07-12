@@ -108,7 +108,10 @@ _HA_ENTITY_ID_RE = re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _LOCKS_CACHE_TTL = 30
 _VISITORS_CACHE_TTL = 30
-_ALARM_CACHE_TTL = 5
+# Must exceed the home page's 10s htmx auto-refresh: at the old 5s TTL
+# every poll was a guaranteed cache miss — an HA call plus a ui_cache
+# write transaction every 10s per open tab (e2e review 2026-07-12).
+_ALARM_CACHE_TTL = 15
 _ACTION_RATE_LIMIT = {"max_attempts": 20, "window": 60, "lockout": 60}
 _LOGIN_RATE_LIMIT = {"max_attempts": 5, "window": 300, "lockout": 60}
 # /setup is intentionally CSRF + login exempt (first-run has no session
@@ -291,12 +294,17 @@ async def login_post(
     stored_username = await db.get_config("admin_username")
     stored_password_hash = await db.get_config("admin_password_hash")
 
-    if (
-        stored_username is None
-        or stored_password_hash is None
-        or username != stored_username
-        or not verify_password(password, stored_password_hash)
-    ):
+    # PBKDF2 at 480k iterations is ~hundreds of ms of pure CPU — run it
+    # in a worker thread so a login attempt can't stall the event loop
+    # (and with it WS door-event dispatch and relock timers). e2e review
+    # 2026-07-12.
+    password_ok = False
+    if stored_username is not None and stored_password_hash is not None:
+        password_ok = await asyncio.to_thread(
+            verify_password, password, stored_password_hash
+        )
+
+    if stored_username is None or username != stored_username or not password_ok:
         await db.record_rate_limit_failure("login", client_ip, **_LOGIN_RATE_LIMIT)
         return templates.TemplateResponse(
             request,
@@ -480,7 +488,9 @@ async def setup_post(
     # from the DB to bring up the runtime clients (AccessClient, HAClient,
     # etc.), so the writes have to land before init_runtime() runs.
     await db.set_config("admin_username", admin_username)
-    await db.set_config("admin_password_hash", hash_password(admin_password))
+    await db.set_config(
+        "admin_password_hash", await asyncio.to_thread(hash_password, admin_password)
+    )
     await db.set_config("secret_key", secret_key)
     await db.set_config("encryption_salt", salt.hex())
     await db.set_config("unvr_host", unvr_host)
@@ -796,11 +806,22 @@ async def locks_list(request: Request, user: str = Depends(require_login)):
     all_ha_locks = []
     ha_states = {}
     if ha and ha.connected:
-        try:
-            all_ha_locks = await ha.get_lock_entities()
-            ha_states = {l["entity_id"]: l["state"] for l in all_ha_locks}
-        except Exception:
-            logger.exception("Failed to fetch HA lock states")
+        # get_lock_entities() downloads HA's ENTIRE /api/states payload
+        # (1-5 MB on a mid-sized install) — cache the filtered result
+        # like the Access/Protect lists below instead of paying 200-800ms
+        # per page render (e2e review 2026-07-12).
+        cached_ha_locks = await db.get_ui_cache("locks_ha_lock_entities")
+        if cached_ha_locks is not None:
+            all_ha_locks = cached_ha_locks
+        else:
+            try:
+                all_ha_locks = await ha.get_lock_entities()
+                await db.set_ui_cache(
+                    "locks_ha_lock_entities", all_ha_locks, _LOCKS_CACHE_TTL
+                )
+            except Exception:
+                logger.exception("Failed to fetch HA lock states")
+        ha_states = {l["entity_id"]: l["state"] for l in all_ha_locks}
 
     for lock in locks:
         if lock["type"] == "ha_external" and lock.get("entity_id"):
@@ -1744,14 +1765,23 @@ async def _load_settings_context(request: Request, db, enc_key) -> dict:
     ha_alarms = []
     if ha and ha.connected:
         try:
-            ha_alarms = await ha.get_alarm_entities()
+            # Same full-/api/states download as the locks page — cache
+            # the filtered list rather than re-downloading per render.
+            ha_alarms = await db.get_ui_cache("settings_ha_alarm_entities")
+            if ha_alarms is None:
+                ha_alarms = await ha.get_alarm_entities()
+                await db.set_ui_cache(
+                    "settings_ha_alarm_entities", ha_alarms, _LOCKS_CACHE_TTL
+                )
             existing_eids = {p["entity_id"] for p in alarm_panels}
             ha_alarms = [a for a in ha_alarms if a["entity_id"] not in existing_eids]
         except Exception as exc:
             # HA may have temporarily dropped or returned an unexpected
             # shape — Settings page renders with an empty alarm dropdown.
-            # Log for diagnostics.
+            # Log for diagnostics. (ha_alarms may be None here if the
+            # cache missed and the fetch raised.)
             logger.warning("Settings: could not fetch HA alarm entities: %s", exc)
+            ha_alarms = []
 
     admin_log = await db.get_admin_log(50)
 

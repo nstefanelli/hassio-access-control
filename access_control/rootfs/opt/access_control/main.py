@@ -10,9 +10,25 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Ensure app-level loggers propagate to stdout (uvicorn suppresses by default)
+# Ensure app-level loggers propagate to stdout (uvicorn suppresses by default).
+# Honor the add-on's log_level option (exported by run.sh as APP_LOG_LEVEL):
+# previously this was pinned to INFO, so selecting `debug` in the add-on
+# config changed uvicorn's chatter but never enabled the app's own debug
+# logs (e2e review 2026-07-12). HA levels that Python lacks map to the
+# nearest Python level.
+_HA_TO_PY_LEVEL = {
+    "trace": logging.DEBUG,
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "notice": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+    "fatal": logging.CRITICAL,
+}
 logging.basicConfig(
-    level=logging.INFO,
+    level=_HA_TO_PY_LEVEL.get(
+        os.environ.get("APP_LOG_LEVEL", "info").strip().lower(), logging.INFO
+    ),
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     stream=sys.stdout,
 )
@@ -138,6 +154,11 @@ async def lifespan(app: FastAPI):
 
         logger.info("Starting user/lock sync…")
         try:
+            # Batch every upsert into ONE transaction: this runs every
+            # 15 minutes forever, and per-row commits were thousands of
+            # fsync'd write transactions/day at idle — real SD-card wear
+            # on the hosts this targets (e2e review 2026-07-12).
+            # upsert_user additionally skips unchanged rows entirely.
             users = await access_client.fetch_users()
             active_ulp_ids: list[str] = []
             for u in users:
@@ -149,8 +170,11 @@ async def lifespan(app: FastAPI):
                     name=u.get("name", ""),
                     email=u.get("email") or None,
                     status=u.get("status", "active"),
+                    commit=False,
                 )
                 active_ulp_ids.append(ulp_id)
+            # mark_deleted_users commits internally, flushing the user
+            # batch with it.
             await db.mark_deleted_users(active_ulp_ids)
             logger.info("Synced %d users", len(active_ulp_ids))
 
@@ -163,7 +187,9 @@ async def lifespan(app: FastAPI):
                     location_id=door["location_id"],
                     name=door["name"],
                     door_name=door.get("door_name"),
+                    commit=False,
                 )
+            await db.commit()
             logger.info("Synced %d native lock(s)", len(hub_devices))
 
             new_map: dict[str, str] = {}
@@ -181,6 +207,12 @@ async def lifespan(app: FastAPI):
 
         except Exception:
             logger.exception("sync_users() failed")
+            # Discard any half-written batch so a later commit from an
+            # unrelated write can't flush partial sync state.
+            try:
+                await db.rollback()
+            except Exception:
+                logger.exception("sync_users() rollback failed")
 
     # Semaphore to cap concurrent process_event invocations during event floods
     _event_semaphore = asyncio.Semaphore(5)
@@ -648,9 +680,15 @@ async def lifespan(app: FastAPI):
                     access_client = app.state.access_client
                     if not access_client:
                         continue
+                    # Check the (cheap, local) visitor table BEFORE the
+                    # TLS round-trip to the console — with no visitors
+                    # this loop was still making 1,440 UNVR requests/day
+                    # forever (e2e review 2026-07-12).
+                    local_visitors = await db.get_all_visitors()
+                    if not local_visitors:
+                        continue
                     unvr_visitors = await access_client.list_visitors()
                     unvr_map = {v["unique_id"]: v for v in unvr_visitors}
-                    local_visitors = await db.get_all_visitors()
                     for lv in local_visitors:
                         uvid = lv["unvr_visitor_id"]
                         uv = unvr_map.get(uvid)
