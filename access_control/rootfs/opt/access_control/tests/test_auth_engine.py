@@ -660,5 +660,43 @@ class TestAuthEngineLockdownPersistence(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(engine.lockdown)
 
 
+class TestScheduleTimezone(unittest.TestCase):
+    """Schedules must evaluate in the site's timezone, not a hardcoded one
+    (e2e review 2026-07-12: _TZ was pinned to America/New_York)."""
+
+    def test_set_timezone_valid_and_invalid(self) -> None:
+        engine = make_engine(make_db())
+        self.assertTrue(engine.set_timezone("Europe/Berlin"))
+        self.assertEqual(str(engine.tz), "Europe/Berlin")
+        # Invalid zone is rejected and the current zone is kept.
+        self.assertFalse(engine.set_timezone("Not/AZone"))
+        self.assertEqual(str(engine.tz), "Europe/Berlin")
+
+    def test_schedule_day_follows_configured_timezone(self) -> None:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        engine = make_engine(make_db())
+        day_names = auth_engine_module.DAY_NAMES
+
+        # Etc/GMT-14 is UTC+14 and Etc/GMT+12 is UTC-12 — 26 hours apart,
+        # so the calendar date (and therefore weekday) ALWAYS differs
+        # between them at any instant. A day-restricted schedule must
+        # follow the configured zone's weekday.
+        east = "Etc/GMT-14"
+        west = "Etc/GMT+12"
+        east_day = day_names[datetime.now(ZoneInfo(east)).weekday()]
+        west_day = day_names[datetime.now(ZoneInfo(west)).weekday()]
+        self.assertNotEqual(east_day, west_day)
+
+        rule = {"schedule_days": east_day, "schedule_start": None, "schedule_end": None}
+        self.assertTrue(engine.set_timezone(east))
+        self.assertTrue(engine._check_schedule(rule))
+        # Same rule, same instant — a zone on the other side of the date
+        # line is on a different weekday, so the schedule must deny.
+        self.assertTrue(engine.set_timezone(west))
+        self.assertFalse(engine._check_schedule(rule))
+
+
 if __name__ == "__main__":
     unittest.main()

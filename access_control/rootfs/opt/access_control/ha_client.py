@@ -170,6 +170,35 @@ class HAClient:
             self._circuit.record_failure()
             return None
 
+    async def get_timezone(self) -> str | None:
+        """
+        Return HA's configured IANA timezone (``/api/config`` →
+        ``time_zone``), or None if unavailable. Used to align schedule
+        evaluation with the site's local time.
+        """
+        if self._circuit.is_open():
+            _LOGGER.warning("HA circuit open — skipping get_timezone")
+            return None
+        await self._ensure_session()
+        try:
+            async with self._session.get(
+                f"{self._url}/api/config",
+                headers=self._headers(),
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self._circuit.record_success()
+                    return data.get("time_zone") or None
+                _LOGGER.warning("HA get_timezone returned HTTP %s", resp.status)
+                self._circuit.record_success()  # HA responded — not a network failure
+                return None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            _LOGGER.warning("HA get_timezone failed: %s", err)
+            self._last_error = str(err)
+            self._circuit.record_failure()
+            return None
+
     async def get_lock_entities(self) -> list[dict]:
         """Fetch all lock.* entities from HA with friendly name and state."""
         if self._circuit.is_open():
