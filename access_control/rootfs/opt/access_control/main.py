@@ -499,6 +499,13 @@ async def lifespan(app: FastAPI):
             ha_client_getter=lambda: app.state.ha_client,
             access_client_getter=lambda: app.state.access_client,
             on_hub_state=_mark_hub_state,
+            # HA entity state is writable by any HA token/integration, so
+            # hub sync must not be able to hold a door open during an
+            # incident lockdown — the manager suppresses unlock
+            # transitions while this returns True.
+            lockdown_getter=lambda: bool(
+                app.state.auth_engine and app.state.auth_engine.lockdown
+            ),
         )
 
         app.state.auth_engine = AuthEngine(

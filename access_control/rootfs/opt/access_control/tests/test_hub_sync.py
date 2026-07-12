@@ -71,12 +71,13 @@ def _make_access(connected: bool = True) -> MagicMock:
     return access
 
 
-def _make_mgr(db, ha, access, on_hub_state=None) -> HubSyncManager:
+def _make_mgr(db, ha, access, on_hub_state=None, lockdown=None) -> HubSyncManager:
     return HubSyncManager(
         db=db,
         ha_client_getter=lambda: ha,
         access_client_getter=lambda: access,
         on_hub_state=on_hub_state,
+        lockdown_getter=lockdown,
     )
 
 
@@ -259,6 +260,233 @@ class TestPairing(unittest.TestCase):
         _run(go())
 
 
+class TestLockdown(unittest.TestCase):
+    def test_unlock_transition_suppressed_during_lockdown(self) -> None:
+        async def go():
+            states = {"lock.front": "locked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            access = _make_access()
+            locked_down = {"on": True}
+            mgr = _make_mgr(
+                db, _make_ha(states), access,
+                lockdown=lambda: locked_down["on"],
+            )
+            await mgr.poll_once()  # baseline: locked
+            states["lock.front"] = "unlocked"
+            applied = await mgr.poll_once()
+            self.assertEqual(applied, 0)
+            access.unlock_persistent.assert_not_awaited()
+
+            # Baseline was adopted, so lifting lockdown must NOT replay
+            # the suppressed transition and pop the door open.
+            locked_down["on"] = False
+            applied = await mgr.poll_once()
+            self.assertEqual(applied, 0)
+            access.unlock_persistent.assert_not_awaited()
+
+            # A fresh transition after lockdown lifts applies normally
+            # (baseline is the adopted "unlocked", so locked is a change).
+            states["lock.front"] = "locked"
+            await mgr.poll_once()
+            access.lock.assert_awaited_once_with("dev-hub-1")
+        _run(go())
+
+    def test_lock_transition_still_applies_during_lockdown(self) -> None:
+        async def go():
+            states = {"lock.front": "unlocked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            access = _make_access()
+            mgr = _make_mgr(db, _make_ha(states), access, lockdown=lambda: True)
+            await mgr.poll_once()  # baseline: unlocked
+            states["lock.front"] = "locked"
+            applied = await mgr.poll_once()
+            self.assertEqual(applied, 1)
+            access.lock.assert_awaited_once_with("dev-hub-1")
+        _run(go())
+
+    def test_lockdown_getter_raising_fails_closed(self) -> None:
+        async def go():
+            states = {"lock.front": "locked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            access = _make_access()
+
+            def boom() -> bool:
+                raise RuntimeError("broken getter")
+
+            mgr = _make_mgr(db, _make_ha(states), access, lockdown=boom)
+            await mgr.poll_once()
+            states["lock.front"] = "unlocked"
+            applied = await mgr.poll_once()
+            self.assertEqual(applied, 0)
+            access.unlock_persistent.assert_not_awaited()
+        _run(go())
+
+
+class TestFlapDamping(unittest.TestCase):
+    def test_rapid_second_transition_deferred_then_applied(self) -> None:
+        async def go():
+            import time as _time
+            states = {"lock.front": "locked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            access = _make_access()
+            mgr = _make_mgr(db, _make_ha(states), access)
+            await mgr.poll_once()  # baseline: locked
+            states["lock.front"] = "unlocked"
+            self.assertEqual(await mgr.poll_once(), 1)
+            access.unlock_persistent.assert_awaited_once_with("dev-hub-1")
+
+            # Immediate flap back — deferred by the min-apply interval,
+            # baseline unchanged so the transition is not lost.
+            states["lock.front"] = "locked"
+            self.assertEqual(await mgr.poll_once(), 0)
+            access.lock.assert_not_awaited()
+
+            # Interval elapses → the still-pending transition applies.
+            mgr._last_applied_at["lock.front"] = (
+                _time.monotonic() - hs_module._MIN_APPLY_INTERVAL - 1
+            )
+            self.assertEqual(await mgr.poll_once(), 1)
+            access.lock.assert_awaited_once_with("dev-hub-1")
+        _run(go())
+
+    def test_sustained_flapping_suspends_and_fails_safe(self) -> None:
+        async def go():
+            import time as _time
+            states = {"lock.front": "locked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            ha = _make_ha(states)
+            access = _make_access()
+            mgr = _make_mgr(db, ha, access)
+            await mgr.poll_once()  # baseline: locked
+
+            # Simulate a history of applied transitions at the threshold,
+            # with the hub currently held open, old enough to clear the
+            # min-apply interval.
+            now = _time.monotonic()
+            mgr._apply_times["lock.front"] = [
+                now - 10 * i for i in range(1, hs_module._FLAP_THRESHOLD + 1)
+            ]
+            mgr._last_applied_at["lock.front"] = (
+                now - hs_module._MIN_APPLY_INTERVAL - 1
+            )
+            mgr._applied["lock.front"] = "unlocked"
+            mgr._held_open["lock.front"] = [HUB]
+
+            states["lock.front"] = "locked"
+            applied = await mgr.poll_once()
+            self.assertEqual(applied, 0)
+            # Suspended: transition NOT applied via the normal path...
+            self.assertGreater(
+                mgr._suspended_until.get("lock.front", 0), _time.monotonic()
+            )
+            ha.fire_event.assert_awaited_once_with(
+                "access_control_hub_sync_failed",
+                {"entity_id": "lock.front", "lock_name": "Front Deadbolt",
+                 "reason": "flapping"},
+            )
+            # ...and the held-open hub fail-safes to reset (release queue
+            # is processed at the start of the next poll).
+            await mgr.poll_once()
+            access.lock.assert_awaited_once_with("dev-hub-1")
+            access.unlock_persistent.assert_not_awaited()
+
+            # While suspended the entity is not followed at all.
+            states["lock.front"] = "unlocked"
+            self.assertEqual(await mgr.poll_once(), 0)
+            access.unlock_persistent.assert_not_awaited()
+        _run(go())
+
+
+class TestReleaseOnDrop(unittest.TestCase):
+    def test_deleted_lock_releases_held_open_hub(self) -> None:
+        async def go():
+            states = {"lock.front": "locked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            access = _make_access()
+            mgr = _make_mgr(db, _make_ha(states), access)
+            await mgr.poll_once()  # baseline: locked
+            states["lock.front"] = "unlocked"
+            await mgr.poll_once()  # hub now held open
+            access.unlock_persistent.assert_awaited_once_with("dev-hub-1")
+
+            # Lock deleted — row gone, so release resolves from the
+            # in-memory held-open record.
+            db.get_all_locks = AsyncMock(return_value=[HUB])
+            await mgr.poll_once()
+            access.lock.assert_awaited_once_with("dev-hub-1")
+            self.assertNotIn("lock.front", mgr._applied)
+            self.assertEqual(mgr._pending_release, {})
+        _run(go())
+
+    def test_opt_out_after_restart_releases_via_lock_row(self) -> None:
+        async def go():
+            # Fresh manager (post-restart): no held-open memory, baseline
+            # adopted as unlocked from the live state.
+            states = {"lock.front": "unlocked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            access = _make_access()
+            mgr = _make_mgr(db, _make_ha(states), access)
+            await mgr.poll_once()  # baseline adopted: unlocked, no drive
+            access.unlock_persistent.assert_not_awaited()
+
+            # Option turned off — the row still exists, so hubs resolve
+            # from the pairing and reset even without held-open memory.
+            db.get_all_locks = AsyncMock(
+                return_value=[dict(HA_LOCK, sync_hub_state=0), HUB]
+            )
+            await mgr.poll_once()
+            access.lock.assert_awaited_once_with("dev-hub-1")
+        _run(go())
+
+    def test_hidden_lock_treated_as_dropped_and_released(self) -> None:
+        async def go():
+            states = {"lock.front": "unlocked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            access = _make_access()
+            mgr = _make_mgr(db, _make_ha(states), access)
+            await mgr.poll_once()  # baseline adopted: unlocked
+            db.get_all_locks = AsyncMock(
+                return_value=[dict(HA_LOCK, hidden=1), HUB]
+            )
+            await mgr.poll_once()
+            access.lock.assert_awaited_once_with("dev-hub-1")
+        _run(go())
+
+    def test_release_retries_until_access_recovers(self) -> None:
+        async def go():
+            states = {"lock.front": "unlocked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            access = _make_access(connected=False)
+            mgr = _make_mgr(db, _make_ha(states), access)
+            await mgr.poll_once()  # baseline adopted: unlocked
+            db.get_all_locks = AsyncMock(
+                return_value=[dict(HA_LOCK, sync_hub_state=0), HUB]
+            )
+            await mgr.poll_once()  # release queued but Access is down
+            access.lock.assert_not_awaited()
+            self.assertIn("lock.front", mgr._pending_release)
+
+            access.connected = True
+            mgr._release_backoff.clear()
+            await mgr.poll_once()
+            access.lock.assert_awaited_once_with("dev-hub-1")
+            self.assertEqual(mgr._pending_release, {})
+        _run(go())
+
+    def test_drop_while_locked_releases_nothing(self) -> None:
+        async def go():
+            states = {"lock.front": "locked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            access = _make_access()
+            mgr = _make_mgr(db, _make_ha(states), access)
+            await mgr.poll_once()  # baseline: locked
+            db.get_all_locks = AsyncMock(return_value=[HUB])
+            await mgr.poll_once()
+            access.lock.assert_not_awaited()
+            access.unlock_persistent.assert_not_awaited()
+        _run(go())
+
+
 class TestFailureHandling(unittest.TestCase):
     def test_failed_drive_keeps_baseline_backs_off_and_notifies_once(self) -> None:
         async def go():
@@ -278,7 +506,8 @@ class TestFailureHandling(unittest.TestCase):
             self.assertEqual(access.unlock_persistent.await_count, 2)
             ha.fire_event.assert_awaited_once_with(
                 "access_control_hub_sync_failed",
-                {"entity_id": "lock.front", "lock_name": "Front Deadbolt"},
+                {"entity_id": "lock.front", "lock_name": "Front Deadbolt",
+                 "reason": "apply_failed"},
             )
             db.log_access.assert_not_awaited()
 

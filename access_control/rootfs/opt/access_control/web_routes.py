@@ -893,7 +893,6 @@ async def update_lock_settings(
     request: Request,
     buzz_enabled: str = Form(default=""),
     relock_duration: int = Form(default=30),
-    access_location_id: str = Form(default=""),
     relock_on_remote: str = Form(default=""),
     relock_on_device_auth: str = Form(default=""),
     sync_hub_state: str = Form(default=""),
@@ -903,11 +902,15 @@ async def update_lock_settings(
     if limited:
         return limited
     db = request.app.state.db
+    # access_location_id is intentionally NOT accepted here: the settings
+    # form has never rendered it, and passing a blank form default through
+    # was silently NULLing legacy hub pairings on every save (e2e review
+    # 2026-07-12). update_lock_settings preserves the column when the
+    # kwarg is omitted.
     await db.update_lock_settings(
         lock_id,
         buzz_enabled=bool(buzz_enabled),
         relock_duration=relock_duration,
-        access_location_id=access_location_id or None,
         relock_on_remote=bool(relock_on_remote),
         relock_on_device_auth=bool(relock_on_device_auth),
         sync_hub_state=bool(sync_hub_state),

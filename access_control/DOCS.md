@@ -89,9 +89,23 @@ Requirements & behaviour notes:
   restart or enabling the option never moves a door by itself.
 - `unavailable` / `unknown` / `jammed` states are ignored, so a brief
   radio dropout can't trigger a spurious hub change.
+- **Lockdown wins.** While lockdown mode is active the hub is never
+  held open by sync, even if the HA lock reports unlocked — and the
+  door does not pop open when lockdown is lifted. (HA entity state can
+  be written by any HA token or integration; enabling this option
+  extends trust in HA state to physical door position, so lockdown
+  must override it.)
+- **Flap protection.** Applied transitions are spaced at least 30 s
+  apart, and a lock that keeps cycling (4+ transitions in 10 minutes —
+  failing hardware or abuse) suspends sync for 10 minutes, fail-safes
+  the hub back to normal locked behaviour, and fires the failure event
+  with `reason: flapping`.
+- **No stranded doors.** Turning the option off, hiding the lock, or
+  deleting it while the hub is held open drives the hub back to reset
+  (retried until it succeeds) instead of leaving the door open.
 - If driving the hub fails, the app retries with backoff until the hub
-  converges and fires an `access_control_hub_sync_failed` HA event so
-  your automations can alert.
+  converges and fires an `access_control_hub_sync_failed` HA event
+  (payload includes a `reason` field) so your automations can alert.
 - Successful syncs show up in the hub's lock history as `hub_sync`
   entries.
 

@@ -22,8 +22,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   `jammed` states so radio hiccups can't trigger spurious hub changes.
   Failed syncs are retried with backoff until the hub converges, and an
   `access_control_hub_sync_failed` HA event is fired (once per failing
-  transition) so automations can alert. Successful syncs appear in the
-  hub's lock history as `hub_sync` entries.
+  transition, with a `reason` field) so automations can alert.
+  Successful syncs appear in the hub's lock history as `hub_sync`
+  entries. Safety rails, added after an adversarial review of the
+  feature: **lockdown overrides sync** (an HA state write can never
+  hold a hub open during lockdown, and the door doesn't pop open when
+  lockdown lifts); **flap protection** (applied transitions are spaced
+  ≥30 s apart, and 4+ transitions in 10 minutes suspends sync for that
+  lock for 10 minutes, fail-safes the hub to reset, and alerts with
+  `reason: flapping`); and **release-on-drop** (disabling the option,
+  hiding, or deleting a synced lock while its hub is held open drives
+  the hub back to reset — retried until it lands — instead of
+  stranding the door open).
+
+### Fixed
+
+- **Saving lock settings no longer wipes the Access-location pairing.**
+  The lock settings form has never rendered `access_location_id`, but
+  the save handler passed a blank form default through and NULLed the
+  column on every save — silently breaking tap-to-unlock (and hub
+  sync) for legacy-paired doors the next time any setting was toggled.
+  `update_lock_settings` now preserves the pairing unless a caller
+  passes it explicitly; covered by regression tests against a real
+  SQLite database.
 
 ## [1.4.2] - 2026-07-12
 

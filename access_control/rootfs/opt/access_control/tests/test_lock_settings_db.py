@@ -1,0 +1,108 @@
+"""Regression tests for update_lock_settings against a real SQLite database.
+
+Guards the e2e-review 2026-07-12 finding: the lock settings form never
+renders access_location_id, so the route passing a blank form default
+through was silently NULLing legacy hub pairings on every settings save.
+"""
+from __future__ import annotations
+
+import asyncio
+import importlib
+import importlib.util
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_package() -> None:
+    if "access_control" in sys.modules:
+        return
+    spec = importlib.util.spec_from_file_location(
+        "access_control",
+        ROOT / "__init__.py",
+        submodule_search_locations=[str(ROOT)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["access_control"] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+
+_load_package()
+db_module = importlib.import_module("access_control.database")
+Database = db_module.Database
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+class TestUpdateLockSettingsPreservesPairing(unittest.TestCase):
+    def test_settings_save_without_location_keeps_pairing(self) -> None:
+        async def go():
+            db = Database(path=Path(tempfile.mkdtemp()) / "t.db")
+            await db.connect()
+            try:
+                lock_id = await db.add_external_lock(
+                    entity_id="lock.front", name="Front",
+                )
+                # Establish a legacy pairing explicitly.
+                await db.update_lock_settings(
+                    lock_id, buzz_enabled=True, relock_duration=30,
+                    access_location_id="loc-1",
+                )
+                lock = await db.get_lock(lock_id)
+                self.assertEqual(lock["access_location_id"], "loc-1")
+
+                # The settings-form save path: no access_location_id kwarg.
+                # The pairing MUST survive.
+                await db.update_lock_settings(
+                    lock_id, buzz_enabled=False, relock_duration=45,
+                    relock_on_remote=True, sync_hub_state=True,
+                )
+                lock = await db.get_lock(lock_id)
+                self.assertEqual(lock["access_location_id"], "loc-1")
+                self.assertEqual(lock["buzz_enabled"], 0)
+                self.assertEqual(lock["relock_duration"], 45)
+                self.assertEqual(lock["relock_on_remote"], 1)
+                self.assertEqual(lock["sync_hub_state"], 1)
+            finally:
+                await db.close()
+        _run(go())
+
+    def test_explicit_location_still_updates_and_clears(self) -> None:
+        async def go():
+            db = Database(path=Path(tempfile.mkdtemp()) / "t.db")
+            await db.connect()
+            try:
+                lock_id = await db.add_external_lock(
+                    entity_id="lock.front", name="Front",
+                )
+                await db.update_lock_settings(
+                    lock_id, buzz_enabled=True, relock_duration=30,
+                    access_location_id="loc-1",
+                )
+                await db.update_lock_settings(
+                    lock_id, buzz_enabled=True, relock_duration=30,
+                    access_location_id="loc-2",
+                )
+                lock = await db.get_lock(lock_id)
+                self.assertEqual(lock["access_location_id"], "loc-2")
+
+                # Explicit empty/None clears the pairing (deliberate).
+                await db.update_lock_settings(
+                    lock_id, buzz_enabled=True, relock_duration=30,
+                    access_location_id=None,
+                )
+                lock = await db.get_lock(lock_id)
+                self.assertIsNone(lock["access_location_id"])
+            finally:
+                await db.close()
+        _run(go())
+
+
+if __name__ == "__main__":
+    unittest.main()
