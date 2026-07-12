@@ -10,6 +10,63 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
 
 
+SECRET_KEY_SOURCE_DATABASE = "database"
+SECRET_KEY_SOURCE_ENVIRONMENT = "environment"
+
+
+def secret_key_fingerprint(secret_key: str) -> str:
+    """Return a non-secret identifier used to detect key mismatches."""
+    return hashlib.sha256(secret_key.encode()).hexdigest()
+
+
+def resolve_secret_key(
+    *,
+    stored_key: str | None,
+    source: str | None,
+    stored_fingerprint: str | None,
+    environment_key: str | None,
+) -> tuple[str, str]:
+    """Resolve the configured encryption/session key without changing modes.
+
+    The key source is selected once, during first-run setup.  An environment
+    variable added later must not silently replace the database key: doing so
+    makes every encrypted credential unreadable.  Databases created before the
+    source marker existed are treated as database-key installations.
+
+    Returns ``(secret_key, normalized_source)`` and raises ``RuntimeError`` for
+    a missing/mismatched environment key or corrupt source metadata.
+    """
+    normalized = source or SECRET_KEY_SOURCE_DATABASE
+    if normalized == SECRET_KEY_SOURCE_DATABASE:
+        if not stored_key:
+            raise RuntimeError(
+                "Database-managed secret key is missing; restore access_control.db "
+                "from backup."
+            )
+        return stored_key, normalized
+
+    if normalized == SECRET_KEY_SOURCE_ENVIRONMENT:
+        if not environment_key:
+            raise RuntimeError(
+                "ACCESS_CONTROL_SECRET_KEY is required because this installation "
+                "was initialized in environment-key mode."
+            )
+        if not stored_fingerprint:
+            raise RuntimeError(
+                "Environment-key fingerprint is missing from the database; restore "
+                "a consistent database/key backup."
+            )
+        actual = secret_key_fingerprint(environment_key)
+        if not secrets.compare_digest(actual, stored_fingerprint):
+            raise RuntimeError(
+                "ACCESS_CONTROL_SECRET_KEY does not match the key used during "
+                "first-run setup."
+            )
+        return environment_key, normalized
+
+    raise RuntimeError(f"Unsupported secret_key_source: {normalized!r}")
+
+
 def derive_key(password: str, salt: bytes) -> bytes:
     """Derive a Fernet-compatible key from a password and salt using PBKDF2."""
     kdf = PBKDF2HMAC(

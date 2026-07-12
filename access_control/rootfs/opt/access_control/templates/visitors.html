@@ -48,6 +48,10 @@
           <input name="end_time" type="time" value="17:00" class="input w-full" />
         </div>
       </div>
+      <p class="text-xs text-gray-500">
+        Times use the Home Assistant site timezone: <strong class="text-gray-400">{{ site_timezone }}</strong>.
+        Times skipped or repeated by daylight-saving changes are rejected.
+      </p>
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
           <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">PIN Code (optional, 4-8 digits)</label>
@@ -89,7 +93,8 @@
               <button type="submit" class="btn-secondary text-xs">Extend</button>
             </form>
             <form method="post" action="visitors/{{ v.id }}/delete"
-              onsubmit="return confirm('Delete visitor {{ v.name|e }}?')">
+              data-name="{{ v.name|e }}"
+              onsubmit="return confirm('Delete visitor ' + this.dataset.name + '?')">
               <button type="submit" class="btn-danger text-xs">Delete</button>
             </form>
           </div>
@@ -116,7 +121,8 @@
           </div>
         </div>
         <form method="post" action="visitors/{{ v.id }}/delete"
-          onsubmit="return confirm('Remove expired visitor {{ v.name|e }}?')">
+          data-name="{{ v.name|e }}"
+          onsubmit="return confirm('Remove expired visitor ' + this.dataset.name + '?')">
           <button type="submit" class="btn-danger text-xs">Remove</button>
         </form>
       </div>

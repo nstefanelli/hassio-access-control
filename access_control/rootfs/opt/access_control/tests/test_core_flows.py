@@ -5,7 +5,6 @@ import importlib.util
 import json
 import sqlite3
 import sys
-import time
 import unittest
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from pathlib import Path
@@ -316,6 +315,7 @@ class FakeDB:
         self.ui_cache: dict[str, object] = {}
         self.create_group = AsyncMock()
         self.set_config = AsyncMock(side_effect=self._set_config)
+        self.set_configs = AsyncMock(side_effect=self._set_configs)
         self.add_api_key = AsyncMock()
         self.get_config = AsyncMock()
         self.get_lock = AsyncMock()
@@ -330,6 +330,9 @@ class FakeDB:
 
     async def _set_config(self, key: str, value: str) -> None:
         self.config_values.append((key, value))
+
+    async def _set_configs(self, values: dict[str, str]) -> None:
+        self.config_values.extend(values.items())
 
     async def _log_access(self, **kwargs) -> int:
         self.log_entries.append(kwargs)
@@ -359,6 +362,10 @@ class FakeHAClient:
         return True
 
     async def get_entity_state(self, entity_id: str) -> str | None:
+        if entity_id in self.unlock_calls:
+            return "unlocked"
+        if entity_id in self.lock_calls:
+            return "locked"
         return "disarmed"
 
     async def alarm_disarm(self, entity_id: str, code: str | None = None) -> bool:
@@ -373,16 +380,19 @@ class FakeAccessClient:
         self.unlock_calls.append(location_id)
 
 
+def _authenticated_console_client() -> SimpleNamespace:
+    """Minimal successful Access/Protect setup probe."""
+    return SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+
+
 class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_setup_initializes_runtime(self) -> None:
         db = FakeDB()
         # First-run setup: admin_username must be unset so the C1 guard
         # (audit 2026-05-24) doesn't refuse with 404. Also: setup_post
-        # now checks the rate limit before doing real work — return
-        # not-limited.
+        # now atomically reserves a rate-limit attempt before doing real
+        # work — FakeDB allows the reservation by default.
         db.get_config = AsyncMock(return_value=None)
-        db.is_rate_limited = AsyncMock(return_value=False)
-        db.record_rate_limit_failure = AsyncMock()
         request = SimpleNamespace(
             scope={},
             state=SimpleNamespace(),
@@ -396,12 +406,13 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        access_client = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+        access_client = _authenticated_console_client()
+        protect_client = _authenticated_console_client()
         ha_client = SimpleNamespace(test_connection=AsyncMock(return_value=True), close=AsyncMock())
 
-        with patch.object(web_routes, "AccessClient", return_value=access_client), patch.object(
-            web_routes, "HAClient", return_value=ha_client
-        ):
+        with patch.object(web_routes, "AccessClient", return_value=access_client), \
+                patch.object(web_routes, "ProtectClient", return_value=protect_client), \
+                patch.object(web_routes, "HAClient", return_value=ha_client):
             response = await web_routes.setup_post(
                 request,
                 admin_username="admin",
@@ -409,6 +420,9 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
                 unvr_host="unvr.local",
                 unvr_username="unvr-user",
                 unvr_password="unvr-pass",
+                access_host="",
+                access_username="",
+                access_password="",
                 ha_url="http://ha.local",
                 ha_token="ha-token",
             )
@@ -416,8 +430,143 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 303)
         self.assertTrue(request.app.state.configured)
         request.app.state.initialize_configured_state.assert_awaited_once()
-        db.add_api_key.assert_awaited_once()
+        # Setup no longer creates an unusable hashed key whose raw value was
+        # never shown; operators create API keys from Settings instead.
+        db.add_api_key.assert_not_awaited()
+        db.consume_rate_limit.assert_awaited_once_with(
+            "setup", "127.0.0.1", **web_routes._SETUP_RATE_LIMIT
+        )
+        db.clear_rate_limit.assert_awaited_once_with("setup", "127.0.0.1")
         self.assertIn(("admin_username", "admin"), db.config_values)
+
+    async def test_setup_persists_complete_split_access_console(self) -> None:
+        db = FakeDB()
+        db.get_config = AsyncMock(return_value=None)
+        request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
+            client=SimpleNamespace(host="127.0.0.1"),
+            app=SimpleNamespace(state=SimpleNamespace(
+                db=db,
+                configured=False,
+                initialize_configured_state=AsyncMock(),
+            )),
+        )
+        access_client = _authenticated_console_client()
+        protect_client = _authenticated_console_client()
+        ha_client = SimpleNamespace(
+            test_connection=AsyncMock(return_value=True), close=AsyncMock()
+        )
+
+        with patch.object(
+            web_routes, "AccessClient", return_value=access_client
+        ) as access_factory, patch.object(
+            web_routes, "ProtectClient", return_value=protect_client
+        ) as protect_factory, patch.object(
+            web_routes, "HAClient", return_value=ha_client
+        ):
+            response = await web_routes.setup_post(
+                request,
+                admin_username="admin",
+                admin_password="password",
+                unvr_host="protect.local",
+                unvr_username="protect-user",
+                unvr_password="protect-pass",
+                access_host="access.local",
+                access_username="access-user",
+                access_password="access-pass",
+                ha_url="http://ha.local",
+                ha_token="ha-token",
+            )
+
+        self.assertEqual(response.status_code, 303)
+        protect_factory.assert_called_once_with(
+            "protect.local", "protect-user", "protect-pass"
+        )
+        access_factory.assert_called_once_with(
+            "access.local", "access-user", "access-pass", api_token=None
+        )
+        saved = dict(db.config_values)
+        self.assertEqual(saved["access_host"], "access.local")
+        self.assertNotEqual(saved["access_username"], "access-user")
+        self.assertNotEqual(saved["access_password"], "access-pass")
+
+    async def test_setup_rejects_partial_split_access_fields_before_probes(self) -> None:
+        db = FakeDB()
+        db.get_config = AsyncMock(return_value=None)
+        request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
+            client=SimpleNamespace(host="127.0.0.1"),
+            app=SimpleNamespace(state=SimpleNamespace(db=db, configured=False)),
+        )
+        error_response = web_routes.HTMLResponse("invalid", status_code=422)
+
+        with patch.object(
+            web_routes.templates, "TemplateResponse", return_value=error_response
+        ), patch.object(web_routes, "AccessClient") as access_factory, patch.object(
+            web_routes, "ProtectClient"
+        ) as protect_factory:
+            response = await web_routes.setup_post(
+                request,
+                admin_username="admin",
+                admin_password="password",
+                unvr_host="protect.local",
+                unvr_username="protect-user",
+                unvr_password="protect-pass",
+                access_host="access.local",
+                access_username="",
+                access_password="",
+                ha_url="http://ha.local",
+                ha_token="ha-token",
+            )
+
+        self.assertIs(response, error_response)
+        access_factory.assert_not_called()
+        protect_factory.assert_not_called()
+        self.assertEqual(db.config_values, [])
+        db.consume_rate_limit.assert_awaited_once_with(
+            "setup", "127.0.0.1", **web_routes._SETUP_RATE_LIMIT
+        )
+        db.record_rate_limit_failure.assert_not_awaited()
+        db.clear_rate_limit.assert_not_awaited()
+
+    async def test_setup_rate_limit_reservation_blocks_before_upstream_probes(self) -> None:
+        from fastapi import HTTPException
+
+        db = FakeDB()
+        db.get_config = AsyncMock(return_value=None)
+        db.consume_rate_limit = AsyncMock(return_value=False)
+        request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
+            client=SimpleNamespace(host="192.0.2.10"),
+            app=SimpleNamespace(state=SimpleNamespace(db=db, configured=False)),
+        )
+
+        with patch.object(web_routes, "AccessClient") as access_factory, \
+                patch.object(web_routes, "ProtectClient") as protect_factory:
+            with self.assertRaises(HTTPException) as raised:
+                await web_routes.setup_post(
+                    request,
+                    admin_username="admin",
+                    admin_password="password",
+                    unvr_host="protect.local",
+                    unvr_username="protect-user",
+                    unvr_password="protect-pass",
+                    access_host="",
+                    access_username="",
+                    access_password="",
+                    ha_url="http://ha.local",
+                    ha_token="ha-token",
+                )
+
+        self.assertEqual(raised.exception.status_code, 429)
+        db.consume_rate_limit.assert_awaited_once_with(
+            "setup", "192.0.2.10", **web_routes._SETUP_RATE_LIMIT
+        )
+        access_factory.assert_not_called()
+        protect_factory.assert_not_called()
 
     async def test_setup_post_refuses_when_already_configured(self) -> None:
         """Audit 2026-05-24, C1: after first-run, /setup POST must refuse.
@@ -480,14 +629,16 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         )
-        access_client = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+        access_client = _authenticated_console_client()
+        protect_client = _authenticated_console_client()
         ha_client = SimpleNamespace(test_connection=AsyncMock(return_value=True), close=AsyncMock())
         env = {
             "ACCESS_CONTROL_HA_URL": "http://supervisor/core",
             "ACCESS_CONTROL_HA_TOKEN": "supervisor-token-abc",
         }
         with patch.dict("os.environ", env, clear=False), \
-                patch.object(web_routes, "AccessClient", return_value=access_client) as ac_mock, \
+                patch.object(web_routes, "AccessClient", return_value=access_client), \
+                patch.object(web_routes, "ProtectClient", return_value=protect_client), \
                 patch.object(web_routes, "HAClient", return_value=ha_client) as hac_mock:
             response = await web_routes.setup_post(
                 request,
@@ -496,6 +647,9 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
                 unvr_host="unvr.local",
                 unvr_username="unvr-user",
                 unvr_password="unvr-pass",
+                access_host="",
+                access_username="",
+                access_password="",
                 ha_url="",
                 ha_token="",
             )
@@ -538,7 +692,8 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         )
-        access_client = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+        access_client = _authenticated_console_client()
+        protect_client = _authenticated_console_client()
         ha_client = SimpleNamespace(test_connection=AsyncMock(return_value=True), close=AsyncMock())
         env = {
             "ACCESS_CONTROL_HA_URL": "http://supervisor/core",
@@ -546,6 +701,7 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
         }
         with patch.dict("os.environ", env, clear=False), \
                 patch.object(web_routes, "AccessClient", return_value=access_client), \
+                patch.object(web_routes, "ProtectClient", return_value=protect_client), \
                 patch.object(web_routes, "HAClient", return_value=ha_client) as hac_mock:
             response = await web_routes.setup_post(
                 request,
@@ -554,6 +710,9 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
                 unvr_host="unvr.local",
                 unvr_username="unvr-user",
                 unvr_password="unvr-pass",
+                access_host="",
+                access_username="",
+                access_password="",
                 ha_url="http://malicious.example",
                 ha_token="hijacked-token",
             )
@@ -585,7 +744,8 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
             client=SimpleNamespace(host="127.0.0.1"),
             app=SimpleNamespace(state=SimpleNamespace(db=db, configured=False)),
         )
-        access_client = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+        access_client = _authenticated_console_client()
+        protect_client = _authenticated_console_client()
         ha_client = SimpleNamespace(test_connection=AsyncMock(return_value=False), close=AsyncMock())
         env = {
             "ACCESS_CONTROL_HA_URL": "http://supervisor/core",
@@ -600,6 +760,7 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict("os.environ", env, clear=False), \
                 patch.object(web_routes, "AccessClient", return_value=access_client), \
+                patch.object(web_routes, "ProtectClient", return_value=protect_client), \
                 patch.object(web_routes, "HAClient", return_value=ha_client), \
                 patch.object(web_routes.templates, "TemplateResponse", side_effect=_capture_template):
             response = await web_routes.setup_post(
@@ -609,6 +770,9 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
                 unvr_host="unvr.local",
                 unvr_username="unvr-user",
                 unvr_password="unvr-pass",
+                access_host="",
+                access_username="",
+                access_password="",
                 ha_url="",
                 ha_token="",
             )
@@ -636,10 +800,12 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         )
-        access_client = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+        access_client = _authenticated_console_client()
+        protect_client = _authenticated_console_client()
         ha_client = SimpleNamespace(test_connection=AsyncMock(return_value=True), close=AsyncMock())
 
         with patch.object(web_routes, "AccessClient", return_value=access_client), \
+                patch.object(web_routes, "ProtectClient", return_value=protect_client), \
                 patch.object(web_routes, "HAClient", return_value=ha_client):
             response = await web_routes.setup_post(
                 request,
@@ -648,6 +814,9 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
                 unvr_host="unvr.local",
                 unvr_username="unvr-user",
                 unvr_password="unvr-pass",
+                access_host="",
+                access_username="",
+                access_password="",
                 ha_url="http://ha.local",
                 ha_token="ha-token",
             )
@@ -675,6 +844,10 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 303)
         self.assertIn("session=", response.headers.get("set-cookie", ""))
+        db.consume_rate_limit.assert_awaited_once_with(
+            "login", "127.0.0.1", **web_routes._LOGIN_RATE_LIMIT
+        )
+        db.clear_rate_limit.assert_awaited_once_with("login", "127.0.0.1")
 
 
 class ResolveHaCredsTests(unittest.TestCase):

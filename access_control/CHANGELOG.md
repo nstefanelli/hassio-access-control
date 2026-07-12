@@ -4,6 +4,235 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+No unreleased changes.
+
+## [1.5.3] - 2026-07-12
+
+End-to-end reliability, performance, security, packaging, and documentation
+review.
+
+### Fixed — physical-access correctness
+
+- **Native Access locking is schedule-aware and state-confirmed.** The former
+  generic Lock path sent `reset`, which could restore an active unlock schedule
+  and leave the door open. Native **Unlock** now applies `keep_unlock`, **Lock**
+  applies `lock_now` to terminate a current schedule/temporary unlock, and the
+  separate **Follow Schedule** action applies `reset` intentionally. Access
+  writes are followed by bounded rule and relay-state reads before success is
+  reported.
+- **The official Access Open API is supported.** Operators can save a token
+  with `view:space` and `edit:space`; calls use HTTPS port `12445`, door/location
+  IDs, Bearer authentication, strict response envelopes, and an isolated
+  cookieless session. The token is encrypted at rest, can be overridden with
+  `ACCESS_CONTROL_ACCESS_API_TOKEN`, and is never silently bypassed with the
+  private session API after a configured-token failure. Tokenless installations
+  retain compatibility mode with explicitly documented firmware/readback
+  limitations.
+- **Opt-in HA/Access synchronization is bidirectional.** Confirmed HA-only
+  changes propagate to Access, while confirmed Access rule/relay changes—including
+  native unlock-schedule activation/deactivation—propagate to HA. Access events
+  reduce latency and the periodic authenticated poll catches missed events and
+  drift. Persisted origin snapshots prevent feedback loops across restart;
+  unreadable state, startup disagreement without a verified active schedule,
+  and opposing simultaneous changes resolve locked.
+- **Fail-safe locking no longer restores a schedule.** Lockdown, ambiguous
+  state, recovery, and conflict handling use `keep_lock`; `reset` is reserved
+  for deliberately returning ownership to Access. A configured token or
+  controller error remains pending/visible instead of being counted as a
+  confirmed safe transition.
+- **Enabled incomplete schedules now fail closed.** The form requires days
+  and/or a complete start/end range; corrupt rows with one bound or no
+  restriction are inactive instead of becoming an all-day grant. Days-only,
+  time-only, combined, and overnight schedules remain supported.
+- **Alarm uncertainty is conservative.** Literal unknown/unavailable values,
+  unrecognized states, and mixed armed modes no longer collapse to
+  `disarmed` or a single less-restrictive armed state. Armed-state blocking is
+  applied to uncertain/transitional state, including when panels are
+  configured but the HA client is unavailable.
+- **Closed the lockdown decision race with one physical-command barrier.**
+  Lockdown changes, application unlocks, HA re-locks, hub actuations, and live
+  client publication are ordered together. Once enabling lockdown returns, an
+  event already evaluating under the old state cannot issue its unlock later.
+- **Lockdown now locks a hub already held open by sync and continuously
+  verifies it.** The `keep_lock` override runs before the unchanged-state fast
+  path. Authenticated Access rule/relay and HA state are re-read on later polls,
+  so a direct HA unlock or Access schedule/temporary unlock during the same
+  incident is closed again. Lifting lockdown does not reopen the hub without a
+  verified post-incident source change.
+- **Lockdown persistence and enforcement fail closed.** An unreadable persisted
+  value restores lockdown as enabled. Enable/disable transitions are serialized;
+  failed disable persistence leaves it enabled, while an unresolved immediate
+  hub lock returns `503` and remains visible as entity IDs in
+  `lockdown_enforcement_pending` health.
+- **Missing hub pairings remain unconverged.** Hub sync reports
+  `reason=no_paired_hub`, backs off, and retries so a later pairing converges;
+  it no longer records a false success.
+- **Hub persistent-rule ownership survives crashes.** Door/location identity
+  plus `keep_unlock` or fail-safe `keep_lock` ownership is persisted before the
+  physical command and cleared only after readback proves the rule was
+  replaced. Startup, lockdown, opt-out, and best-effort shutdown recovery close
+  uncertain doors without stranding them open or silently suppressing future
+  schedules.
+- **Untrustworthy HA state and ambiguous hub ownership now lock fail-safe.** A
+  disconnect, state-read exception, or value other than exactly
+  `locked`/`unlocked` closes any app-owned hold. Pairing changes close removed
+  hubs before opening replacements; independent HA entities that resolve to one
+  physical hub are locked/suppressed and alert with
+  `reason=shared_hub_conflict` until the mapping is one-to-one.
+- **Timed re-lock intent is durable before physical unlock.** Buzz and
+  device-auth paths persist and arm the new deadline first. A failure or
+  timeout retains the earliest applicable deadline because HA may have acted
+  before the response was lost. Generation checks prevent late recovery from
+  clobbering a newer schedule. Manual overrides without a new
+  timer retain/restore their earlier deadline on failure.
+- **HA lock success now requires observed-state confirmation.** Manual and
+  scheduled re-lock paths perform bounded state reads and clear the durable
+  timer only after HA reports exactly `locked`; confirmation/retry sleeps no
+  longer monopolize the app-wide physical-command barrier.
+- **Remote-unlock re-lock work survives teardown.** Because the upstream event
+  says the door is already open, its scheduling task is critical and awaited
+  across client swaps/shutdown, and scheduling no longer depends on the
+  optional remote actor ID. A timer-persistence failure attempts an immediate
+  lock, requires observed `locked` state, audits the result, and emits the
+  failure event when recovery cannot be confirmed.
+- **Disappeared native Access doors retire without becoming stale targets.** A
+  valid non-empty snapshot marks missing native rows dormant and excludes them
+  from normal UI/API/authorization/pairing lookups while preserving history;
+  rediscovery of the same location revives them. Empty door snapshots cannot
+  mass-retire an existing inventory.
+- **Visitor wall times now use the HA site timezone.** Daylight-saving gaps and
+  ambiguous folds are rejected, and extensions cannot end before a future
+  visitor's original start.
+
+### Fixed — reliability and security boundaries
+
+- **Concurrent rate limiting is serialized without overlapping SQLite
+  transactions.** Bursts no longer fail with `cannot start a transaction
+  within a transaction`; successful API authentication avoids a no-op write.
+- **SQLite transaction ownership is explicit.** The long-lived connection now
+  autocommits ordinary statements, while topology/config bundles, group
+  replacement, pending re-locks, hub ownership, and explicit batches use
+  task-owned isolated transactions. One coroutine can no longer accidentally
+  commit or roll back another's write.
+- **Access/Protect login state is published atomically.** Partial login state is
+  not retained after failure; a successful login clears permanent-auth-failure
+  state. REST 401 reauthentication no longer awaits aiohttp's synchronous
+  `release()` method.
+- **Secret-key source is fixed at first setup.** Database-key installs ignore a
+  key injected later. Environment-key installs store only a fingerprint and
+  require the exact `ACCESS_CONTROL_SECRET_KEY` on every start. Legacy
+  databases migrate to database-key mode, preventing late overrides from
+  orphaning encrypted credentials.
+- **Logical configuration bundles commit atomically.** First-run encryption and
+  credential metadata, multi-field console/HA changes, and restart-schedule
+  values are serialized and committed as bundles, so a failed write cannot
+  expose a partly updated credential or key set.
+- **Settings client swaps are tested before promotion.** Home Assistant and
+  UniFi credential changes preserve a working client on failure and keep a
+  separately configured Access console separate from the primary Protect
+  console.
+- **Access sessions are bound to the enrolled site namespace.** First setup
+  persists a hash derived from all stable console/site identity candidates,
+  falling back to authenticated Access-building topology. Every login,
+  Settings candidate, REST reauthentication, WebSocket reconnect, and topology
+  refresh must match before auth state or identifiers are published. Same-site
+  Access-host/target changes remain supported, including single/split mode; a
+  different Access site requires fresh initialization. This is not TLS peer
+  verification or certificate pinning.
+- **HTTP trust boundaries were tightened.** Body limits apply before form
+  parsing (including setup/login and chunked requests), early middleware
+  responses receive security headers, CSRF validation covers every mutating
+  dashboard verb, dynamic responses are non-cacheable, background polling no
+  longer extends a direct-mode session forever, logs omit the WebSocket CSRF
+  credential and untrusted upstream error bodies, and API responses omit
+  encrypted PIN material.
+- **Form relationships and enums are validated.** Lock/alarm entity domains,
+  API-key scopes, entry-device types/ownership, schedule shapes, and re-lock
+  ranges are checked at the request boundary. Visitor names are no longer
+  interpolated into inline JavaScript.
+- **The packaged scheduled restart is functional.** It requests a self-restart
+  through the authenticated Supervisor API, retains an explicit standalone
+  fallback, and the manifest enables the required Supervisor API plus a
+  `/health/live` watchdog. Ingress continues to direct ordinary manual restarts
+  to Home Assistant's app page; direct-host Settings shows its manual control
+  and reload banner only when a restart mechanism is available.
+
+### Changed — API
+
+- **`POST /api/lockdown` is now an idempotent setter.** Full-scope callers must
+  pass `?enabled=true` or `?enabled=false`; the old bodyless toggle contract is
+  rejected with `422`. Duplicate delivery can no longer invert incident state.
+
+### Performance and efficiency
+
+- **Topology sync is one isolated atomic transaction.** A dedicated SQLite
+  connection prevents request coroutines from committing or rolling back part
+  of a refresh, skips unchanged users/locks, and refuses empty/malformed user
+  snapshots as a mass-delete signal.
+- **Short-lived UI caches are process-local.** Cache hits/expiry no longer write
+  to SQLite, reducing idle flash/SD-card I/O.
+- **Visitor polling targets active work.** Every five minutes, status-1 rows
+  whose timezone-aware end has passed are expired locally; UniFi is queried
+  only when active rows remain. Historical rows no longer keep a one-minute
+  upstream loop alive indefinitely.
+- **Static browser dependencies are bundled.** Pinned Tailwind input produces a
+  committed minified stylesheet; shared JavaScript replaces HTMX home polling
+  and injects CSRF form fields, eliminating runtime Tailwind, HTMX, and font CDN
+  dependencies.
+- **Shutdown owns background work.** Ordinary event and timer tasks are
+  cancelled/awaited before clients/database close; safety-critical
+  remote-unlock re-lock work is awaited to completion rather than cancelled,
+  avoiding both torn-down-state access and an unprotected already-open door.
+
+### CI, release, and packaging
+
+- GitHub Release creation now runs only after successful main-push CI for the
+  exact commit, extracts a literal exact-version changelog section, and can
+  repair a tag whose release creation failed without moving the tag.
+- Ordinary main/manual image builds use immutable `sha-*` tags. Version and
+  `latest` move only for a manifest version change; released version tags are
+  never overwritten.
+- Added an app-local `.dockerignore` because `access_control/` is the build
+  context. Local environments, caches, tests, dev requirements, databases, and
+  frontend dependencies are excluded from runtime images.
+
+### Documentation
+
+- Rebuilt the documentation as an end-to-end set covering configuration,
+  architecture, operations, safe backup/restore, troubleshooting, API
+  contracts/scopes, security trust boundaries, development/testing, bundled
+  CSS, CI, and releases.
+- Marked dated audits and design specs as historical, updated support/version
+  references and issue-report guidance, documented split-console setup and
+  the fixed secret-key modes, and removed unsafe live-SQLite copy guidance.
+
+### Corrections to historical notes
+
+- The v1.5.1 topology item correctly records the reduction in row rewrites and
+  commits at that release, but a later concurrency review found that batching
+  on the shared `aiosqlite` connection did not provide transaction ownership.
+  This Unreleased change moves the refresh to a dedicated atomic connection.
+- The v1.5.0/v1.5.2 hub-sync notes describe the intended lockdown behavior at
+  those releases. A held-open hub whose HA state had not changed could still
+  skip reset through the unchanged-state fast path; the Unreleased fix above
+  closes that specific gap. Historical release text is preserved rather than
+  rewritten.
+- The v1.5.0 hub-sync entry says unknown/unavailable/jammed HA states are
+  ignored. That was the behavior at that release. Current sync never opens on
+  an untrustworthy state and actively resets any hold the app owns, including
+  after an HA disconnect or state-read exception.
+- The v1.1.0 ingress entry called `X-Ingress-Path` “Supervisor-signed” and said
+  another app on the bridge could not forge it. The app validates only the
+  header's shape; it cannot verify the opaque ingress token. Co-resident apps
+  remain inside the documented HA-host trust boundary. The current security
+  model corrects that terminology.
+- v1.1.0 removed the manifest watchdog and later restart UI was intentionally
+  ineffective in the packaged container. This Unreleased change restores an
+  explicit `/health/live` watchdog and uses Supervisor's authenticated
+  self-restart endpoint for scheduled restarts.
+
 ## [1.5.2] - 2026-07-12
 
 ### Fixed (hub sync — field report: "sync isn't working")

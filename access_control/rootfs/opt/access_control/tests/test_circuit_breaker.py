@@ -6,7 +6,6 @@ import sys
 import unittest
 import unittest.mock
 from pathlib import Path
-from types import ModuleType
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -219,6 +218,54 @@ class TestCircuitBreakerConcurrentProbeGuard(unittest.TestCase):
             # _probe_in_flight cleared so the next recovery window can
             # legitimately HALF_OPEN again.
             self.assertFalse(cb._probe_in_flight)
+
+    def test_aborted_probe_reopens_and_restarts_recovery_clock(self):
+        cb = CircuitBreaker("t", failure_threshold=1, recovery_timeout=60.0)
+        with unittest.mock.patch(
+            "access_control.circuit_breaker.time.monotonic", return_value=100.0
+        ):
+            cb.record_failure()
+        with unittest.mock.patch(
+            "access_control.circuit_breaker.time.monotonic", return_value=170.0
+        ):
+            self.assertFalse(cb.is_open())
+            self.assertEqual(cb.state, CircuitBreaker.HALF_OPEN)
+
+        # Models cancellation or an unexpected exception after the probe slot
+        # was reserved but before record_success/record_failure ran.
+        with unittest.mock.patch(
+            "access_control.circuit_breaker.time.monotonic", return_value=171.0
+        ):
+            cb.abort_probe()
+        self.assertEqual(cb.state, CircuitBreaker.OPEN)
+        self.assertFalse(cb._probe_in_flight)
+
+        with unittest.mock.patch(
+            "access_control.circuit_breaker.time.monotonic", return_value=230.0
+        ):
+            self.assertTrue(cb.is_open())
+        with unittest.mock.patch(
+            "access_control.circuit_breaker.time.monotonic", return_value=232.0
+        ):
+            self.assertFalse(cb.is_open())
+
+    def test_abort_probe_is_noop_after_success(self):
+        cb = CircuitBreaker("t", failure_threshold=1, recovery_timeout=1.0)
+        with unittest.mock.patch(
+            "access_control.circuit_breaker.time.monotonic", return_value=100.0
+        ):
+            cb.record_failure()
+        with unittest.mock.patch(
+            "access_control.circuit_breaker.time.monotonic", return_value=102.0
+        ):
+            self.assertFalse(cb.is_open())
+        cb.record_success()
+
+        cb.abort_probe()
+
+        self.assertEqual(cb.state, CircuitBreaker.CLOSED)
+        self.assertFalse(cb.is_open())
+        self.assertFalse(cb._probe_in_flight)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,14 @@
 # Codebase review — deferred items punch list
 
-**Branch:** `review/codebase-2026-05-24` (this PR fixes 17 findings; this
-file tracks the remaining items that were considered and deliberately
-deferred, with rationale and triggers for revisiting.)
+> **Historical record.** This was the deferred list for one May 2026 review,
+> not the current backlog or operating guidance. Later work bundled frontend
+> assets, removed the shared-connection rate-limit transaction race, hardened
+> client login state, and changed other items listed as deferred here. See the
+> current [documentation index](README.md) and
+> [changelog](../access_control/CHANGELOG.md).
+
+**Original branch:** `review/codebase-2026-05-24` (this file recorded items
+deferred by that review; it is not maintained as a current punch list.)
 
 ## What this PR fixed
 

@@ -114,9 +114,9 @@ def security_headers_for(*, ingress_active: bool) -> dict[str, str]:
         frame_ancestors = "frame-ancestors 'none'"
     csp = (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://unpkg.com; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.tailwindcss.com; "
-        "font-src https://fonts.gstatic.com; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "font-src 'self'; "
         "connect-src 'self'; "
         "img-src 'self' data:; "
         f"{frame_ancestors}"
@@ -129,6 +129,28 @@ def security_headers_for(*, ingress_active: bool) -> dict[str, str]:
         "X-XSS-Protection": "0",
         "Content-Security-Policy": csp,
     }
+
+
+def _finalize_response(request: Request, response):
+    """Apply security and cache policy, including to middleware rejections."""
+    ingress_active = bool(getattr(request.state, "ingress_active", False))
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        # Lightweight unit-test stand-ins do not always model Response headers.
+        headers = {}
+        response.headers = headers
+    for name, value in security_headers_for(
+        ingress_active=ingress_active
+    ).items():
+        headers[name] = value
+    path = getattr(getattr(request, "url", None), "path", "")
+    if path.startswith("/static/"):
+        # Asset paths are stable across releases, so keep this bounded rather
+        # than immutable; browsers will pick up an add-on upgrade promptly.
+        headers["Cache-Control"] = "public, max-age=3600"
+    else:
+        headers["Cache-Control"] = "no-store"
+    return response
 
 
 async def ingress_middleware(request: Request, call_next):
@@ -145,7 +167,7 @@ async def ingress_middleware(request: Request, call_next):
         # No valid ingress prefix → not from the Supervisor's proxy. Any
         # X-Remote-User-* headers on this request are ignored (could be
         # forged by another addon on the Docker bridge).
-        return await call_next(request)
+        return _finalize_response(request, await call_next(request))
 
     request.scope["root_path"] = ingress_path
     request.state.ingress_active = True
@@ -194,7 +216,9 @@ async def ingress_middleware(request: Request, call_next):
                 sorted(_ADMIN_TRUE_VALUES),
                 sorted(request.headers.keys()),
             )
-            return HTMLResponse(_FORBIDDEN_BODY, status_code=403)
+            return _finalize_response(
+                request, HTMLResponse(_FORBIDDEN_BODY, status_code=403)
+            )
         request.state.ingress_user = {"id": user_id, "name": user_name or user_id}
 
-    return await call_next(request)
+    return _finalize_response(request, await call_next(request))

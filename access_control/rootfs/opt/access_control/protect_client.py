@@ -90,26 +90,26 @@ class ProtectClient:
             ) as resp:
                 if resp.status == 401:
                     self._auth_permanently_failed = True
-                    text = await resp.text()
-                    # Sanitize the user-facing message; log the raw response
-                    # body for diagnostics only. Audit 2026-05-24, L1.
-                    _LOGGER.warning("Protect login 401 — response body: %s", text[:500])
+                    self._csrf_token = None
+                    self._auth_cookie = None
+                    await resp.text()
+                    _LOGGER.warning("Protect login returned HTTP 401")
                     raise RuntimeError(
                         "UniFi Protect rejected the credentials (HTTP 401). "
                         "Double-check the service-account username + password."
                     )
                 if resp.status not in (200, 201):
-                    text = await resp.text()
-                    _LOGGER.warning("Protect login HTTP %d — response body: %s", resp.status, text[:500])
+                    await resp.text()
+                    _LOGGER.warning("Protect login returned HTTP %d", resp.status)
                     raise RuntimeError(
                         f"UniFi Protect returned HTTP {resp.status} during login. "
                         "Check the app log for the full upstream response."
                     )
-                self._csrf_token = (
+                csrf_token = (
                     resp.headers.get("X-Updated-CSRF-Token")
                     or resp.headers.get("X-CSRF-Token")
                 )
-                if not self._csrf_token:
+                if not csrf_token:
                     raise RuntimeError("Protect login succeeded but no CSRF token found in response headers")
                 # Extract TOKEN cookie via regex — SimpleCookie silently
                 # drops cookies with the 'Partitioned' attribute (newer
@@ -119,9 +119,12 @@ class ProtectClient:
                     resp.headers.get("Set-Cookie", ""),
                 )
                 if token_match:
-                    self._auth_cookie = token_match.group(1)
+                    auth_cookie = token_match.group(1)
                 else:
                     raise RuntimeError("TOKEN cookie not found in login response")
+                self._csrf_token = csrf_token
+                self._auth_cookie = auth_cookie
+                self._auth_permanently_failed = False
                 _LOGGER.info("Protect: logged in to %s", self._host)
 
     def _headers(self) -> dict:
@@ -153,6 +156,11 @@ class ProtectClient:
 
         result = []
         for cam in cameras:
+            if not isinstance(cam, dict):
+                _LOGGER.warning(
+                    "Protect cameras response contained a non-object row"
+                )
+                continue
             name = cam.get("name") or "Unknown"
             result.append({
                 "id": cam.get("id", ""),
@@ -174,7 +182,8 @@ class ProtectClient:
     # ------------------------------------------------------------------
 
     def register_callback(self, callback: Callable) -> None:
-        self._callbacks.append(callback)
+        if callback not in self._callbacks:
+            self._callbacks.append(callback)
 
     async def start_websocket(self) -> None:
         if self._ws_task is not None and not self._ws_task.done():
@@ -188,8 +197,10 @@ class ProtectClient:
             self._ws_task.cancel()
             try:
                 await self._ws_task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception:
+                _LOGGER.exception("Protect WebSocket task raised during shutdown")
             self._ws_task = None
         self._ws_connected = False
 
@@ -255,8 +266,8 @@ class ProtectClient:
             raise
 
         self._ws_connected = True
-        # Reset the "last event seen" timestamp on every (re)connect — see
-        # AccessClient._ws_connect for the rationale (watchdog re-fire loop).
+        # Seed activity age for API diagnostics. aiohttp heartbeat and the
+        # reconnect loop own protocol liveness; quiet doors are not failures.
         self._last_event_at = asyncio.get_running_loop().time()
         _LOGGER.info("Protect WebSocket connected")
 
@@ -359,7 +370,14 @@ class ProtectClient:
                     except Exception:
                         _LOGGER.exception("Protect callback error")
 
-        except (json.JSONDecodeError, struct.error, ValueError, IndexError) as exc:
+        except (
+            json.JSONDecodeError,
+            struct.error,
+            ValueError,
+            IndexError,
+            AttributeError,
+            TypeError,
+        ) as exc:
             _LOGGER.warning("Protect WS frame parse error (%s): %d bytes", type(exc).__name__, len(data))
 
     async def close(self) -> None:

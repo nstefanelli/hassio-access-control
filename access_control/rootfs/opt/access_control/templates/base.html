@@ -9,15 +9,11 @@
      local docker testing). All in-app links use RELATIVE paths so they
      work in both modes; do NOT introduce leading slashes. #}
   <base href="{% if ingress_path %}{{ ingress_path }}/{% else %}/{% endif %}">
-  <script>window.__INGRESS_PREFIX__ = "{{ ingress_path or '' }}";</script>
+  {% if csrf_token %}<meta name="csrf-token" content="{{ csrf_token }}">{% endif %}
   <title>{% block title %}Access Control{% endblock %}</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%233b82f6'><path d='M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 3.18L18 7.1v4.9c0 4.28-2.98 8.28-6 9.67-3.02-1.39-6-5.39-6-9.67V7.1l6-2.92z'/></svg>" type="image/svg+xml">
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/htmx.org@2.0.0"></script>
   <link rel="stylesheet" href="static/app.css" />
+  <script src="static/app.js" defer></script>
   <style>
     :root {
       --bg-deep: #050810;
@@ -316,22 +312,5 @@
 </nav>
 {% endif %}
 
-{% if csrf_token %}
-<script>
-  function _injectCsrf(root) {
-    (root || document).querySelectorAll('form[method="post"]').forEach(function(form) {
-      if (!form.querySelector('input[name="_csrf_token"]')) {
-        var input = document.createElement('input');
-        input.type = 'hidden';
-        input.name = '_csrf_token';
-        input.value = '{{ csrf_token }}';
-        form.appendChild(input);
-      }
-    });
-  }
-  _injectCsrf();
-  document.addEventListener('htmx:afterSwap', function(e) { _injectCsrf(e.detail.target); });
-</script>
-{% endif %}
 </body>
 </html>

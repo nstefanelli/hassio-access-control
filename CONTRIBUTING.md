@@ -1,35 +1,61 @@
 # Contributing
 
-Thanks for the interest. This is a hobby project, so the bar for
-"contributing" is intentionally low — bug reports, feature ideas, and
-PRs are all welcome.
+Bug reports, focused fixes, tests, documentation, and feature proposals are
+welcome. For larger behavior changes, open an issue first so the physical-
+access and migration implications can be agreed before implementation.
 
-## Quick links
+## Before opening anything public
+
+- Security vulnerabilities belong in [GitHub Private Vulnerability
+  Reporting](SECURITY.md), not an issue or pull request.
+- Remove API keys, HA/UniFi tokens, passwords, PINs, cookies, database files,
+  household identities, console addresses, and unredacted logs.
+- Search existing issues and the [changelog](access_control/CHANGELOG.md).
+
+Quick links:
 
 - [Report a bug](https://github.com/nstefanelli/hassio-access-control/issues/new?template=bug_report.yml)
 - [Request a feature](https://github.com/nstefanelli/hassio-access-control/issues/new?template=feature_request.yml)
-- [Report a security issue](SECURITY.md) (private channel — don't open a public issue)
+- [Development guide](docs/DEVELOPMENT.md)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
 
-## Development setup
+## Local setup
 
-The app is a FastAPI + HTMX dashboard packaged as a Home Assistant app.
-You can develop and test it entirely on your laptop — no real UniFi or
-HA install needed for most changes.
-
-### Run the test suite
+Use Python 3.12:
 
 ```bash
 cd access_control/rootfs/opt
-python -m venv .venv
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
 .venv/bin/pip install -r access_control/requirements-dev.txt
 .venv/bin/pytest access_control/tests -q
 ```
 
-The suite takes ~1 second and covers the auth engine, circuit breaker,
-ingress middleware, re-lock manager, and core route flows.
+Most tests use fake HA/UniFi clients. Changes to the app manifest, Ingress,
+Supervisor APIs, restart behavior, authentication, or real upstream payload
+parsing also need a smoke test on a disposable Home Assistant/UniFi environment
+when available.
 
-### Build the container image locally
+The complete [development guide](docs/DEVELOPMENT.md) covers focused tests,
+security checks, the local image, direct-mode smoke testing, and repository
+conventions.
+
+## Frontend changes
+
+The runtime UI is self-hosted. If a template adds/removes Tailwind classes or
+the CSS input changes, commit the regenerated minified stylesheet:
+
+```bash
+cd access_control/frontend
+npm ci
+npm run build
+```
+
+Node.js 20+ is required for this build. Commit `package-lock.json` and the
+generated `static/app.css`; never commit `node_modules/`. Keep browser URLs
+relative/Ingress-aware and shared behavior in `static/app.js`.
+
+## Container build
 
 ```bash
 cd access_control
@@ -40,106 +66,79 @@ docker build \
   -t access-control:dev .
 ```
 
-### Run the container
-
-```bash
-mkdir -p /tmp/ac-data
-echo '{"log_level":"info","use_supervisor_api":false}' > /tmp/ac-opts.json
-docker run --rm -p 8080:8080 \
-  -v /tmp/ac-data:/data \
-  -v /tmp/ac-opts.json:/data/options.json:ro \
-  access-control:dev
-```
-
-Then open <http://localhost:8080/setup> in your browser.
-
-To simulate the HA Ingress + SSO path, pass the headers manually with
-`curl`:
-
-```bash
-curl -H 'X-Ingress-Path: /api/hassio_ingress/dummytoken' \
-     -H 'X-Remote-User-Id: u1' \
-     -H 'X-Remote-User-Name: Test' \
-     -H 'X-Remote-User-Is-Admin: true' \
-     http://localhost:8080/
-```
+The build context is `access_control/`, so its local `.dockerignore` is the
+effective ignore file. Keep test data, local databases, virtual environments,
+caches, and frontend dependencies out of the image context.
 
 ## What CI checks
 
-Every push to `main` and every PR triggers:
+Every pull request and push to `main` runs:
 
-- `yamllint` — YAML files (configs, workflows, GitHub forms)
-- `hadolint` — Dockerfile linting
-- `shellcheck` — `run.sh` and other bash
-- `pytest` — full test suite
-- Multi-arch build (`amd64`, `aarch64`) using the
-  [home-assistant/builder][builder] action; PRs build with `--test`, main
-  builds publish to `ghcr.io`
+- `yamllint`;
+- `hadolint`;
+- `shellcheck` and release-helper self-tests;
+- Python 3.12 tests;
+- Bandit at medium-or-higher severity/confidence;
+- `pip-audit` for runtime and development requirements;
+- native `amd64` and `aarch64` image builds when app/shared build inputs
+  changed;
+- an aggregation gate that requires every selected architecture to succeed.
 
-All checks must pass before a PR can merge.
+Pull-request images are never pushed. Ordinary main builds use immutable
+`sha-*` tags; only a main push with a manifest version change publishes the
+version and `latest` tags. GitHub Release creation waits for successful main
+push CI. See [Development → Release process](docs/DEVELOPMENT.md#release-process).
 
-### First publish: make the GHCR package public (one-time, manual)
+## Pull-request expectations
 
-A newly-created GHCR package is **private by default**. Home Assistant's
-Supervisor pulls the image anonymously (it has no GHCR credentials), so an
-install fails with `pull access denied` / `403` until the package is made
-public — with no in-HA hint that this is the cause. After the first CI push
-of each architecture, the maintainer must flip visibility:
+- Keep the change scoped and explain the failure mode or user outcome.
+- Add regression tests, including concurrency/failure cases where relevant.
+- Run the full suite before pushing.
+- Update canonical documentation when configuration, operations, API, trust
+  boundaries, or contributor workflow changes.
+- Add user-visible changes under `## [Unreleased]` in
+  `access_control/CHANGELOG.md`.
+- Include before/after screenshots for visible UI changes.
+- Call out database migrations, upgrade/rollback behavior, and physical-door
+  safety effects explicitly.
 
-`https://github.com/users/<owner>/packages/container/<image-name>/settings`
-→ **Change visibility** → **Public**.
+Conventional Commit prefixes are encouraged but not required: `feat`, `fix`,
+`docs`, `perf`, `refactor`, `test`, and `chore`.
 
-This is one-time per package per arch — `hassio-access-control-amd64` and
-`hassio-access-control-aarch64` are **separate packages**, so both need it.
-There is no non-PAT API path on the free tier, so it isn't automated.
+## Review principles
 
-## Style notes
+- Lockdown, alarm uncertainty, corrupt schedules, and failed re-lock paths
+  should resolve conservatively.
+- A failed settings update must not destroy a working live client or split-
+  console topology.
+- State-changing web routes require authentication, CSRF, boundary validation,
+  and the appropriate action rate limit.
+- The shared SQLite connection remains autocommit-only. Concurrent
+  multi-statement workflows must use an isolated, task-owned transaction and
+  explicit process-level coordination where the operation is read-modify-write.
+- Access-client changes must preserve persisted site-namespace verification
+  before initial publication, candidate swaps, REST reauthentication, and
+  WebSocket reconnect.
+- Avoid persistent writes for short-lived caches or unchanged topology.
+- Do not surface raw upstream response bodies or secrets in the UI/logs.
+- Preserve HA Ingress `root_path` behavior in links, redirects, fetches, and
+  cookies.
 
-- **Python**: roughly PEP 8. No formatter is enforced yet; new code
-  should look like neighboring code.
-- **Templates**: HTML + Jinja2. Use **relative URLs** so they resolve
-  against `<base href>` under both ingress and direct-port access. The
-  README's "Anti-pattern" callout in `templates/base.html` explains why.
-- **Tests**: prefer `unittest.IsolatedAsyncioTestCase` for async tests
-  (matches the existing pattern; works out of the box with `pytest`).
-
-## Commit / PR conventions
-
-Conventional Commits are encouraged but not required:
-
-- `feat: ...` — new feature
-- `fix: ...` — bug fix
-- `docs: ...` — documentation only
-- `refactor: ...` — internal restructuring with no behavior change
-- `test: ...` — test changes only
-- `chore: ...` — build, CI, dependencies
-
-For PRs:
-
-- Link the issue you're addressing if there is one (`Fixes #N`).
-- Update `access_control/CHANGELOG.md` under an `## [Unreleased]` heading
-  if the change is user-visible.
-- Add tests for new behavior. Run `pytest` before pushing.
-- If you change anything in `access_control/config.yaml`'s `version`,
-  also update `CHANGELOG.md` with the corresponding release section.
-
-## Repo layout
+## Repository map
 
 ```text
-.
-├── access_control/            # the app
-│   ├── config.yaml            # app manifest
-│   ├── Dockerfile             # multi-arch image
-│   ├── build.yaml             # base images per arch
-│   ├── apparmor.txt           # security profile
-│   ├── README.md / DOCS.md / CHANGELOG.md
-│   └── rootfs/
-│       ├── run.sh             # bashio entrypoint
-│       └── opt/access_control/  # FastAPI app + tests
-├── .github/workflows/ci.yaml  # lint + build + publish
-├── docs/specs/                # design notes
-├── docs/screenshots/          # README screenshots
-└── README.md                  # main README
+access_control/
+├── config.yaml                         # HA app manifest
+├── Dockerfile / build.yaml
+├── frontend/                           # pinned Tailwind inputs
+├── rootfs/run.sh                       # bashio/container entry point
+└── rootfs/opt/access_control/
+    ├── main.py                         # lifecycle and background services
+    ├── auth_engine.py                  # physical authorization decisions
+    ├── database.py                     # schema and state
+    ├── web_routes.py / api_routes.py   # dashboard and external API
+    ├── templates/ / static/            # self-hosted UI
+    └── tests/
+docs/                                    # canonical documentation
+.github/workflows/                       # CI and releases
 ```
-
-[builder]: https://github.com/home-assistant/builder

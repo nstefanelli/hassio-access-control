@@ -62,9 +62,9 @@
       </div>
       {% endif %}
 
-      <!-- UNVR Console -->
+      <!-- Primary Protect console -->
       <div class="card">
-        <div class="section-heading" style="margin-bottom:1rem;">UNVR Console</div>
+        <div class="section-heading" style="margin-bottom:1rem;">Primary UNVR / Protect Console</div>
         <div class="space-y-4">
           <div>
             <label for="unvr_host" class="block text-sm font-medium text-gray-300 mb-1">Host / IP</label>
@@ -78,6 +78,44 @@
             <label for="unvr_password" class="block text-sm font-medium text-gray-300 mb-1">Password</label>
             <input id="unvr_password" name="unvr_password" type="password" required class="input" placeholder="••••••••" />
           </div>
+        </div>
+      </div>
+
+      <!-- Optional split Access console -->
+      <div class="card">
+        <div class="section-heading" style="margin-bottom:0.5rem;">Separate UniFi Access Console <span style="font-weight:400; text-transform:none; color:var(--text-muted);">(optional)</span></div>
+        <p style="font-size:0.75rem; color:var(--text-muted); margin:0 0 1rem;">
+          Leave all three fields blank when Protect and Access run on the primary console.
+        </p>
+        <div class="space-y-4">
+          <div>
+            <label for="access_host" class="block text-sm font-medium text-gray-300 mb-1">Host / IP</label>
+            <input id="access_host" name="access_host" type="text" class="input" placeholder="192.168.1.11" />
+          </div>
+          <div>
+            <label for="access_username" class="block text-sm font-medium text-gray-300 mb-1">Username</label>
+            <input id="access_username" name="access_username" type="text" class="input" autocomplete="username" />
+          </div>
+          <div>
+            <label for="access_password" class="block text-sm font-medium text-gray-300 mb-1">Password</label>
+            <input id="access_password" name="access_password" type="password" class="input" autocomplete="current-password" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Official Access Open API -->
+      <div class="card">
+        <div class="section-heading" style="margin-bottom:0.5rem;">UniFi Access API Token <span style="font-weight:400; text-transform:none; color:var(--text-muted);">(recommended)</span></div>
+        <p style="font-size:0.75rem; color:var(--text-muted); margin:0 0 1rem;">
+          Create a token in Access &gt; Settings &gt; General &gt; Advanced with
+          <code>view:space</code> and <code>edit:space</code>. It is used on the
+          official local API to confirm lock state and handle active unlock schedules.
+          Existing installations can add it later from Settings.
+        </p>
+        <div>
+          <label for="access_api_token" class="block text-sm font-medium text-gray-300 mb-1">API Token</label>
+          <input id="access_api_token" name="access_api_token" type="password" class="input"
+                 autocomplete="new-password" placeholder="Optional during initial setup" />
         </div>
       </div>
 

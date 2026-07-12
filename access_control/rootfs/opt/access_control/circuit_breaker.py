@@ -94,3 +94,17 @@ class CircuitBreaker:
             self._state = self.OPEN
             self._probe_in_flight = False
         # If already OPEN, do NOT reset _opened_at — let the recovery timer tick
+
+    def abort_probe(self) -> None:
+        """Release a reserved half-open probe after cancellation/buggy exit.
+
+        Callers invoke this from ``finally``. Successful/failed requests have
+        already transitioned out of HALF_OPEN, so this is a no-op for them.
+        Reopening here prevents an uncaught parse error or task cancellation
+        from leaving the single probe slot reserved forever.
+        """
+        if self._state == self.HALF_OPEN and self._probe_in_flight:
+            self._state = self.OPEN
+            self._opened_at = time.monotonic()
+            self._probe_in_flight = False
+            _LOGGER.warning("Circuit %s: half-open probe aborted; reopening", self.name)

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import re
-import shlex
 import sqlite3
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -17,16 +19,20 @@ from fastapi.templating import Jinja2Templates
 from .access_client import AccessClient, AccessClientError
 from .protect_client import ProtectClient
 from .config import (
+    SECRET_KEY_SOURCE_DATABASE,
+    SECRET_KEY_SOURCE_ENVIRONMENT,
     decrypt_value,
     derive_key,
     encrypt_value,
     generate_api_key,
     hash_api_key,
     hash_password,
+    secret_key_fingerprint,
     verify_password,
 )
 from .ha_client import HAClient
-from . import web_auth
+from .lock_actions import execute_lock_action
+from .service_restart import request_service_restart
 from .web_auth import (
     clear_session_cookie,
     generate_csrf_token,
@@ -101,7 +107,8 @@ except AttributeError:
 # ---------------------------------------------------------------------------
 
 _DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-_HA_ENTITY_ID_RE = re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
+_LOCK_ENTITY_ID_RE = re.compile(r"^lock\.[a-z0-9_]+$")
+_ALARM_ENTITY_ID_RE = re.compile(r"^alarm_control_panel\.[a-z0-9_]+$")
 # 24-hour HH:MM. Validated wherever schedule start/end strings are
 # accepted; the auth engine treats malformed values as "always inactive"
 # which fails closed, but rejecting at the form layer is friendlier.
@@ -119,6 +126,10 @@ _LOGIN_RATE_LIMIT = {"max_attempts": 5, "window": 300, "lockout": 60}
 # live UNVR + HA connection test — attacker brute-forces upstream creds
 # through us if we don't cap. Audit 2026-05-24, C2.
 _SETUP_RATE_LIMIT = {"max_attempts": 3, "window": 300, "lockout": 300}
+_API_KEY_SCOPES = frozenset({"full", "read_only", "locks_only"})
+_ENTRY_DEVICE_TYPES = frozenset(
+    {"access_reader", "protect_doorbell"}
+)
 
 
 def _log_task_exception(task: asyncio.Task) -> None:
@@ -134,6 +145,63 @@ def _extract_schedule_days(form) -> str | None:
     """Extract checked day checkboxes from form and return comma-separated day names."""
     selected = [d for d in _DAY_NAMES if form.get(d)]
     return ",".join(selected) if selected else None
+
+
+def _schedule_validation_error(
+    *,
+    enabled: bool,
+    days: str | None,
+    start: str | None,
+    end: str | None,
+) -> str | None:
+    """Validate a schedule at the trust boundary.
+
+    Days-only schedules mean all day on the selected days. Time-only
+    schedules mean the window applies every day. An enabled schedule with
+    no restriction, or only one time bound, is almost certainly a partial
+    form submission and must fail closed.
+    """
+    if start and not _TIME_RE.fullmatch(start):
+        return "Invalid start time format."
+    if end and not _TIME_RE.fullmatch(end):
+        return "Invalid end time format."
+    if bool(start) != bool(end):
+        return "Schedule start and end times must be provided together."
+    if enabled and not days and not (start and end):
+        return "Enabled schedules need at least one day or a time range."
+    return None
+
+
+def _site_timezone(request: Request) -> tzinfo:
+    """Return the HA-configured timezone used by the auth engine."""
+    engine = getattr(request.app.state, "auth_engine", None)
+    configured = getattr(engine, "tz", None)
+    if configured is not None:
+        return configured
+    return datetime.now(timezone.utc).astimezone().tzinfo or timezone.utc
+
+
+def _timezone_label(value: tzinfo) -> str:
+    return getattr(value, "key", None) or str(value)
+
+
+def _parse_site_datetime(date_value: str, time_value: str, zone: tzinfo) -> datetime:
+    """Parse a local wall time and reject DST gaps or ambiguous folds."""
+    naive = datetime.strptime(
+        f"{date_value} {time_value}", "%Y-%m-%d %H:%M"
+    )
+    candidates: dict[float, datetime] = {}
+    for fold in (0, 1):
+        aware = naive.replace(tzinfo=zone, fold=fold)
+        timestamp = aware.timestamp()
+        round_trip = datetime.fromtimestamp(timestamp, zone)
+        if round_trip.replace(tzinfo=None) == naive:
+            candidates[timestamp] = aware
+    if not candidates:
+        raise ValueError("That local time does not exist because of a DST change.")
+    if len(candidates) > 1:
+        raise ValueError("That local time is ambiguous because of a DST change.")
+    return next(iter(candidates.values()))
 
 
 def _redirect(request: Request, url: str, *, delete_cookie: bool = False) -> RedirectResponse:
@@ -220,7 +288,13 @@ async def _render(template: str, request: Request, context: dict) -> HTMLRespons
     _inject_ingress_context(request, context)
 
     response = templates.TemplateResponse(request, template, context)
-    if user:
+    # A background status refresh is not user activity. Refreshing the
+    # four-hour cookie on the 10-second poll kept an abandoned dashboard
+    # authenticated forever and emitted needless Set-Cookie traffic.
+    background_poll = (
+        getattr(request, "headers", {}).get("X-Background-Poll") == "true"
+    )
+    if user and not background_poll:
         refresh_session_cookie(response, request, user)
     return response
 
@@ -230,6 +304,20 @@ def _client_ip(request: Request) -> str:
     # (no `.client` attribute) don't crash this helper.
     client = getattr(request, "client", None)
     return client.host if client else "unknown"
+
+
+def _same_console_endpoint(left: str | None, right: str | None) -> bool:
+    """Compare configured console endpoints conservatively."""
+    return (left or "").strip().rstrip("/").casefold() == (
+        right or ""
+    ).strip().rstrip("/").casefold()
+
+
+async def _get_access_identity(client) -> str | None:
+    getter = getattr(client, "get_console_identity", None)
+    if not callable(getter):
+        return None
+    return await getter()
 
 
 def _action_key(request: Request, user: str, action: str) -> str:
@@ -249,6 +337,43 @@ async def _enforce_action_rate_limit(request: Request, user: str, action: str) -
         "<h1>429 Too Many Requests</h1><p>Action rate limit exceeded. Try again in 60 seconds.</p>",
         status_code=429,
     )
+
+
+@asynccontextmanager
+async def _physical_barrier(request: Request):
+    """Serialize client publication with physical lock/alarm commands."""
+    command_lock = getattr(request.app.state, "physical_command_lock", None)
+    if command_lock is None:
+        yield
+        return
+    async with command_lock:
+        yield
+
+
+async def _quiesce_event_sources(request: Request, *clients) -> None:
+    """Stop old WebSockets and drain callbacks before publishing new clients."""
+    for client in clients:
+        if client is None:
+            continue
+        stop = getattr(client, "stop_websocket", None)
+        if callable(stop):
+            result = stop()
+            if inspect.isawaitable(result):
+                await result
+    drain = getattr(request.app.state, "drain_event_tasks", None)
+    if callable(drain):
+        result = drain()
+        if inspect.isawaitable(result):
+            await result
+
+
+def _visitor_operation_lock(request: Request, visitor_id: int) -> asyncio.Lock:
+    """Return the stable per-visitor lock for upstream/local transitions."""
+    locks = getattr(request.app.state, "visitor_operation_locks", None)
+    if locks is None:
+        locks = {}
+        request.app.state.visitor_operation_locks = locks
+    return locks.setdefault(visitor_id, asyncio.Lock())
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +408,9 @@ async def login_post(
     """Validate credentials and set session cookie."""
     client_ip = _client_ip(request)
     db = request.app.state.db
-    if await db.is_rate_limited("login", client_ip):
+    if not await db.consume_rate_limit(
+        "login", client_ip, **_LOGIN_RATE_LIMIT
+    ):
         return templates.TemplateResponse(
             request,
             "login.html",
@@ -305,7 +432,6 @@ async def login_post(
         )
 
     if stored_username is None or username != stored_username or not password_ok:
-        await db.record_rate_limit_failure("login", client_ip, **_LOGIN_RATE_LIMIT)
         return templates.TemplateResponse(
             request,
             "login.html",
@@ -350,16 +476,68 @@ async def setup_post(
     unvr_host: str = Form(...),
     unvr_username: str = Form(...),
     unvr_password: str = Form(...),
+    access_host: str = Form(""),
+    access_username: str = Form(""),
+    access_password: str = Form(""),
     ha_url: str = Form(""),
     ha_token: str = Form(""),
+    access_api_token: str = Form(""),
 ):
-    """Validate UNVR + HA connections, save encrypted config, generate initial API key.
+    """Serialize first-run so concurrent submissions cannot mix key bundles."""
+    setup_lock = getattr(request.app.state, "setup_lock", None)
+    if setup_lock is None:
+        return await _setup_post_impl(
+            request,
+            admin_username,
+            admin_password,
+            unvr_host,
+            unvr_username,
+            unvr_password,
+            access_host,
+            access_username,
+            access_password,
+            ha_url,
+            ha_token,
+            access_api_token,
+        )
+    async with setup_lock:
+        return await _setup_post_impl(
+            request,
+            admin_username,
+            admin_password,
+            unvr_host,
+            unvr_username,
+            unvr_password,
+            access_host,
+            access_username,
+            access_password,
+            ha_url,
+            ha_token,
+            access_api_token,
+        )
+
+
+async def _setup_post_impl(
+    request: Request,
+    admin_username: str,
+    admin_password: str,
+    unvr_host: str,
+    unvr_username: str,
+    unvr_password: str,
+    access_host: str,
+    access_username: str,
+    access_password: str,
+    ha_url: str,
+    ha_token: str,
+    access_api_token: str = "",
+):
+    """Validate upstream connections and persist first-run configuration.
 
     Security: this route is intentionally exempt from CSRF + login (no
     session exists during first-run). To prevent re-execution after the
     app is configured — which would overwrite admin credentials, rotate
     the encryption_salt (orphaning previously-encrypted UNVR/HA tokens
-    and visitor PINs), and emit new API keys — we hard-guard against
+    and visitor PINs) — we hard-guard against
     `configured=True` here and rate-limit unauthenticated POSTs.
     """
     db = request.app.state.db
@@ -376,16 +554,15 @@ async def setup_post(
     # Each attempt drives real UNVR + HA connection tests, so unmetered
     # access lets an attacker brute-force those upstream credentials.
     client_ip = _client_ip(request)
-    if await db.is_rate_limited("setup", client_ip):
+    if not await db.consume_rate_limit(
+        "setup", client_ip, **_SETUP_RATE_LIMIT
+    ):
         raise HTTPException(
             status_code=429,
             detail="Too many setup attempts. Try again in a minute.",
         )
 
-    async def _render_error_and_record(error: str) -> HTMLResponse:
-        # Record a rate-limit failure on every error path so repeated
-        # bad-credential attempts get throttled (see C2).
-        await db.record_rate_limit_failure("setup", client_ip, **_SETUP_RATE_LIMIT)
+    async def _render_error(error: str) -> HTMLResponse:
         return templates.TemplateResponse(
             request,
             "setup.html",
@@ -415,15 +592,53 @@ async def setup_post(
         )
         admin_password = _secrets.token_urlsafe(48)
     elif not admin_username or not admin_password:
-        return await _render_error_and_record("Admin username and password are required.")
+        return await _render_error("Admin username and password are required.")
 
-    # 1. Test UNVR connection
-    access_client = AccessClient(unvr_host, unvr_username, unvr_password)
+    separate_access_values = (access_host, access_username, access_password)
+    if any(separate_access_values) and not all(separate_access_values):
+        return await _render_error(
+            "Provide all three separate Access console fields, or leave all blank."
+        )
+
+    # 1. Authenticate the primary Protect console and the Access console.
+    # They may be the same UniFi console or two independent appliances.
+    protect_client = ProtectClient(unvr_host, unvr_username, unvr_password)
+    try:
+        await protect_client.login()
+    except Exception as exc:
+        logger.warning("Setup primary UNVR connection test failed: %s", exc)
+        return await _render_error(
+            "Failed to authenticate to the primary UNVR. Check host and credentials."
+        )
+    finally:
+        await protect_client.close()
+
+    access_target = (
+        separate_access_values
+        if all(separate_access_values)
+        else (unvr_host, unvr_username, unvr_password)
+    )
+    # Direct unit calls see FastAPI's ``Form`` default object when the newly
+    # added optional field is omitted; HTTP requests always supply a string.
+    access_api_token = (
+        access_api_token.strip() if isinstance(access_api_token, str) else ""
+    )
+    access_client = AccessClient(
+        *access_target,
+        api_token=access_api_token or None,
+    )
+    access_identity = None
     try:
         await access_client.login()
+        access_identity = await _get_access_identity(access_client)
+        if access_api_token:
+            await access_client.validate_open_api()
     except AccessClientError as exc:
-        logger.warning("Setup UNVR connection test failed: %s", exc)
-        return await _render_error_and_record("Failed to connect to UNVR. Check host and credentials.")
+        logger.warning("Setup Access console connection test failed: %s", exc)
+        return await _render_error(
+            "Failed to connect to UniFi Access or validate its API token. "
+            "Check the host, credentials, token, and view:space permission."
+        )
     finally:
         await access_client.close()
 
@@ -448,7 +663,7 @@ async def setup_post(
         persist_ha_creds = False
     else:
         if not ha_url or not ha_token:
-            return await _render_error_and_record(
+            return await _render_error(
                 "Home Assistant URL and Long-Lived Access Token are required."
             )
         ha_url_for_test = ha_url
@@ -476,54 +691,85 @@ async def setup_post(
                 "is healthy, and that ACCESS_CONTROL_HA_URL / _TOKEN are "
                 "set (run.sh exports both when use_supervisor_api: true)."
             )
-        return await _render_error_and_record(err)
+        return await _render_error(err)
 
-    # 3. Generate a random secret_key (used for session signing) and encryption salt
+    # 3. Select the secret-key source once. Environment-key installations
+    # intentionally do not persist the key itself; the fingerprint detects a
+    # missing or wrong value on every subsequent boot. Database-key mode is the
+    # default and ignores an env var injected later, avoiding silent credential
+    # decryption failure.
     import secrets
-    secret_key = secrets.token_hex(32)
+    environment_secret_key = os.environ.get("ACCESS_CONTROL_SECRET_KEY")
+    if environment_secret_key:
+        secret_key = environment_secret_key
+        secret_key_source = SECRET_KEY_SOURCE_ENVIRONMENT
+    else:
+        secret_key = secrets.token_hex(32)
+        secret_key_source = SECRET_KEY_SOURCE_DATABASE
     salt = os.urandom(16)
     enc_key = derive_key(secret_key, salt)
 
     # 4. Save credentials to config. init_runtime() below re-reads these
     # from the DB to bring up the runtime clients (AccessClient, HAClient,
     # etc.), so the writes have to land before init_runtime() runs.
-    await db.set_config("admin_username", admin_username)
-    await db.set_config(
-        "admin_password_hash", await asyncio.to_thread(hash_password, admin_password)
-    )
-    await db.set_config("secret_key", secret_key)
-    await db.set_config("encryption_salt", salt.hex())
-    await db.set_config("unvr_host", unvr_host)
-    await db.set_config("unvr_username", encrypt_value(unvr_username, enc_key))
-    await db.set_config("unvr_password", encrypt_value(unvr_password, enc_key))
+    config_values = {
+        "admin_username": admin_username,
+        "admin_password_hash": await asyncio.to_thread(
+            hash_password, admin_password
+        ),
+        "secret_key_source": secret_key_source,
+        "secret_key_fingerprint": secret_key_fingerprint(secret_key),
+        "encryption_salt": salt.hex(),
+        "unvr_host": unvr_host,
+        "unvr_username": encrypt_value(unvr_username, enc_key),
+        "unvr_password": encrypt_value(unvr_password, enc_key),
+    }
+    if secret_key_source == SECRET_KEY_SOURCE_DATABASE:
+        config_values["secret_key"] = secret_key
+    if all(separate_access_values):
+        config_values.update(
+            {
+                "access_host": access_host,
+                "access_username": encrypt_value(access_username, enc_key),
+                "access_password": encrypt_value(access_password, enc_key),
+            }
+        )
     if persist_ha_creds:
-        await db.set_config("ha_url", ha_url)
-        await db.set_config("ha_token", encrypt_value(ha_token, enc_key))
+        config_values.update(
+            {
+                "ha_url": ha_url,
+                "ha_token": encrypt_value(ha_token, enc_key),
+            }
+        )
+    if access_identity:
+        config_values["access_console_identity"] = access_identity
+    if access_api_token:
+        config_values["access_api_token"] = encrypt_value(
+            access_api_token, enc_key
+        )
+    await db.set_configs(config_values)
 
-    # 5. Run runtime initialization. The API key is generated AFTER this
-    # succeeds so a failed init doesn't orphan a hashed-but-never-shown
-    # key in the DB. If init fails, the addon recovers on next restart
-    # via lifespan() — credentials are already persisted — but the user
-    # will need to generate an API key from the Settings page manually.
+    # 5. Run runtime initialization. If init fails, the addon recovers on the
+    # next restart via lifespan(); credentials are already persisted.
     request.app.state.configured = True
     try:
         init_runtime = getattr(request.app.state, "initialize_configured_state", None)
         if init_runtime is None:
             raise RuntimeError("Runtime initializer unavailable")
         await init_runtime()
-    except Exception as exc:
+    except Exception:
         logger.exception("Setup completed but runtime initialization failed")
         request.app.state.configured = False
-        return await _render_error_and_record(
-            f"Setup saved, but runtime initialization failed: {exc}. "
+        return await _render_error(
+            "Setup was saved, but runtime initialization failed. "
             "Credentials were persisted — restart the addon to retry "
             "(env-var fallback will pick up Supervisor-proxy creds) and "
             "generate an API key from Settings once it comes up."
         )
 
-    # 6. Generate the initial API key now that runtime init has succeeded.
-    raw_key = generate_api_key()
-    await db.add_api_key("default", hash_api_key(raw_key))
+    # API keys are created from Settings where the raw value can be shown once.
+    # Creating a hash here and then redirecting made the first key unusable.
+    await db.clear_rate_limit("setup", client_ip)
 
     # Under SSO, send the admin straight into the dashboard — they're already
     # authenticated by HA, no need to bounce through the legacy /login form.
@@ -774,12 +1020,16 @@ async def update_schedule(
 
     enabled_flag = schedule_enabled.lower() in ("on", "1", "true", "yes")
 
-    # Reject malformed time strings up front so the auth engine never
-    # receives unparseable schedule bounds. Audit 2026-05-24, M2.
-    if schedule_start and not _TIME_RE.match(schedule_start):
-        return _redirect(request, f"/users/{user_id}?error=Invalid+start+time")
-    if schedule_end and not _TIME_RE.match(schedule_end):
-        return _redirect(request, f"/users/{user_id}?error=Invalid+end+time")
+    schedule_error = _schedule_validation_error(
+        enabled=enabled_flag,
+        days=days_str,
+        start=schedule_start or None,
+        end=schedule_end or None,
+    )
+    if schedule_error:
+        return _redirect(
+            request, f"/users/{user_id}?error={quote_plus(schedule_error)}"
+        )
 
     await db.update_rule(
         rule_id,
@@ -894,8 +1144,10 @@ async def add_lock(
     limited = await _enforce_action_rate_limit(request, user, "lock_admin")
     if limited:
         return limited
-    if not _HA_ENTITY_ID_RE.match(entity_id):
+    if not _LOCK_ENTITY_ID_RE.fullmatch(entity_id):
         return _redirect(request, "/locks?error=Invalid+entity+ID+format")
+    if not 1 <= relock_duration <= 300:
+        return _redirect(request, "/locks?error=Relock+duration+must+be+1-300+seconds")
     db = request.app.state.db
     await db.add_external_lock(
         entity_id=entity_id,
@@ -922,6 +1174,8 @@ async def update_lock_settings(
     limited = await _enforce_action_rate_limit(request, user, "lock_admin")
     if limited:
         return limited
+    if not 1 <= relock_duration <= 300:
+        return _redirect(request, "/locks?error=Relock+duration+must+be+1-300+seconds")
     db = request.app.state.db
     # access_location_id is intentionally NOT accepted here: the settings
     # form has never rendered it, and passing a blank form default through
@@ -993,6 +1247,10 @@ async def add_entry_device(
     if limited:
         return limited
     db = request.app.state.db
+    if device_type not in _ENTRY_DEVICE_TYPES or not device_id:
+        return _redirect(request, "/locks?error=Invalid+entry+device")
+    if await db.get_lock(lock_id) is None:
+        return _redirect(request, "/locks?error=Unknown+lock")
     await db.add_entry_device(
         lock_id=lock_id,
         device_type=device_type,
@@ -1011,6 +1269,9 @@ async def delete_entry_device(
     if limited:
         return limited
     db = request.app.state.db
+    devices = await db.get_entry_devices_for_lock(lock_id)
+    if not any(device["id"] == ed_id for device in devices):
+        return _redirect(request, "/locks?error=Entry+device+does+not+belong+to+lock")
     await db.delete_entry_device(ed_id)
     return _redirect(request, "/locks")
 
@@ -1042,126 +1303,35 @@ async def buzz_lock(lock_id: int, request: Request, user: str = Depends(require_
     return await _lock_action(lock_id, "buzz", user, request)
 
 
+@router.post("/locks/{lock_id}/follow-schedule")
+async def follow_lock_schedule(
+    lock_id: int,
+    request: Request,
+    user: str = Depends(require_csrf),
+):
+    """Clear an app-owned native override and resume the Access schedule."""
+    limited = await _enforce_action_rate_limit(request, user, "lock_action")
+    if limited:
+        return limited
+    return await _lock_action(lock_id, "restore_schedule", user, request)
+
+
 async def _lock_action(lock_id: int, action: str, user: str, request):
-    """Execute a lock/unlock/buzz action on a lock."""
-    db = request.app.state.db
-    access = request.app.state.access_client
-    ha = request.app.state.ha_client
-
-    lock = await db.get_lock(lock_id)
-    if lock is None:
-        return _redirect(request, "/locks")
-
-    result = "error"
-    reason: str | None = None
-
-    try:
-        if lock["type"] == "access_native":
-            if not access:
-                reason = "Access client not available"
-            elif action == "buzz":
-                if lock.get("location_id"):
-                    await access.unlock_momentary(lock["location_id"])
-                    result = "granted"
-                else:
-                    reason = "Missing location_id for momentary unlock"
-            elif action == "unlock":
-                if lock.get("device_id"):
-                    await access.unlock_persistent(lock["device_id"])
-                    result = "granted"
-                else:
-                    reason = "Missing device_id for persistent unlock"
-            elif action == "lock":
-                if lock.get("device_id"):
-                    await access.lock(lock["device_id"])
-                    result = "granted"
-                else:
-                    reason = "Missing device_id for lock"
-
-        elif lock["type"] == "ha_external":
-            if not ha or not lock.get("entity_id"):
-                reason = "HA client not available or missing entity_id"
-            elif action == "buzz":
-                # Cancel any pending relock FIRST so an about-to-fire timer
-                # can't briefly re-lock the door between our unlock and the
-                # new schedule.
-                duration = lock.get("relock_duration", 30)
-                eid = lock["entity_id"]
-                rm = request.app.state.relock_manager
-                if rm is not None:
-                    await rm.cancel(eid)
-                ok = await ha.unlock(eid)
-                if ok:
-                    result = "granted"
-                    lock_name = lock.get("name", eid)
-                    request.app.state.lock_states[eid] = "unlocked"
-
-                    if rm is not None:
-                        await rm.schedule(
-                            entity_id=eid,
-                            duration=duration,
-                            lock_id=lock_id,
-                            lock_name=lock_name,
-                            source="buzz",
-                        )
-                else:
-                    reason = "HA unlock call returned failure"
-            elif action == "unlock":
-                # Cancel any pending relock FIRST so an about-to-fire timer
-                # can't re-lock the door immediately after our unlock returns.
-                eid = lock["entity_id"]
-                rm = request.app.state.relock_manager
-                if rm is not None:
-                    await rm.cancel(eid)
-                ok = await ha.unlock(eid)
-                result = "granted" if ok else "error"
-                if ok:
-                    request.app.state.lock_states[eid] = "unlocked"
-                    if rm is not None:
-                        logger.info("Cancelled relock timer for %s (manual unlock override)", lock.get("name", eid))
-                else:
-                    reason = "HA unlock call failed"
-            elif action == "lock":
-                # Cancel any pending relock FIRST — we're locking now, so
-                # the pending timer is redundant and could fire after we've
-                # already moved on (no harm here, but keeps state tidy).
-                eid = lock["entity_id"]
-                rm = request.app.state.relock_manager
-                if rm is not None:
-                    await rm.cancel(eid)
-                ok = await ha.lock(eid)
-                result = "granted" if ok else "error"
-                if ok:
-                    request.app.state.lock_states[eid] = "locked"
-                else:
-                    reason = "HA lock call failed"
-        else:
-            reason = f"Unknown lock type: {lock['type']}"
-    except Exception as exc:
-        result = "error"
-        reason = str(exc)
-        logger.exception("Error with %s on lock %s: %s", action, lock_id, exc)
-
-    await db.log_access(
-        method=f"manual_{action}",
-        result=result,
-        lock_id=lock_id,
-        lock_name=lock.get("name"),
-        user_name=user,
-        reason=reason,
+    """Execute a dashboard action through the shared command service."""
+    result = await execute_lock_action(
+        request.app.state,
+        lock_id,
+        action,
+        actor=user,
+        source="manual",
     )
-
-    # Auto-disarm alarm panels on successful unlock/buzz
-    if result == "granted" and action in ("unlock", "buzz") and ha:
-        alarm_panels = await db.get_all_alarm_panels()
-        for panel in alarm_panels:
-            try:
-                code = _decrypt_panel_code(request, panel)
-                await ha.alarm_disarm(panel["entity_id"], code=code)
-                logger.info("Auto-disarmed %s after %s on %s", panel["entity_id"], action, lock.get("name"))
-            except Exception:
-                logger.exception("Failed to auto-disarm %s", panel["entity_id"])
-
+    if result.outcome == "not_found":
+        return _redirect(request, "/locks")
+    if not result.granted:
+        return _redirect(
+            request,
+            f"/locks?error={quote_plus(result.reason or 'Lock action failed')}",
+        )
     return _redirect(request, "/locks")
 
 
@@ -1207,12 +1377,32 @@ async def alarm_arm_away(panel_id: int, request: Request, user: str = Depends(re
     if limited:
         return limited
     db = request.app.state.db
-    ha = request.app.state.ha_client
     panel = await _get_alarm_panel(db, panel_id)
-    if panel and ha:
-        ok = await ha.alarm_arm_away(panel["entity_id"])
-        if not ok:
-            logger.error("Alarm arm-away failed for %s", panel["entity_id"])
+    ok = False
+    reason = "Alarm panel not found"
+    if panel:
+        try:
+            async with _physical_barrier(request):
+                ha = request.app.state.ha_client
+                if ha is None:
+                    reason = "HA client unavailable"
+                else:
+                    code = _decrypt_panel_code(request, panel)
+                    ok = await ha.alarm_arm_away(
+                        panel["entity_id"], code=code
+                    )
+                    reason = "success" if ok else "HA returned failure"
+        except Exception as exc:
+            reason = f"command raised: {type(exc).__name__}"
+            logger.exception("Alarm arm-away raised for %s", panel["entity_id"])
+    if not ok:
+        logger.error("Alarm arm-away failed for %s: %s", panel_id, reason)
+    await db.log_admin_action(
+        user,
+        "alarm_arm_away",
+        panel["entity_id"] if panel else str(panel_id),
+        reason,
+    )
     return _redirect(request, "/")
 
 
@@ -1222,12 +1412,32 @@ async def alarm_arm_home(panel_id: int, request: Request, user: str = Depends(re
     if limited:
         return limited
     db = request.app.state.db
-    ha = request.app.state.ha_client
     panel = await _get_alarm_panel(db, panel_id)
-    if panel and ha:
-        ok = await ha.alarm_arm_home(panel["entity_id"])
-        if not ok:
-            logger.error("Alarm arm-home failed for %s", panel["entity_id"])
+    ok = False
+    reason = "Alarm panel not found"
+    if panel:
+        try:
+            async with _physical_barrier(request):
+                ha = request.app.state.ha_client
+                if ha is None:
+                    reason = "HA client unavailable"
+                else:
+                    code = _decrypt_panel_code(request, panel)
+                    ok = await ha.alarm_arm_home(
+                        panel["entity_id"], code=code
+                    )
+                    reason = "success" if ok else "HA returned failure"
+        except Exception as exc:
+            reason = f"command raised: {type(exc).__name__}"
+            logger.exception("Alarm arm-home raised for %s", panel["entity_id"])
+    if not ok:
+        logger.error("Alarm arm-home failed for %s: %s", panel_id, reason)
+    await db.log_admin_action(
+        user,
+        "alarm_arm_home",
+        panel["entity_id"] if panel else str(panel_id),
+        reason,
+    )
     return _redirect(request, "/")
 
 
@@ -1237,13 +1447,32 @@ async def alarm_disarm(panel_id: int, request: Request, user: str = Depends(requ
     if limited:
         return limited
     db = request.app.state.db
-    ha = request.app.state.ha_client
     panel = await _get_alarm_panel(db, panel_id)
-    if panel and ha:
-        code = _decrypt_panel_code(request, panel)
-        ok = await ha.alarm_disarm(panel["entity_id"], code=code)
-        if not ok:
-            logger.error("Alarm disarm failed for %s", panel["entity_id"])
+    ok = False
+    reason = "Alarm panel not found"
+    if panel:
+        try:
+            async with _physical_barrier(request):
+                ha = request.app.state.ha_client
+                if ha is None:
+                    reason = "HA client unavailable"
+                else:
+                    code = _decrypt_panel_code(request, panel)
+                    ok = await ha.alarm_disarm(
+                        panel["entity_id"], code=code
+                    )
+                    reason = "success" if ok else "HA returned failure"
+        except Exception as exc:
+            reason = f"command raised: {type(exc).__name__}"
+            logger.exception("Alarm disarm raised for %s", panel["entity_id"])
+    if not ok:
+        logger.error("Alarm disarm failed for %s: %s", panel_id, reason)
+    await db.log_admin_action(
+        user,
+        "alarm_disarm",
+        panel["entity_id"] if panel else str(panel_id),
+        reason,
+    )
     return _redirect(request, "/")
 
 
@@ -1274,7 +1503,7 @@ async def add_alarm_panel(
     limited = await _enforce_action_rate_limit(request, user, "alarm_action")
     if limited:
         return limited
-    if not _HA_ENTITY_ID_RE.match(entity_id):
+    if not _ALARM_ENTITY_ID_RE.fullmatch(entity_id):
         return _redirect(request, "/settings?error=Invalid+entity+ID+format")
     db = request.app.state.db
     await db.add_alarm_panel(entity_id, name)
@@ -1347,11 +1576,15 @@ async def create_group(request: Request, user: str = Depends(require_csrf)):
     name = form.get("name", "")
     schedule_start = form.get("schedule_start") or None
     schedule_end = form.get("schedule_end") or None
-    # Reject malformed time strings up front. Audit 2026-05-24, M2.
-    if schedule_start and not _TIME_RE.match(schedule_start):
-        return _redirect(request, f"/groups?error={quote_plus('Invalid start time format.')}")
-    if schedule_end and not _TIME_RE.match(schedule_end):
-        return _redirect(request, f"/groups?error={quote_plus('Invalid end time format.')}")
+    schedule_enabled = bool(form.get("schedule_enabled"))
+    schedule_error = _schedule_validation_error(
+        enabled=schedule_enabled,
+        days=days,
+        start=schedule_start,
+        end=schedule_end,
+    )
+    if schedule_error:
+        return _redirect(request, f"/groups?error={quote_plus(schedule_error)}")
     try:
         await db.create_group(
             name=name,
@@ -1360,7 +1593,7 @@ async def create_group(request: Request, user: str = Depends(require_csrf)):
             blocked_when_armed_away=bool(form.get("blocked_when_armed_away")),
             blocked_when_armed_home=bool(form.get("blocked_when_armed_home")),
             can_disarm=bool(form.get("can_disarm")),
-            schedule_enabled=bool(form.get("schedule_enabled")),
+            schedule_enabled=schedule_enabled,
             schedule_days=days,
             schedule_start=schedule_start,
             schedule_end=schedule_end,
@@ -1436,10 +1669,18 @@ async def update_group(group_id: int, request: Request, user: str = Depends(requ
     days = _extract_schedule_days(form)
     schedule_start = form.get("schedule_start") or None
     schedule_end = form.get("schedule_end") or None
-    if schedule_start and not _TIME_RE.match(schedule_start):
-        return _redirect(request, f"/groups/{group_id}?error={quote_plus('Invalid start time format.')}")
-    if schedule_end and not _TIME_RE.match(schedule_end):
-        return _redirect(request, f"/groups/{group_id}?error={quote_plus('Invalid end time format.')}")
+    schedule_enabled = bool(form.get("schedule_enabled"))
+    schedule_error = _schedule_validation_error(
+        enabled=schedule_enabled,
+        days=days,
+        start=schedule_start,
+        end=schedule_end,
+    )
+    if schedule_error:
+        return _redirect(
+            request,
+            f"/groups/{group_id}?error={quote_plus(schedule_error)}",
+        )
     try:
         await db.update_group(
             group_id,
@@ -1449,7 +1690,7 @@ async def update_group(group_id: int, request: Request, user: str = Depends(requ
             blocked_when_armed_away=bool(form.get("blocked_when_armed_away")),
             blocked_when_armed_home=bool(form.get("blocked_when_armed_home")),
             can_disarm=bool(form.get("can_disarm")),
-            schedule_enabled=bool(form.get("schedule_enabled")),
+            schedule_enabled=schedule_enabled,
             schedule_days=days,
             schedule_start=schedule_start,
             schedule_end=schedule_end,
@@ -1518,10 +1759,11 @@ async def visitors_list(request: Request, user: str = Depends(require_login)):
                 logger.exception("Failed to fetch Access locations for visitors")
 
     error = request.query_params.get("error")
+    site_tz = _site_timezone(request)
     return await _render("visitors.html", request, {
         "request": request, "user": user, "page": "visitors",
         "visitors": visitors, "access_locations": access_locations,
-        "error": error,
+        "error": error, "site_timezone": _timezone_label(site_tz),
     })
 
 
@@ -1539,13 +1781,36 @@ async def add_visitor(
     pin_code: str = Form(default=""),
     notes: str = Form(default=""),
 ):
+    data_lock = getattr(request.app.state, "access_data_lock", None)
+    if data_lock is None:
+        return await _add_visitor_impl(
+            request, user, first_name, last_name, location_id,
+            start_date, start_time, end_date, end_time, pin_code, notes,
+        )
+    async with data_lock:
+        return await _add_visitor_impl(
+            request, user, first_name, last_name, location_id,
+            start_date, start_time, end_date, end_time, pin_code, notes,
+        )
+
+
+async def _add_visitor_impl(
+    request: Request,
+    user: str,
+    first_name: str,
+    last_name: str,
+    location_id: str,
+    start_date: str,
+    start_time: str,
+    end_date: str,
+    end_time: str,
+    pin_code: str,
+    notes: str,
+):
     """Create a visitor in UniFi and store locally."""
     limited = await _enforce_action_rate_limit(request, user, "visitor_action")
     if limited:
         return limited
-    from datetime import datetime as dt
-    from zoneinfo import ZoneInfo
-
     # Validate PIN if provided
     if pin_code and not re.match(r'^[0-9]{4,8}$', pin_code):
         return _redirect(request, "/visitors?error=Invalid+PIN+format")
@@ -1556,14 +1821,16 @@ async def add_visitor(
     if not access:
         return _redirect(request, "/visitors?error=Access+client+not+available")
 
-    local_tz = ZoneInfo("America/New_York")
-    # Defensive parse — malformed date/time input must not crash the
-    # route with an uncaught ValueError. Audit 2026-05-24, M1.
+    local_tz = _site_timezone(request)
+    # Parse in the same HA-configured zone used by group/rule schedules.
+    # Strict round-trip validation rejects DST gaps and ambiguous folds.
     try:
-        start_dt = dt.strptime(f"{start_date} {start_time}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
-        end_dt = dt.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
-    except ValueError:
-        return _redirect(request, "/visitors?error=Invalid+date+or+time+format")
+        start_dt = _parse_site_datetime(start_date, start_time, local_tz)
+        end_dt = _parse_site_datetime(end_date, end_time, local_tz)
+    except ValueError as exc:
+        return _redirect(
+            request, f"/visitors?error={quote_plus(str(exc))}"
+        )
 
     # Validate time window
     if end_dt <= start_dt:
@@ -1630,25 +1897,66 @@ async def extend_visitor(
     limited = await _enforce_action_rate_limit(request, user, "visitor_action")
     if limited:
         return limited
-    from datetime import datetime as dt
-    from zoneinfo import ZoneInfo
+    data_lock = getattr(request.app.state, "access_data_lock", None)
+    if data_lock is None:
+        async with _visitor_operation_lock(request, visitor_id):
+            return await _extend_visitor_impl(
+                visitor_id, request, user, end_date, end_time
+            )
+    async with data_lock:
+        async with _visitor_operation_lock(request, visitor_id):
+            return await _extend_visitor_impl(
+                visitor_id, request, user, end_date, end_time
+            )
 
+
+async def _extend_visitor_impl(
+    visitor_id: int,
+    request: Request,
+    user: str,
+    end_date: str,
+    end_time: str,
+):
     db = request.app.state.db
     access = request.app.state.access_client
     visitor = await db.get_visitor(visitor_id)
     if not visitor:
         return _redirect(request, "/visitors")
+    if int(visitor.get("status") or 0) != 1:
+        return _redirect(
+            request,
+            "/visitors?error=Only+active+visitors+can+be+extended",
+        )
     if not access:
         return _redirect(request, "/visitors?error=Access+client+not+available")
 
-    local_tz = ZoneInfo("America/New_York")
-    # Defensive parse — same as add_visitor. Audit 2026-05-24, M1.
+    local_tz = _site_timezone(request)
     try:
-        end_dt = dt.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
-    except ValueError:
-        return _redirect(request, "/visitors?error=Invalid+date+or+time+format")
-    if end_dt <= dt.now(local_tz):
-        return _redirect(request, "/visitors")
+        end_dt = _parse_site_datetime(end_date, end_time, local_tz)
+        stored_start = datetime.fromisoformat(visitor["start_time"])
+        if stored_start.tzinfo is None:
+            stored_start = stored_start.replace(tzinfo=local_tz)
+        else:
+            stored_start = stored_start.astimezone(local_tz)
+        stored_end = datetime.fromisoformat(visitor["end_time"])
+        if stored_end.tzinfo is None:
+            stored_end = stored_end.replace(tzinfo=local_tz)
+        else:
+            stored_end = stored_end.astimezone(local_tz)
+    except (TypeError, ValueError) as exc:
+        return _redirect(
+            request, f"/visitors?error={quote_plus(str(exc))}"
+        )
+    if end_dt <= datetime.now(local_tz) or end_dt <= stored_start:
+        return _redirect(
+            request,
+            "/visitors?error=End+time+must+be+after+the+visitor+start",
+        )
+    if stored_end <= datetime.now(local_tz):
+        return _redirect(
+            request,
+            "/visitors?error=Expired+visitors+cannot+be+extended",
+        )
     end_unix = int(end_dt.timestamp())
 
     try:
@@ -1656,7 +1964,40 @@ async def extend_visitor(
     except Exception:
         logger.exception("Failed to extend visitor %s in UniFi", visitor["name"])
         return _redirect(request, "/visitors?error=Failed+to+extend+visitor+in+UniFi")
-    await db.update_visitor_end_time(visitor_id, end_dt.isoformat())
+    try:
+        updated = await db.update_active_visitor_end_time(
+            visitor_id,
+            end_dt.isoformat(),
+            expected_end_time=visitor["end_time"],
+        )
+        if not updated:
+            raise RuntimeError("visitor expired while extension was in flight")
+    except Exception:
+        # UniFi was already extended. Restore the previous end time so a
+        # concurrent local expiry (or SQLite failure) cannot leave active
+        # access invisible in the dashboard.
+        logger.exception(
+            "Local visitor extension failed; restoring UniFi end time for %s",
+            visitor["name"],
+        )
+        try:
+            old_end = datetime.fromisoformat(visitor["end_time"])
+            if old_end.tzinfo is None:
+                old_end = old_end.replace(tzinfo=local_tz)
+            await access.update_visitor(
+                visitor["unvr_visitor_id"], end_time=int(old_end.timestamp())
+            )
+        except Exception:
+            logger.critical(
+                "Failed to compensate UniFi visitor extension for %s; "
+                "reconcile this visitor manually",
+                visitor["name"],
+                exc_info=True,
+            )
+        return _redirect(
+            request,
+            "/visitors?error=Visitor+changed+while+being+extended;+please+refresh",
+        )
     await db.log_admin_action(user, "visitor_extend", visitor["name"], f"new end={end_dt.isoformat()}")
     return _redirect(request, "/visitors")
 
@@ -1671,6 +2012,18 @@ async def delete_visitor_route(
     limited = await _enforce_action_rate_limit(request, user, "visitor_action")
     if limited:
         return limited
+    data_lock = getattr(request.app.state, "access_data_lock", None)
+    if data_lock is None:
+        async with _visitor_operation_lock(request, visitor_id):
+            return await _delete_visitor_impl(visitor_id, request, user)
+    async with data_lock:
+        async with _visitor_operation_lock(request, visitor_id):
+            return await _delete_visitor_impl(visitor_id, request, user)
+
+
+async def _delete_visitor_impl(
+    visitor_id: int, request: Request, user: str
+):
     db = request.app.state.db
     access = request.app.state.access_client
     visitor = await db.get_visitor(visitor_id)
@@ -1710,6 +2063,17 @@ async def set_user_pin(
     if not re.match(r'^[0-9]{4,8}$', pin_code):
         return _redirect(request, f"/users/{user_id}")
 
+    data_lock = getattr(request.app.state, "access_data_lock", None)
+    if data_lock is None:
+        return await _set_user_pin_impl(user_id, request, user, pin_code)
+    async with data_lock:
+        return await _set_user_pin_impl(user_id, request, user, pin_code)
+
+
+async def _set_user_pin_impl(
+    user_id: int, request: Request, user: str, pin_code: str
+):
+
     db = request.app.state.db
     access = request.app.state.access_client
     enc_key = getattr(request.app.state, "enc_key", None)
@@ -1748,6 +2112,10 @@ async def _load_settings_context(request: Request, db, enc_key) -> dict:
     ha_url = await db.get_config("ha_url") or ""
 
     access_host = await db.get_config("access_host") or ""
+    access_api_token_configured = bool(
+        os.environ.get("ACCESS_CONTROL_ACCESS_API_TOKEN")
+        or await db.get_config("access_api_token")
+    )
     access_username = ""
     if enc_key and access_host:
         raw = await db.get_config("access_username")
@@ -1799,6 +2167,7 @@ async def _load_settings_context(request: Request, db, enc_key) -> dict:
         "unvr_username": unvr_username,
         "access_host": access_host,
         "access_username": access_username,
+        "access_api_token_configured": access_api_token_configured,
         "ha_url": ha_url,
         "alarm_panels": alarm_panels,
         "ha_alarms": ha_alarms,
@@ -1806,6 +2175,13 @@ async def _load_settings_context(request: Request, db, enc_key) -> dict:
         "reboot_enabled": reboot_enabled,
         "reboot_day": reboot_day,
         "reboot_hour": reboot_hour,
+        "restart_available": bool(
+            os.environ.get("SUPERVISOR_TOKEN")
+            or os.environ.get("RESTART_COMMAND")
+        ),
+        "restart_error": getattr(
+            request.app.state, "restart_request_error", None
+        ),
     }
 
 
@@ -1841,68 +2217,200 @@ async def update_unvr(
     user: str = Depends(require_csrf),
 ):
     """Update UNVR connection credentials. Tests before saving."""
+    lock = getattr(request.app.state, "settings_update_lock", None)
+    if lock is None:
+        return await _update_unvr_impl(
+            request, unvr_host, unvr_username, unvr_password, user
+        )
+    async with lock:
+        protect_lock = getattr(request.app.state, "protect_start_lock", None)
+        access_lock = getattr(request.app.state, "access_start_lock", None)
+        data_lock = getattr(request.app.state, "access_data_lock", None)
+        if (
+            protect_lock is not None
+            and access_lock is not None
+            and data_lock is not None
+        ):
+            async with protect_lock, access_lock, data_lock:
+                return await _update_unvr_impl(
+                    request, unvr_host, unvr_username, unvr_password, user
+                )
+        return await _update_unvr_impl(
+            request, unvr_host, unvr_username, unvr_password, user
+        )
+
+
+async def _update_unvr_impl(
+    request: Request,
+    unvr_host: str,
+    unvr_username: str,
+    unvr_password: str,
+    user: str,
+):
     limited = await _enforce_action_rate_limit(request, user, "settings_admin")
     if limited:
         return limited
     db = request.app.state.db
     enc_key = getattr(request.app.state, "enc_key", None)
 
-    # Test the new credentials
-    test_client = AccessClient(unvr_host, unvr_username, unvr_password)
+    # Build replacement clients before touching persisted or live state. The
+    # primary console always supplies Protect; it supplies Access only when no
+    # separate Access console is configured.
+    separate_access = all(
+        (
+            await db.get_config("access_host"),
+            await db.get_config("access_username"),
+            await db.get_config("access_password"),
+        )
+    )
+    candidate_protect = ProtectClient(unvr_host, unvr_username, unvr_password)
+    candidate_access = None
+    expected_identity = await db.get_config("access_console_identity")
     try:
-        await test_client.login()
-    except AccessClientError as exc:
-        # Sanitize the user-facing message; the AccessClient already
-        # logs the raw upstream response body at warning level.
-        # Audit 2026-05-24, H1.
+        await candidate_protect.login()
+        if not separate_access:
+            candidate_access = AccessClient(
+                unvr_host,
+                unvr_username,
+                unvr_password,
+                expected_identity=expected_identity,
+                api_token=getattr(
+                    request.app.state, "access_api_token", None
+                ),
+            )
+            await candidate_access.login()
+            if getattr(candidate_access, "open_api_configured", False):
+                await candidate_access.validate_open_api()
+    except Exception as exc:
         logger.warning("UNVR connection test failed during settings update: %s", exc)
-        return await _settings_with_result(request, user, db, enc_key, "UNVR connection failed. Check host and credentials.")
-    finally:
-        await test_client.close()
+        await candidate_protect.close()
+        if candidate_access is not None:
+            await candidate_access.close()
+        return await _settings_with_result(
+            request,
+            user,
+            db,
+            enc_key,
+            "UNVR connection failed. Check host, Protect service, and credentials.",
+        )
 
-    # Save encrypted credentials
-    await db.set_config("unvr_host", unvr_host)
-    await db.set_config("unvr_username", encrypt_value(unvr_username, enc_key))
-    await db.set_config("unvr_password", encrypt_value(unvr_password, enc_key))
+    if candidate_access is not None:
+        observed_identity = await _get_access_identity(candidate_access)
+        if (
+            expected_identity
+            and expected_identity != observed_identity
+        ):
+            await candidate_protect.close()
+            await candidate_access.close()
+            return await _settings_with_result(
+                request,
+                user,
+                db,
+                enc_key,
+                "The Access site identity changed. In-place "
+                "site replacement is blocked to protect existing grants.",
+            )
+        current_access_creds = getattr(
+            request.app.state, "access_creds", None
+        )
+        if (
+            current_access_creds
+            and not _same_console_endpoint(
+                current_access_creds[0], unvr_host
+            )
+            and (
+                not expected_identity
+                or not observed_identity
+                or expected_identity != observed_identity
+            )
+        ):
+            await candidate_protect.close()
+            await candidate_access.close()
+            return await _settings_with_result(
+                request,
+                user,
+                db,
+                enc_key,
+                "A host change requires the same verified Access site "
+                "identity. Reinitialize for a different site.",
+            )
 
-    # Reconnect the live client + WebSocket + auth engine reference
-    old_client = request.app.state.access_client
-    if old_client:
-        await old_client.close()
-    new_client = AccessClient(unvr_host, unvr_username, unvr_password)
-    await new_client.login()
-    request.app.state.access_client = new_client
-    if request.app.state.auth_engine:
-        request.app.state.auth_engine._access_client = new_client
+    try:
+        unvr_values = {
+                "unvr_host": unvr_host,
+                "unvr_username": encrypt_value(unvr_username, enc_key),
+                "unvr_password": encrypt_value(unvr_password, enc_key),
+        }
+        if candidate_access is not None and observed_identity:
+            unvr_values["access_console_identity"] = observed_identity
+        await db.set_configs(unvr_values)
+    except Exception:
+        await candidate_protect.close()
+        if candidate_access is not None:
+            await candidate_access.close()
+        raise
 
-    # Keep stashed UNVR creds in sync so the Protect cold-start supervisor
-    # and any future use_creds() helpers see the new password if the live
-    # client drops and needs re-creation.
-    request.app.state.unvr_creds = (unvr_host, unvr_username, unvr_password)
-
-    # Re-register WS callback and start WebSocket on new client
-    on_access_event = getattr(request.app.state, "on_access_event", None)
-    if on_access_event:
-        new_client.register_callback(on_access_event)
-    await new_client.start_websocket()
-    logger.info("Access WebSocket re-started after credential update")
-
-    # Reconnect the Protect client with the same new UNVR credentials.
-    # If Protect was not running before (cold-start failure), the supervisor
-    # will pick it up on its next tick now that unvr_creds is updated.
     old_protect = request.app.state.protect_client
-    if old_protect:
-        await old_protect.close()
-    request.app.state.protect_client = None
-    starter = getattr(request.app.state, "start_protect_client", None)
-    if starter is not None:
-        try:
-            await starter()
-        except Exception:
-            logger.exception("Failed to restart Protect client after credential update")
+    old_access = (
+        request.app.state.access_client
+        if candidate_access is not None
+        else None
+    )
+    # Critical post-event safety work may itself need the physical barrier.
+    # Stop intake and drain it before acquiring publication ownership.
+    await _quiesce_event_sources(request, old_protect, old_access)
 
-    # Refresh users / native locks / camera_to_location against the new
-    # console — otherwise stale until the 15-min topology resync ticks.
+    async with _physical_barrier(request):
+
+        if candidate_access is not None:
+            # Both new WebSockets must remain fail-closed until the matching
+            # Access snapshot commits. Set this before starting Protect: a
+            # fast credential event from that source otherwise sees the old
+            # camera map while publication is still in progress.
+            request.app.state.event_topology_ready = False
+
+        request.app.state.protect_client = candidate_protect
+        request.app.state.unvr_creds = (
+            unvr_host,
+            unvr_username,
+            unvr_password,
+        )
+        on_protect_event = getattr(request.app.state, "on_protect_event", None)
+        if on_protect_event:
+            candidate_protect.register_callback(on_protect_event)
+        await candidate_protect.start_websocket()
+
+        # In split-console mode the Access client and credentials are
+        # deliberately untouched. Unified mode publishes before WS intake.
+        if candidate_access is not None:
+            request.app.state.access_generation = (
+                getattr(request.app.state, "access_generation", 0) + 1
+            )
+            request.app.state.access_client = candidate_access
+            request.app.state.access_started_client = candidate_access
+            request.app.state.access_creds = (
+                unvr_host,
+                unvr_username,
+                unvr_password,
+            )
+            request.app.state.access_open_api_ready = bool(
+                getattr(request.app.state, "access_api_token", None)
+            )
+            request.app.state.access_open_api_error = None
+            request.app.state.access_console_identity = observed_identity
+            if request.app.state.auth_engine:
+                request.app.state.auth_engine._access_client = candidate_access
+            on_access_event = getattr(request.app.state, "on_access_event", None)
+            if on_access_event:
+                candidate_access.register_callback(on_access_event)
+            await candidate_access.start_websocket()
+
+        if old_protect and old_protect is not candidate_protect:
+            await old_protect.close()
+        if old_access and old_access is not candidate_access:
+            await old_access.close()
+
+    # Refresh topology against whichever Access console is active.
     sync = getattr(request.app.state, "sync_users", None)
     if sync is not None:
         try:
@@ -1922,39 +2430,73 @@ async def update_ha(
     user: str = Depends(require_csrf),
 ):
     """Update Home Assistant connection credentials. Tests before saving."""
+    lock = getattr(request.app.state, "settings_update_lock", None)
+    if lock is None:
+        return await _update_ha_impl(request, ha_url, ha_token, user)
+    async with lock:
+        return await _update_ha_impl(request, ha_url, ha_token, user)
+
+
+async def _update_ha_impl(
+    request: Request, ha_url: str, ha_token: str, user: str
+):
     limited = await _enforce_action_rate_limit(request, user, "settings_admin")
     if limited:
         return limited
     db = request.app.state.db
     enc_key = getattr(request.app.state, "enc_key", None)
 
-    # Test the new credentials
+    if _supervisor_proxy_active():
+        logger.warning(
+            "Rejected HA credential update while Supervisor proxy is active"
+        )
+        return await _settings_with_result(
+            request,
+            user,
+            db,
+            enc_key,
+            "Home Assistant credentials are managed by Supervisor in this mode.",
+        )
+
+    # Test once, then promote this exact connected client. The former path
+    # closed the tested client, disconnected the known-good live client, and
+    # performed a second unguarded connection that could fail mid-swap.
     test_client = HAClient(ha_url, ha_token)
+    new_timezone = None
     try:
         ok = await test_client.test_connection()
         if not ok:
+            await test_client.close()
             return await _settings_with_result(request, user, db, enc_key, "HA connection failed. Check URL and token.")
+        new_timezone = await test_client.get_timezone()
     except Exception as exc:
         # Sanitize: don't surface raw aiohttp / SSL / token-validation
         # exception strings to the dashboard. Audit 2026-05-24, H1.
         logger.warning("HA connection test failed during settings update: %s", exc)
-        return await _settings_with_result(request, user, db, enc_key, "HA connection failed. Check URL and token.")
-    finally:
         await test_client.close()
+        return await _settings_with_result(request, user, db, enc_key, "HA connection failed. Check URL and token.")
 
-    # Save encrypted credentials
-    await db.set_config("ha_url", ha_url)
-    await db.set_config("ha_token", encrypt_value(ha_token, enc_key))
+    try:
+        await db.set_configs(
+            {
+                "ha_url": ha_url,
+                "ha_token": encrypt_value(ha_token, enc_key),
+            }
+        )
+    except Exception:
+        await test_client.close()
+        raise
 
-    # Reconnect the live client + auth engine reference
-    old_client = request.app.state.ha_client
-    if old_client:
-        await old_client.close()
-    new_client = HAClient(ha_url, ha_token)
-    await new_client.test_connection()
-    request.app.state.ha_client = new_client
-    if request.app.state.auth_engine:
-        request.app.state.auth_engine._ha_client = new_client
+    # Atomically publish the already-tested client before retiring the old one.
+    async with _physical_barrier(request):
+        old_client = request.app.state.ha_client
+        request.app.state.ha_client = test_client
+        if request.app.state.auth_engine:
+            request.app.state.auth_engine._ha_client = test_client
+            if new_timezone:
+                request.app.state.auth_engine.set_timezone(new_timezone)
+        if old_client and old_client is not test_client:
+            await old_client.close()
 
     # Re-seed lock_states and re-attempt pending relocks against the new
     # client. The HA recovery loop won't fire on this swap (no
@@ -1986,6 +2528,47 @@ async def update_access_console(
     clear: str = Form(default=""),
 ):
     """Save separate Access console credentials (or clear to use primary)."""
+    lock = getattr(request.app.state, "settings_update_lock", None)
+    if lock is None:
+        return await _update_access_console_impl(
+            request,
+            user,
+            access_host,
+            access_username,
+            access_password,
+            clear,
+        )
+    async with lock:
+        start_lock = getattr(request.app.state, "access_start_lock", None)
+        data_lock = getattr(request.app.state, "access_data_lock", None)
+        if start_lock is not None and data_lock is not None:
+            async with start_lock, data_lock:
+                return await _update_access_console_impl(
+                    request,
+                    user,
+                    access_host,
+                    access_username,
+                    access_password,
+                    clear,
+                )
+        return await _update_access_console_impl(
+            request,
+            user,
+            access_host,
+            access_username,
+            access_password,
+            clear,
+        )
+
+
+async def _update_access_console_impl(
+    request: Request,
+    user: str,
+    access_host: str,
+    access_username: str,
+    access_password: str,
+    clear: str,
+):
     limited = await _enforce_action_rate_limit(request, user, "settings_admin")
     if limited:
         return limited
@@ -1993,43 +2576,308 @@ async def update_access_console(
     enc_key = getattr(request.app.state, "enc_key", None)
 
     if clear:
-        await db.set_config("access_host", "")
-        await db.set_config("access_username", "")
-        await db.set_config("access_password", "")
-        await db.log_admin_action(user, "settings_access_console_clear")
-        return await _settings_with_result(
-            request, user, db, enc_key,
-            "Access console cleared — using primary console. Restart to apply.",
-            success=True,
+        primary_creds = getattr(request.app.state, "unvr_creds", None)
+        if not primary_creds:
+            return await _settings_with_result(
+                request,
+                user,
+                db,
+                enc_key,
+                "Primary-console credentials are unavailable; restart and try again.",
+            )
+        target_host, target_username, target_password = primary_creds
+        action = "settings_access_console_clear"
+        success_message = "Access console cleared — now using primary console."
+    else:
+        if not access_host or not access_username or not access_password:
+            return await _settings_with_result(
+                request,
+                user,
+                db,
+                enc_key,
+                "All fields required for separate Access console.",
+            )
+        target_host, target_username, target_password = (
+            access_host,
+            access_username,
+            access_password,
         )
+        action = "settings_access_console_update"
+        success_message = f"Access console configured at {access_host}."
 
-    if not access_host or not access_username or not access_password:
-        return await _settings_with_result(
-            request, user, db, enc_key,
-            "All fields required for separate Access console.",
-        )
-
-    # Test the connection
-    test_client = AccessClient(host=access_host, username=access_username, password=access_password)
+    # Authenticate a candidate without attaching production event callbacks.
+    test_client = AccessClient(
+        host=target_host,
+        username=target_username,
+        password=target_password,
+        expected_identity=await db.get_config("access_console_identity"),
+        api_token=getattr(request.app.state, "access_api_token", None),
+    )
     try:
         await test_client.login()
+        if getattr(test_client, "open_api_configured", False):
+            await test_client.validate_open_api()
     except Exception as exc:
         # Sanitize: don't surface raw upstream errors. Audit 2026-05-24, H1.
         logger.warning("Access console connection test failed during settings update: %s", exc)
+        await test_client.close()
         return await _settings_with_result(
             request, user, db, enc_key,
             "Access console connection failed. Check host and credentials.",
         )
-    finally:
-        await test_client.close()
 
-    await db.set_config("access_host", access_host)
-    await db.set_config("access_username", encrypt_value(access_username, enc_key))
-    await db.set_config("access_password", encrypt_value(access_password, enc_key))
-    await db.log_admin_action(user, "settings_access_console_update", access_host)
+    expected_identity = await db.get_config("access_console_identity")
+    observed_identity = await _get_access_identity(test_client)
+    if (
+        expected_identity
+        and expected_identity != observed_identity
+    ):
+        await test_client.close()
+        return await _settings_with_result(
+            request,
+            user,
+            db,
+            enc_key,
+            "The Access site identity changed. In-place site "
+            "replacement is blocked to protect existing grants.",
+        )
+    current_access_creds = getattr(request.app.state, "access_creds", None)
+    if (
+        current_access_creds
+        and not _same_console_endpoint(
+            current_access_creds[0], target_host
+        )
+        and (
+            not expected_identity
+            or not observed_identity
+            or expected_identity != observed_identity
+        )
+    ):
+        await test_client.close()
+        return await _settings_with_result(
+            request,
+            user,
+            db,
+            enc_key,
+            "A host change requires the same verified Access site identity. "
+            "Reinitialize for a different site.",
+        )
+
+    try:
+        if clear:
+            access_values = {
+                "access_host": "",
+                "access_username": "",
+                "access_password": "",
+            }
+        else:
+            access_values = {
+                "access_host": access_host,
+                "access_username": encrypt_value(access_username, enc_key),
+                "access_password": encrypt_value(access_password, enc_key),
+            }
+        if observed_identity:
+            access_values["access_console_identity"] = observed_identity
+        await db.set_configs(access_values)
+    except Exception:
+        await test_client.close()
+        raise
+
+    old_client = request.app.state.access_client
+    await _quiesce_event_sources(request, old_client)
+    async with _physical_barrier(request):
+        request.app.state.event_topology_ready = False
+        request.app.state.access_generation = (
+            getattr(request.app.state, "access_generation", 0) + 1
+        )
+        request.app.state.access_client = test_client
+        request.app.state.access_started_client = test_client
+        request.app.state.access_creds = (
+            target_host,
+            target_username,
+            target_password,
+        )
+        request.app.state.access_open_api_ready = bool(
+            getattr(request.app.state, "access_api_token", None)
+        )
+        request.app.state.access_open_api_error = None
+        request.app.state.access_console_identity = observed_identity
+        if request.app.state.auth_engine:
+            request.app.state.auth_engine._access_client = test_client
+        on_access_event = getattr(request.app.state, "on_access_event", None)
+        if on_access_event:
+            test_client.register_callback(on_access_event)
+        await test_client.start_websocket()
+        if old_client and old_client is not test_client:
+            await old_client.close()
+
+    sync = getattr(request.app.state, "sync_users", None)
+    if sync is not None:
+        try:
+            await sync()
+        except Exception:
+            logger.exception("Topology refresh after Access console update failed")
+
+    await db.log_admin_action(user, action, target_host)
     return await _settings_with_result(
         request, user, db, enc_key,
-        f"Access console configured at {access_host}. Restart to apply.",
+        success_message,
+        success=True,
+    )
+
+
+@router.post("/settings/access-api-token", response_class=HTMLResponse)
+async def update_access_api_token(
+    request: Request,
+    user: str = Depends(require_csrf),
+    access_api_token: str = Form(default=""),
+    clear: str = Form(default=""),
+):
+    """Validate, persist, and hot-swap the official Access API token."""
+    settings_lock = getattr(request.app.state, "settings_update_lock", None)
+    if settings_lock is None:
+        return await _update_access_api_token_impl(
+            request, user, access_api_token, clear
+        )
+    async with settings_lock:
+        start_lock = getattr(request.app.state, "access_start_lock", None)
+        data_lock = getattr(request.app.state, "access_data_lock", None)
+        if start_lock is not None and data_lock is not None:
+            async with start_lock, data_lock:
+                return await _update_access_api_token_impl(
+                    request, user, access_api_token, clear
+                )
+        return await _update_access_api_token_impl(
+            request, user, access_api_token, clear
+        )
+
+
+async def _update_access_api_token_impl(
+    request: Request,
+    user: str,
+    access_api_token: str,
+    clear: str,
+):
+    limited = await _enforce_action_rate_limit(
+        request, user, "settings_admin"
+    )
+    if limited:
+        return limited
+
+    db = request.app.state.db
+    enc_key = getattr(request.app.state, "enc_key", None)
+    if os.environ.get("ACCESS_CONTROL_ACCESS_API_TOKEN"):
+        return await _settings_with_result(
+            request,
+            user,
+            db,
+            enc_key,
+            "The Access API token is controlled by "
+            "ACCESS_CONTROL_ACCESS_API_TOKEN; update or remove that environment "
+            "override and restart the service.",
+        )
+
+    token = None if clear else access_api_token.strip()
+    if not clear and not token:
+        return await _settings_with_result(
+            request,
+            user,
+            db,
+            enc_key,
+            "Enter an Access API token or choose Clear Token.",
+        )
+
+    creds = getattr(request.app.state, "access_creds", None)
+    if not creds:
+        return await _settings_with_result(
+            request,
+            user,
+            db,
+            enc_key,
+            "Access console credentials are unavailable; restart and try again.",
+        )
+
+    candidate = AccessClient(
+        *creds,
+        expected_identity=await db.get_config("access_console_identity"),
+        api_token=token,
+    )
+    try:
+        await candidate.login()
+        observed_identity = await _get_access_identity(candidate)
+        expected_identity = await db.get_config("access_console_identity")
+        if expected_identity and observed_identity != expected_identity:
+            raise AccessClientError(
+                "Access site identity changed during token validation"
+            )
+        if token:
+            await candidate.validate_open_api()
+    except Exception as exc:
+        logger.warning(
+            "Access API token validation failed: %s", type(exc).__name__
+        )
+        await candidate.close()
+        return await _settings_with_result(
+            request,
+            user,
+            db,
+            enc_key,
+            "Access API token validation failed. Verify port 12445 is reachable "
+            "and the token has view:space permission.",
+        )
+
+    try:
+        await db.set_config(
+            "access_api_token",
+            encrypt_value(token, enc_key) if token else "",
+        )
+    except Exception:
+        await candidate.close()
+        raise
+
+    old_client = request.app.state.access_client
+    await _quiesce_event_sources(request, old_client)
+    async with _physical_barrier(request):
+        request.app.state.event_topology_ready = False
+        request.app.state.access_generation = (
+            getattr(request.app.state, "access_generation", 0) + 1
+        )
+        request.app.state.access_client = candidate
+        request.app.state.access_started_client = candidate
+        request.app.state.access_api_token = token
+        request.app.state.access_open_api_ready = bool(token)
+        request.app.state.access_open_api_error = None
+        request.app.state.access_console_identity = observed_identity
+        if request.app.state.auth_engine:
+            request.app.state.auth_engine._access_client = candidate
+        on_access_event = getattr(request.app.state, "on_access_event", None)
+        if on_access_event:
+            candidate.register_callback(on_access_event)
+        await candidate.start_websocket()
+        if old_client and old_client is not candidate:
+            await old_client.close()
+
+    sync = getattr(request.app.state, "sync_users", None)
+    if sync is not None:
+        try:
+            await sync()
+        except Exception:
+            logger.exception("Topology refresh after Access API token update failed")
+
+    await db.log_admin_action(
+        user,
+        "settings_access_api_token_clear"
+        if clear
+        else "settings_access_api_token_update",
+    )
+    return await _settings_with_result(
+        request,
+        user,
+        db,
+        enc_key,
+        "Access API token cleared; compatibility mode is active."
+        if clear
+        else "Access API token validated and activated.",
         success=True,
     )
 
@@ -2065,6 +2913,24 @@ async def create_api_key(
         return limited
     db = request.app.state.db
     enc_key = getattr(request.app.state, "enc_key", None)
+    name = name.strip()
+    if not name or len(name) > 100:
+        return await _settings_with_result(
+            request,
+            user,
+            db,
+            enc_key,
+            "API key name must be between 1 and 100 characters.",
+        )
+    if scope not in _API_KEY_SCOPES:
+        logger.warning("Rejected unsupported API key scope %r", scope)
+        return await _settings_with_result(
+            request,
+            user,
+            db,
+            enc_key,
+            "Invalid API key scope.",
+        )
     raw_key = generate_api_key()
     await db.add_api_key(name, hash_api_key(raw_key), scope=scope)
     await db.log_admin_action(user, "api_key_create", name)
@@ -2131,6 +2997,16 @@ async def add_user_route(
     limited = await _enforce_action_rate_limit(request, user, "user_admin")
     if limited:
         return limited
+    data_lock = getattr(request.app.state, "access_data_lock", None)
+    if data_lock is None:
+        return await _add_user_impl(request, user, first_name, last_name)
+    async with data_lock:
+        return await _add_user_impl(request, user, first_name, last_name)
+
+
+async def _add_user_impl(
+    request: Request, user: str, first_name: str, last_name: str
+):
     db = request.app.state.db
     access = request.app.state.access_client
 
@@ -2156,26 +3032,37 @@ async def add_user_route(
 
 @router.post("/settings/restart")
 async def restart_service(request: Request, user: str = Depends(require_csrf)):
-    """Restart the access-control systemd service."""
+    """Request a Supervisor (or explicitly configured host) restart."""
     limited = await _enforce_action_rate_limit(request, user, "service_action")
     if limited:
         return limited
     logger.info("Service restart requested by %s", user)
+    request.app.state.restart_request_error = None
     db = request.app.state.db
     await db.log_admin_action(user, "service_restart")
-    restart_cmd = os.environ.get("RESTART_COMMAND", "systemctl restart access-control")
+    if not os.environ.get("SUPERVISOR_TOKEN") and not os.environ.get(
+        "RESTART_COMMAND"
+    ):
+        raise HTTPException(status_code=503, detail="Service restart is unavailable")
 
     async def _do_restart():
-        await asyncio.sleep(1.5)
-        parts = shlex.split(restart_cmd)
-        proc = await asyncio.create_subprocess_exec(
-            *parts,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.wait()
+        try:
+            await request_service_restart(delay=1.5)
+        except Exception:
+            logger.exception("Service restart request failed")
+            request.app.state.restart_request_error = (
+                "The restart request failed. Check the application log and "
+                "restart the service from its host/Supervisor UI."
+            )
 
-    asyncio.create_task(_do_restart(), name="service-restart")
+    task = asyncio.create_task(_do_restart(), name="service-restart")
+    tracker = getattr(request.app.state, "track_background_task", None)
+    if callable(tracker):
+        tracker(task)
+    else:
+        task.add_done_callback(
+            lambda done: done.exception() if not done.cancelled() else None
+        )
     return _redirect(request, "/settings?restarting=1")
 
 
@@ -2194,12 +3081,22 @@ async def update_reboot_schedule(
     db = request.app.state.db
 
     enabled = "1" if reboot_enabled in ("1", "on", "true", "yes") else "0"
+    if enabled == "1" and not (
+        os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("RESTART_COMMAND")
+    ):
+        raise HTTPException(
+            status_code=503, detail="Scheduled restart is unavailable"
+        )
     day = reboot_day if reboot_day in ("daily", "0", "1", "2", "3", "4", "5", "6") else "daily"
     hour = max(0, min(23, int(reboot_hour)))
 
-    await db.set_config("reboot_enabled", enabled)
-    await db.set_config("reboot_day", day)
-    await db.set_config("reboot_hour", str(hour))
+    await db.set_configs(
+        {
+            "reboot_enabled": enabled,
+            "reboot_day": day,
+            "reboot_hour": str(hour),
+        }
+    )
     await db.log_admin_action(
         user, "reboot_schedule_update",
         target=f"enabled={enabled} day={day} hour={hour}",

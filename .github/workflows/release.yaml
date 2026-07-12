@@ -1,28 +1,27 @@
 name: Release
 
-# Runs after a push to main. If the version in access_control/config.yaml
-# changed AND there's no existing tag for that version, this workflow
-# creates a git tag and a GitHub Release. Release notes are extracted
-# from access_control/CHANGELOG.md by scraping the section header that
-# matches the version. The CI workflow's `Build & publish app` job
-# already publishes container images to ghcr.io on every push to main,
-# so this workflow only handles the GitHub-side tag/release artefact.
-
+# Automatic releases run only after the CI workflow has completed
+# successfully for a push to main. Manual runs are repair/retry paths and
+# independently verify that the exact target commit already passed push CI.
 on:
-  push:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
     branches:
       - main
-    paths:
-      # Only trigger on version bump. CHANGELOG-only edits don't need a
-      # workflow run — the awk extraction reads from disk at job time, so
-      # the latest CHANGELOG.md is always picked up alongside an actual
-      # version change. Adding CHANGELOG.md here would cause noisy "no
-      # section found" runs on retroactive note edits.
-      - access_control/config.yaml
   workflow_dispatch:
+    inputs:
+      head_sha:
+        description: "Exact 40-character main-branch commit to release (defaults to selected ref)"
+        required: false
+        type: string
 
 permissions:
+  actions: read
   contents: write
+  packages: read
 
 concurrency:
   group: release
@@ -30,108 +29,238 @@ concurrency:
 
 jobs:
   tag-and-release:
-    name: Tag + release if version bumped
+    name: Tag and publish verified release
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve exact target commit
+        id: target
+        env:
+          DEFAULT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_HEAD_SHA: ${{ inputs.head_sha }}
+          WORKFLOW_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "workflow_run" ]; then
+            TARGET_SHA="${WORKFLOW_HEAD_SHA}"
+          else
+            TARGET_SHA="${INPUT_HEAD_SHA:-${DEFAULT_SHA}}"
+          fi
+
+          if [[ ! "${TARGET_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::head_sha must be an exact 40-character commit SHA (got '${TARGET_SHA}')"
+            exit 1
+          fi
+          TARGET_SHA=$(tr 'A-F' 'a-f' <<< "${TARGET_SHA}")
+
+          echo "sha=${TARGET_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify manual target passed push CI
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          RUNS=$(gh api --method GET \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yaml/runs" \
+            -f head_sha="${TARGET_SHA}" \
+            -f status=completed \
+            -f per_page=100)
+          if ! jq -e --arg sha "${TARGET_SHA}" '
+            [.workflow_runs[] |
+              select(
+                .head_sha == $sha and
+                .head_branch == "main" and
+                .event == "push" and
+                .conclusion == "success"
+              )
+            ] | length > 0
+          ' <<< "${RUNS}" >/dev/null; then
+            echo "::error::No successful main push CI run exists for ${TARGET_SHA}"
+            exit 1
+          fi
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
-          # We need full history so we can compare config.yaml across
-          # the parent commit and inspect existing tags.
+          ref: ${{ steps.target.outputs.sha }}
 
-      - name: Read current version
-        id: ver
-        run: |
-          set -euo pipefail
-          VERSION=$(yq '.version' access_control/config.yaml)
-          if [ -z "${VERSION}" ] || [ "${VERSION}" = "null" ]; then
-            echo "::error::Could not read version from config.yaml"
-            exit 1
-          fi
-          # Strip surrounding quotes if yq returns them (depends on style)
-          VERSION="${VERSION%\"}"
-          VERSION="${VERSION#\"}"
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "tag=v${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "Detected version: ${VERSION}"
-
-      - name: Check if tag already exists
-        id: tag-check
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.ver.outputs.tag }}"
-          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
-            echo "exists=true" >> "${GITHUB_OUTPUT}"
-            echo "Tag ${TAG} already exists locally — nothing to do."
-          elif git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "exists=true" >> "${GITHUB_OUTPUT}"
-            echo "Tag ${TAG} already exists on origin — nothing to do."
-          else
-            echo "exists=false" >> "${GITHUB_OUTPUT}"
-            echo "Tag ${TAG} does not exist — proceeding with release."
-          fi
-
-      - name: Extract release notes from CHANGELOG
-        if: steps.tag-check.outputs.exists == 'false'
-        id: notes
+      - name: Verify checkout and main ancestry
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
         run: |
           set -euo pipefail
-          # Find the "## [VERSION]" section and everything until the next
-          # "## [" header. Output goes to a file so we can pass it to the
-          # release action without shell-escaping headaches.
-          CHANGELOG=access_control/CHANGELOG.md
-          if [ ! -f "${CHANGELOG}" ]; then
-            echo "::error::${CHANGELOG} not found"
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          if [ "${ACTUAL_SHA}" != "${TARGET_SHA}" ]; then
+            echo "::error::Checkout mismatch: expected ${TARGET_SHA}, got ${ACTUAL_SHA}"
             exit 1
           fi
-          # Use awk to extract the section. Match the version header
-          # literally; stop at the next ## [ ... ] header or EOF.
-          BODY=$(awk -v v="[${VERSION}]" '
-            $0 ~ "^## " v {found=1; next}
-            found && /^## \[/ {exit}
-            found {print}
-          ' "${CHANGELOG}")
-          if [ -z "${BODY}" ]; then
-            echo "::warning::No CHANGELOG section found for version ${VERSION}. Using placeholder."
-            BODY="See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/access_control/CHANGELOG.md) for details."
+
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${TARGET_SHA}" refs/remotes/origin/main; then
+            echo "::error::Target ${TARGET_SHA} is not part of the main branch"
+            exit 1
           fi
-          # Append the published image references at the bottom for convenience
+
+      - name: Determine release action
+        id: release-state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          VERSION=$(yq -r '.version' access_control/config.yaml)
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::Invalid semantic version in access_control/config.yaml: '${VERSION}'"
+            exit 1
+          fi
+          TAG="v${VERSION}"
+
+          git fetch --force --tags origin
+          TAG_EXISTS=false
+          TAG_SHA=""
+          if git show-ref --verify --quiet "refs/tags/${TAG}"; then
+            TAG_EXISTS=true
+            TAG_SHA=$(git rev-list -n 1 "refs/tags/${TAG}")
+          fi
+
+          RELEASE_EXISTS=false
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            RELEASE_EXISTS=true
+          fi
+
+          CREATE_TAG=false
+          PUBLISH_RELEASE=false
+          if [ "${RELEASE_EXISTS}" = true ]; then
+            if [ "${TAG_EXISTS}" != true ]; then
+              echo "::error::GitHub release ${TAG} exists but its git tag is missing"
+              exit 1
+            fi
+            echo "Release ${TAG} already exists; nothing to do."
+          elif [ "${TAG_EXISTS}" = true ]; then
+            if [ "${TAG_SHA}" != "${TARGET_SHA}" ]; then
+              echo "::error::Tag ${TAG} points to ${TAG_SHA}, not target ${TARGET_SHA}. Re-run manually with head_sha=${TAG_SHA} to repair its missing release."
+              exit 1
+            fi
+            # This is the important repair case: tag creation succeeded on a
+            # prior attempt, but GitHub Release creation did not.
+            PUBLISH_RELEASE=true
+            echo "Tag ${TAG} exists at the target; its missing release will be repaired."
+          else
+            # CI is solely responsible for deciding whether a push is a
+            # version build. Before creating the git tag below, the next step
+            # proves that both versioned images carry TARGET_SHA as their OCI
+            # revision. An ordinary/snapshot CI run cannot satisfy that gate.
+            CREATE_TAG=true
+            PUBLISH_RELEASE=true
+            echo "Unreleased version ${VERSION} detected; versioned images will be verified before creating ${TAG}."
+          fi
+
           {
-            echo "${BODY}"
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "create_tag=${CREATE_TAG}"
+            echo "publish_release=${PUBLISH_RELEASE}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Verify both versioned images match the target
+        if: steps.release-state.outputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          VERSION: ${{ steps.release-state.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "${GH_TOKEN}" | docker login ghcr.io \
+            --username "${GITHUB_ACTOR}" --password-stdin >/dev/null
+
+          for spec in "amd64:amd64" "aarch64:arm64"; do
+            suffix=${spec%%:*}
+            platform_arch=${spec##*:}
+            image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/hassio-access-control-${suffix}:${VERSION}"
+            docker pull --quiet --platform "linux/${platform_arch}" "${image}" >/dev/null
+            revision=$(docker image inspect --format \
+              '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "${image}")
+            image_version=$(docker image inspect --format \
+              '{{ index .Config.Labels "org.opencontainers.image.version" }}' "${image}")
+            if [ "${revision}" != "${TARGET_SHA}" ]; then
+              echo "::error::${image} was built from ${revision:-<missing>}, not ${TARGET_SHA}"
+              exit 1
+            fi
+            if [ "${image_version}" != "${VERSION}" ]; then
+              echo "::error::${image} carries version label ${image_version:-<missing>}, not ${VERSION}"
+              exit 1
+            fi
+            echo "Verified ${image} (${revision})."
+          done
+
+      - name: Extract exact release notes
+        if: steps.release-state.outputs.publish_release == 'true'
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          TOOL_SHA: ${{ github.workflow_sha }}
+          VERSION: ${{ steps.release-state.outputs.version }}
+        run: |
+          set -euo pipefail
+          # A repair may target a release commit from before this helper
+          # existed. Load the helper from the exact commit that supplied this
+          # workflow while leaving release content checked out at TARGET_SHA.
+          git show "${TOOL_SHA}:.github/scripts/release-utils.sh" > /tmp/release-utils.sh
+          bash /tmp/release-utils.sh extract-notes \
+            "${VERSION}" access_control/CHANGELOG.md /tmp/changelog-section.md
+
+          {
+            cat /tmp/changelog-section.md
             echo ""
             echo "---"
             echo ""
             echo "**Container images:**"
             echo ""
-            echo "- \`ghcr.io/${{ github.repository_owner }}/hassio-access-control-amd64:${VERSION}\`"
-            echo "- \`ghcr.io/${{ github.repository_owner }}/hassio-access-control-aarch64:${VERSION}\`"
+            echo "- \`ghcr.io/${GITHUB_REPOSITORY_OWNER}/hassio-access-control-amd64:${VERSION}\`"
+            echo "- \`ghcr.io/${GITHUB_REPOSITORY_OWNER}/hassio-access-control-aarch64:${VERSION}\`"
+            echo ""
+            echo "Source commit: \`${TARGET_SHA}\`"
           } > /tmp/release-notes.md
-          echo "Generated /tmp/release-notes.md ($(wc -l < /tmp/release-notes.md) lines)"
 
-      - name: Create tag
-        if: steps.tag-check.outputs.exists == 'false'
+      - name: Create annotated tag
+        if: steps.release-state.outputs.create_tag == 'true'
         env:
-          TAG: ${{ steps.ver.outputs.tag }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release-state.outputs.tag }}
         run: |
           set -euo pipefail
-          # Use the GitHub Actions bot identity so the tag isn't
-          # attributed to a maintainer account.
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${TAG}" -m "Release ${TAG}"
-          git push origin "${TAG}"
+          git push origin "refs/tags/${TAG}"
 
-      - name: Create GitHub Release
-        if: steps.tag-check.outputs.exists == 'false'
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
-        with:
-          tag_name: ${{ steps.ver.outputs.tag }}
-          name: ${{ steps.ver.outputs.tag }}
-          body_path: /tmp/release-notes.md
-          draft: false
-          prerelease: false
-          # Don't fail if the release already exists (idempotent re-runs)
-          fail_on_unmatched_files: false
+      - name: Create or repair GitHub Release
+        if: steps.release-state.outputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release-state.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${TAG}" \
+            --notes-file /tmp/release-notes.md \
+            --verify-tag
+
+      - name: Write release summary
+        env:
+          PUBLISHED: ${{ steps.release-state.outputs.publish_release }}
+          TAG: ${{ steps.release-state.outputs.tag }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${PUBLISHED}" = "true" ]; then
+            echo "Published ${TAG} from ${TARGET_SHA}." >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "${TAG} is already published; no release mutation was needed." >> "${GITHUB_STEP_SUMMARY}"
+          fi

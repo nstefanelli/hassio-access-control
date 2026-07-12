@@ -15,6 +15,10 @@ from typing import Callable
 _log = logging.getLogger(__name__)
 
 
+class MissingHACredentialsError(RuntimeError):
+    """No complete HA credential pair is available from either source."""
+
+
 def resolve_ha_creds(
     env_url: str | None,
     env_token: str | None,
@@ -58,14 +62,14 @@ def resolve_ha_creds(
         token = decrypt(db_token_enc) if db_token_enc else None
         if db_url and token:
             return db_url, token, "db (env partial — see error above)"
-        raise RuntimeError(
+        raise MissingHACredentialsError(
             "HA credentials are incomplete after env-partial fallback: "
             f"DB ha_url={bool(db_url)}, ha_token={bool(token)}. "
             "Re-run setup or fix the Supervisor env injection."
         )
     if db_url and db_token_enc:
         return db_url, decrypt(db_token_enc), "db"
-    raise RuntimeError(
+    raise MissingHACredentialsError(
         "HA credentials are incomplete: neither env vars "
         "(ACCESS_CONTROL_HA_URL/_TOKEN) nor DB-stored "
         "ha_url/ha_token were available."

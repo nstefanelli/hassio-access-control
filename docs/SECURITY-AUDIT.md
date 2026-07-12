@@ -1,5 +1,12 @@
 # Security Audit — 2026-05-24
 
+> **Historical record.** This report describes the repository and verification
+> results on 2026-05-24. Test counts, dependencies, deferred items, supported
+> versions, and mitigations below are not current guarantees. Several items
+> were changed in later releases. Use the current [security
+> model](SECURITY-MODEL.md), [operations guide](OPERATIONS.md), [security
+> policy](../SECURITY.md), and [changelog](../access_control/CHANGELOG.md).
+
 **Branch:** `security/audit-2026-05-24`
 **Reviewer:** Maintainer-led audit with assistance from automated tools
 and a security-focused code-review agent.
@@ -108,9 +115,10 @@ bumps. Container builds clean.
 displayed the raw response body on the Settings page. Today this is
 benign UniFi text ("Unauthorized") but future firmware could include
 internal hostnames or version strings.
-**Fix:** log the raw response body at warning level (truncated to 500
-chars), show users a sanitized message ("UniFi rejected the credentials
-(HTTP 401)" etc.).
+**Fix:** drain but do not log the untrusted response body; log only the HTTP
+status and show users a sanitized message ("UniFi rejected the credentials
+(HTTP 401)" etc.). This also prevents a spoofed/unverified upstream from
+injecting arbitrary content into operator logs.
 
 #### L2 — `try / except / pass` patterns suppressed diagnostics
 

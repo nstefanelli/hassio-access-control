@@ -1,0 +1,46 @@
+# This file must live beside the Docker build context (access_control/).
+# The repository-root .dockerignore is not consulted for this context.
+
+# Local Python environments and caches
+.venv/
+**/.venv/
+venv/
+**/venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.coverage
+**/htmlcov/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Frontend dependencies are reproducible from the lockfile when a build
+# stage needs them; never send the host's node_modules tree as context.
+**/node_modules/
+**/.npm/
+**/npm-debug.log*
+
+# Test/development-only files are not needed by the runtime image
+rootfs/opt/access_control/tests/
+rootfs/opt/access_control/requirements-dev.txt
+
+# Local state and secrets
+**/data/
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/.env
+**/.env.*
+
+# Editor and OS noise
+**/.DS_Store
+**/@eaDir/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts
+**/build/
+**/dist/
+**/*.egg-info/

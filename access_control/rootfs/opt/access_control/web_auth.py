@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from fastapi import Depends, HTTPException, Request
-from fastapi.responses import RedirectResponse
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 
 # Set at application startup

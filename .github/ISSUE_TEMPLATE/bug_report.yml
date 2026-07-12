@@ -17,9 +17,48 @@ body:
     attributes:
       label: Access Control version
       description: Found on the app page in Home Assistant, or in `access_control/config.yaml`.
-      placeholder: "1.1.0"
+      placeholder: "Exact version, for example 1.5.2"
     validations:
       required: true
+
+  - type: dropdown
+    id: topology
+    attributes:
+      label: UniFi topology
+      options:
+        - One console for Access and Protect
+        - Separate Access and Protect consoles
+        - Access only / no Protect
+        - Unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: affected-path
+    attributes:
+      label: Affected path
+      options:
+        - Authorization / credential event
+        - HA-external lock / re-lock
+        - UniFi-native door
+        - Hub sync
+        - Alarm / lockdown
+        - Visitor
+        - Dashboard / Ingress / login
+        - REST API
+        - Install / startup / update / backup
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: timezone
+    attributes:
+      label: Site timezone and event time
+      description: Required for schedules/visitors; include local time and UTC offset when known.
+      placeholder: "Europe/Berlin; 2026-07-12 22:15 CEST (UTC+02:00)"
+    validations:
+      required: false
 
   - type: input
     id: ha-version
@@ -66,8 +105,23 @@ body:
     attributes:
       label: Logs / screenshots
       description: |
-        Paste relevant log lines from the app's Supervisor log tab, or
-        attach screenshots. Redact any tokens or credentials before pasting.
+        Paste the smallest relevant section from the app Log tab and the
+        sanitized Activity reason. If available, include /api/health or
+        /api/debug output with identifiers removed. Never attach a database,
+        WAL, Supervisor backup, API key, token, password, PIN, cookie, or
+        ACCESS_CONTROL_SECRET_KEY. Redact hosts, entity IDs, and household data.
       render: text
     validations:
       required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety and troubleshooting checks
+      options:
+        - label: I reviewed the current Operations troubleshooting guide.
+          required: true
+        - label: I removed credentials, PINs, cookies, database/backup files, and household-sensitive data.
+          required: true
+        - label: This is not an undisclosed security vulnerability (those use Private Vulnerability Reporting).
+          required: true
