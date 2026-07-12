@@ -4,6 +4,40 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.2] - 2026-07-12
+
+### Fixed (hub sync — field report: "sync isn't working")
+
+Three real-world gaps meant hub sync could silently do nothing:
+
+- **Sync now converges instead of waiting for a change.** v1.5.0 acted
+  on transitions only and silently adopted the current state on enable
+  or restart — so enabling the toggle while the deadbolt was already
+  unlocked did nothing until the *next* change. The hub is now driven
+  to match the lock's current state within one poll of the option
+  being enabled (and after restarts). The hub commands are idempotent
+  state-sets, so re-asserting an already-correct state is physically a
+  no-op; lockdown still suppresses the hold-open direction, and the
+  door still doesn't pop open when lockdown lifts.
+- **Hubs hidden from the Locks page now resolve.** Pairing resolution
+  filtered `hidden = 0`, so hiding the (redundant-looking) native hub
+  card silently broke sync with only a container-log warning.
+- **Doors paired via a Protect doorbell now resolve.** Resolution only
+  read *Access NFC Reader* entry devices; a lock linked to its door
+  through a *Protect Doorbell* entry device (the natural pairing for a
+  G6 Entry) found no hub. The doorbell's camera→location mapping is
+  now used.
+
+### Changed
+
+- **Flap-protection retuning.** Hub drives are now spaced ≥10 s (was
+  30 s), and suspension requires 8+ drives in 5 minutes (was 4+ in 10
+  minutes) — the old thresholds could suspend sync for 10 minutes just
+  from someone hand-testing the feature or normal leave/return traffic,
+  which read as "sync is broken". Sustained pathological cycling still
+  suspends, fail-safes the hub to reset, and alerts with
+  `reason: flapping`.
+
 ## [1.5.1] - 2026-07-12
 
 ### Performance (idle I/O + hot-path latency)

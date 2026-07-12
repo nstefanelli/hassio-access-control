@@ -144,7 +144,7 @@
           </label>
           {% if lock.type == 'ha_external' %}
           <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer"
-                 title="Requires an Access location linked via Entry Devices. Unlocked holds the hub open; locked resets it.">
+                 title="Requires the door linked via Entry Devices (Access location or Protect doorbell). The hub follows the lock's current state: unlocked holds it open, locked resets it.">
             <input type="checkbox" name="sync_hub_state" value="1" {{ 'checked' if lock.sync_hub_state else '' }}
                    class="rounded bg-gray-800 border-gray-700" />
             Sync Access hub &amp; door to this lock's state
