@@ -6,8 +6,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## [1.5.3] - 2026-07-12
+
 End-to-end reliability, performance, security, packaging, and documentation
-review. No release version has been assigned yet.
+review.
 
 ### Fixed — physical-access correctness
 
