@@ -27,6 +27,7 @@ from .auth_engine import AuthEngine
 from .config import decrypt_value, derive_key
 from .database import Database
 from .ha_creds import resolve_ha_creds as _resolve_ha_creds
+from .hub_sync import HubSyncManager
 from .protect_client import ProtectClient
 from .ha_client import HAClient
 from .relock_manager import RelockManager
@@ -80,6 +81,7 @@ async def lifespan(app: FastAPI):
     app.state.lock_states = {}
     app.state.relock_tasks = {}
     app.state.relock_manager: RelockManager | None = None
+    app.state.hub_sync_manager: HubSyncManager | None = None
     app.state.camera_to_location = {}
     app.state.sync_users = None
     app.state.on_access_event = None
@@ -484,6 +486,28 @@ async def lifespan(app: FastAPI):
             on_locked=_mark_locked,
         )
 
+        # HubSyncManager mirrors opted-in third-party HA lock states onto
+        # their paired Access hubs (per-lock sync_hub_state setting, off by
+        # default). Clients are fetched lazily via getters — same rationale
+        # as RelockManager. on_hub_state keeps the lock_states cache fresh
+        # so the Locks page shows the hub's new state.
+        def _mark_hub_state(device_id: str, state: str) -> None:
+            app.state.lock_states[device_id] = state
+
+        app.state.hub_sync_manager = HubSyncManager(
+            db=db,
+            ha_client_getter=lambda: app.state.ha_client,
+            access_client_getter=lambda: app.state.access_client,
+            on_hub_state=_mark_hub_state,
+            # HA entity state is writable by any HA token/integration, so
+            # hub sync must not be able to hold a door open during an
+            # incident lockdown — the manager suppresses unlock
+            # transitions while this returns True.
+            lockdown_getter=lambda: bool(
+                app.state.auth_engine and app.state.auth_engine.lockdown
+            ),
+        )
+
         app.state.auth_engine = AuthEngine(
             db=db,
             access_client=access_client,
@@ -720,6 +744,27 @@ async def lifespan(app: FastAPI):
         resilience_tasks.append(asyncio.create_task(
             _supervised(_ha_health_loop, name="ha-health"),
             name="ha-health",
+        ))
+
+        # Hub sync — mirrors opted-in third-party HA lock states onto their
+        # paired Access hubs. Polls the HA REST API (the app has no HA
+        # websocket); the manager acts on locked/unlocked transitions only,
+        # so the cadence just bounds reaction latency. No-op while nothing
+        # has opted in.
+        async def _hub_sync_loop():
+            while True:
+                await asyncio.sleep(HubSyncManager.POLL_INTERVAL)
+                mgr = app.state.hub_sync_manager
+                if mgr is None:
+                    continue
+                try:
+                    await mgr.poll_once()
+                except Exception:
+                    logger.exception("Hub sync poll failed")
+
+        resilience_tasks.append(asyncio.create_task(
+            _supervised(_hub_sync_loop, name="hub-sync"),
+            name="hub-sync",
         ))
 
         # Protect cold-start supervisor — keeps retrying if UNVR Protect

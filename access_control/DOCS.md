@@ -64,6 +64,51 @@ All three share a single configurable timer. Pending re-locks are
 persisted to SQLite and re-armed on app restart — a re-lock scheduled
 just before a restart still fires.
 
+## Hub sync for third-party locks (optional)
+
+For an HA lock (e.g. Aqara / Z-Wave / Zigbee deadbolt) mounted on a door
+that also has a UniFi Access hub, you can optionally keep the hub and
+door in sync with the lock's state. Enable **Sync Access hub & door to
+this lock's state** in the lock's Settings on the Locks page (off by
+default).
+
+While enabled:
+
+- HA lock reports **unlocked** → the paired hub is held open
+  (`keep_unlock`), so the strike/maglock doesn't fight an open deadbolt.
+- HA lock reports **locked** → the hub is reset to normal locked
+  behaviour.
+
+Requirements & behaviour notes:
+
+- The lock must be associated with an Access location — add an
+  **Entry Device** of type *Access NFC Reader* pointing at the door's
+  location.
+- Sync is one-way (HA lock → hub). The app polls the lock entity every
+  few seconds and acts on locked/unlocked **transitions** only — a
+  restart or enabling the option never moves a door by itself.
+- `unavailable` / `unknown` / `jammed` states are ignored, so a brief
+  radio dropout can't trigger a spurious hub change.
+- **Lockdown wins.** While lockdown mode is active the hub is never
+  held open by sync, even if the HA lock reports unlocked — and the
+  door does not pop open when lockdown is lifted. (HA entity state can
+  be written by any HA token or integration; enabling this option
+  extends trust in HA state to physical door position, so lockdown
+  must override it.)
+- **Flap protection.** Applied transitions are spaced at least 30 s
+  apart, and a lock that keeps cycling (4+ transitions in 10 minutes —
+  failing hardware or abuse) suspends sync for 10 minutes, fail-safes
+  the hub back to normal locked behaviour, and fires the failure event
+  with `reason: flapping`.
+- **No stranded doors.** Turning the option off, hiding the lock, or
+  deleting it while the hub is held open drives the hub back to reset
+  (retried until it succeeds) instead of leaving the door open.
+- If driving the hub fails, the app retries with backoff until the hub
+  converges and fires an `access_control_hub_sync_failed` HA event
+  (payload includes a `reason` field) so your automations can alert.
+- Successful syncs show up in the hub's lock history as `hub_sync`
+  entries.
+
 ## Visitors / guests
 
 The **Visitors** page creates time-windowed visitors via the UniFi

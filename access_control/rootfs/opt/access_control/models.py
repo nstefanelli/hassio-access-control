@@ -51,6 +51,7 @@ class Lock(BaseModel):
     entity_id: Optional[str] = None
     name: str
     door_name: Optional[str] = None
+    sync_hub_state: bool = False
 
     class Config:
         from_attributes = True

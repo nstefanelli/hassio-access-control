@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS locks (
     buzz_enabled        INTEGER NOT NULL DEFAULT 1,
     buzz_duration       INTEGER NOT NULL DEFAULT 30,
     remote_buzz_enabled INTEGER NOT NULL DEFAULT 0,
-    access_location_id  TEXT
+    access_location_id  TEXT,
+    sync_hub_state      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS access_rules (
@@ -372,6 +373,16 @@ class Database:
                 )"""
             )
 
+            # Migration 18: opt-in hub sync — mirror a third-party HA lock's
+            # state onto its paired Access hub. Default 0 (off) so existing
+            # installs keep current behaviour.
+            async with self._db.execute("PRAGMA table_info(locks)") as cur:
+                cols = {row[1] for row in await cur.fetchall()}
+            if "sync_hub_state" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE locks ADD COLUMN sync_hub_state INTEGER NOT NULL DEFAULT 0"
+                )
+
             await self._db.commit()
         except Exception:
             await self._db.rollback()
@@ -589,14 +600,41 @@ class Database:
         await self._db.execute("DELETE FROM locks WHERE id = ?", (lock_id,))
         await self._db.commit()
 
+    # Sentinel distinguishing "caller didn't supply access_location_id"
+    # from an explicit None/"" (clear the pairing). The lock settings
+    # form has never rendered this field, so passing a form default
+    # through unconditionally was silently NULLing legacy pairings on
+    # every settings save (e2e review 2026-07-12).
+    _KEEP = object()
+
     async def update_lock_settings(
         self, lock_id: int, buzz_enabled: bool, relock_duration: int,
-        access_location_id: str | None = None, relock_on_remote: bool = False,
-        relock_on_device_auth: bool = False,
+        access_location_id: Any = _KEEP, relock_on_remote: bool = False,
+        relock_on_device_auth: bool = False, sync_hub_state: bool = False,
     ) -> None:
+        sets = (
+            "buzz_enabled = ?, relock_duration = ?, relock_on_remote = ?, "
+            "relock_on_device_auth = ?, sync_hub_state = ?"
+        )
+        params: list[Any] = [
+            1 if buzz_enabled else 0, relock_duration,
+            1 if relock_on_remote else 0, 1 if relock_on_device_auth else 0,
+            1 if sync_hub_state else 0,
+        ]
+        # Resolve the sentinel via type(self), NOT the module-global
+        # `Database`: importlib.reload (used by the integration tests)
+        # re-executes this module in place, rebinding the global to a new
+        # class with a new sentinel while live instances still carry the
+        # old default — the global lookup would then never match.
+        if access_location_id is not type(self)._KEEP:
+            sets += ", access_location_id = ?"
+            params.append(access_location_id or None)
+        params.append(lock_id)
+        # `sets` is assembled from hardcoded literals above, not user
+        # input; values flow through parameter binding.
         await self._db.execute(
-            "UPDATE locks SET buzz_enabled = ?, relock_duration = ?, access_location_id = ?, relock_on_remote = ?, relock_on_device_auth = ? WHERE id = ?",
-            (1 if buzz_enabled else 0, relock_duration, access_location_id or None, 1 if relock_on_remote else 0, 1 if relock_on_device_auth else 0, lock_id),
+            f"UPDATE locks SET {sets} WHERE id = ?",  # nosec B608
+            params,
         )
         await self._db.commit()
 
