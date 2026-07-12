@@ -692,12 +692,20 @@ class Database:
         )
         await self._db.commit()
 
-    async def get_locks_for_location(self, location_id: str) -> list[dict[str, Any]]:
-        """Return all non-hidden locks associated with an Access location (native or linked)."""
-        async with self._db.execute(
-            "SELECT * FROM locks WHERE (location_id = ? OR access_location_id = ?) AND hidden = 0",
-            (location_id, location_id),
-        ) as cursor:
+    async def get_locks_for_location(
+        self, location_id: str, include_hidden: bool = False
+    ) -> list[dict[str, Any]]:
+        """Return locks associated with an Access location (native or linked).
+
+        Hidden locks are excluded by default (a hidden lock must not
+        unlock on a tap). Hub sync passes include_hidden=True: hiding a
+        hub card from the dashboard is cosmetic and must not silently
+        break hub-state mirroring (field report 2026-07-12).
+        """
+        sql = "SELECT * FROM locks WHERE (location_id = ? OR access_location_id = ?)"
+        if not include_hidden:
+            sql += " AND hidden = 0"
+        async with self._db.execute(sql, (location_id, location_id)) as cursor:
             return [_row_to_dict(r) for r in await cursor.fetchall()]
 
     # ------------------------------------------------------------------

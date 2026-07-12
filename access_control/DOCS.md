@@ -81,12 +81,16 @@ While enabled:
 
 Requirements & behaviour notes:
 
-- The lock must be associated with an Access location — add an
-  **Entry Device** of type *Access NFC Reader* pointing at the door's
-  location.
-- Sync is one-way (HA lock → hub). The app polls the lock entity every
-  few seconds and acts on locked/unlocked **transitions** only — a
-  restart or enabling the option never moves a door by itself.
+- The lock must be linked to its door via an **Entry Device** — either
+  an *Access NFC Reader* pointing at the door's Access location, or a
+  *Protect Doorbell* (G6 Entry) on that door. Hiding the native hub
+  card from the Locks page doesn't break sync — hiding is cosmetic.
+- Sync is one-way (HA lock → hub) and **converges**: the app polls the
+  lock entity every few seconds and drives the hub to match the lock's
+  *current* state. Enabling the option while the lock is unlocked holds
+  the hub open within a few seconds; a restart re-asserts whatever the
+  lock currently reports. (The hub commands are idempotent state-sets,
+  so re-asserting an already-correct state does nothing physically.)
 - `unavailable` / `unknown` / `jammed` states are ignored, so a brief
   radio dropout can't trigger a spurious hub change.
 - **Lockdown wins.** While lockdown mode is active the hub is never
@@ -95,11 +99,11 @@ Requirements & behaviour notes:
   be written by any HA token or integration; enabling this option
   extends trust in HA state to physical door position, so lockdown
   must override it.)
-- **Flap protection.** Applied transitions are spaced at least 30 s
-  apart, and a lock that keeps cycling (4+ transitions in 10 minutes —
-  failing hardware or abuse) suspends sync for 10 minutes, fail-safes
-  the hub back to normal locked behaviour, and fires the failure event
-  with `reason: flapping`.
+- **Flap protection.** Hub drives are spaced at least 10 s apart, and a
+  lock that cycles pathologically (8+ drives in 5 minutes — failing
+  hardware or abuse, well past normal use or hand-testing) suspends
+  sync for 10 minutes, fail-safes the hub back to normal locked
+  behaviour, and fires the failure event with `reason: flapping`.
 - **No stranded doors.** Turning the option off, hiding the lock, or
   deleting it while the hub is held open drives the hub back to reset
   (retried until it succeeds) instead of leaving the door open.

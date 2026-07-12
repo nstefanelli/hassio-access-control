@@ -538,6 +538,9 @@ async def lifespan(app: FastAPI):
             lockdown_getter=lambda: bool(
                 app.state.auth_engine and app.state.auth_engine.lockdown
             ),
+            # Live camera→location map so locks paired to their door via a
+            # Protect doorbell entry device (G6 Entry) resolve their hub.
+            camera_map_getter=lambda: app.state.camera_to_location,
         )
 
         app.state.auth_engine = AuthEngine(
