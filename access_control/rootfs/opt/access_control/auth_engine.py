@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, time, timezone
+import os
+from datetime import datetime, time, timezone, tzinfo
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -35,6 +36,29 @@ _FULLY_RESTRICTIVE_ALARM_STATES = frozenset(
 )
 
 
+def _default_timezone() -> tzinfo:
+    """
+    Best-effort local timezone for schedule evaluation before HA's
+    configured zone is known: the TZ env var if valid, else the
+    container's local time (UTC on a stock HAOS container).
+
+    Schedules were previously evaluated in a hardcoded America/New_York —
+    a systematic authorization bug for every install outside Eastern
+    time (e2e review 2026-07-12). main.py overrides this with HA's
+    `time_zone` via set_timezone() as soon as HA is reachable.
+    """
+    tz_name = os.environ.get("TZ")
+    if tz_name:
+        try:
+            return ZoneInfo(tz_name)
+        except Exception:
+            _LOGGER.warning(
+                "Invalid TZ env value %r — falling back to container-local time",
+                tz_name,
+            )
+    return datetime.now(timezone.utc).astimezone().tzinfo or timezone.utc
+
+
 class AuthEngine:
     """
     Authorization engine: evaluates events against rules and fires unlocks.
@@ -42,9 +66,6 @@ class AuthEngine:
     Typical call flow:
         result = await engine.process_event(ulp_id, location_id, method="nfc")
     """
-
-    # Timezone for schedule evaluation — must match physical door location
-    _TZ = ZoneInfo("America/New_York")
 
     def __init__(
         self,
@@ -66,6 +87,36 @@ class AuthEngine:
         self._alarm_cache_value: str | None = None
         self._alarm_cache_expires: float = 0.0
         self._alarm_cache_ttl: float = 1.5
+        # Timezone for schedule evaluation. Seeded from TZ env / container
+        # local time; main.py upgrades it to HA's configured time_zone via
+        # set_timezone() once HA is reachable.
+        self._tz: tzinfo = _default_timezone()
+
+    # ------------------------------------------------------------------
+    # Timezone
+    # ------------------------------------------------------------------
+
+    @property
+    def tz(self) -> tzinfo:
+        """Timezone used for all schedule evaluation."""
+        return self._tz
+
+    def set_timezone(self, tz_name: str) -> bool:
+        """
+        Switch schedule evaluation to ``tz_name`` (an IANA zone like
+        "Europe/Berlin"). Returns False and keeps the current zone if the
+        name is invalid — a bad HA config must not break authorization.
+        """
+        try:
+            self._tz = ZoneInfo(tz_name)
+        except Exception:
+            _LOGGER.warning(
+                "Ignoring invalid timezone %r — schedules keep evaluating in %s",
+                tz_name, self._tz,
+            )
+            return False
+        _LOGGER.info("Schedule evaluation timezone set to %s", tz_name)
+        return True
 
     # ------------------------------------------------------------------
     # Lockdown property
@@ -225,7 +276,7 @@ class AuthEngine:
                 return {"granted": False, "user_name": user_name, "reason": reason, "locks": []}
 
         # Step 4: Find relevant locks
-        locks = await self._get_locks_for_location(location_id)
+        locks = await self.get_locks_for_location(location_id)
         if not locks:
             reason = f"No locks found for location {location_id}"
             _LOGGER.info("Access DENIED for %s — %s", user_name, reason)
@@ -367,13 +418,19 @@ class AuthEngine:
     # Lock resolution
     # ------------------------------------------------------------------
 
-    async def _get_locks_for_location(self, location_id: str) -> list[dict]:
+    async def get_locks_for_location(self, location_id: str) -> list[dict]:
         """
         Return locks relevant to a given location_id.
 
         - Native locks: matched by location_id column.
         - HA external locks: matched via entry_devices table (access_reader type)
           or legacy access_location_id column.
+
+        Public because this is THE canonical resolution — every consumer
+        of "which locks live at this location" must use it. main.py's
+        remote-relock path previously used only the DB column lookup and
+        silently missed entry-device-paired locks, leaving doors unlocked
+        after a remote unlock (e2e review 2026-07-12).
         """
         # Native locks by location_id + legacy access_location_id
         locks = await self._db.get_locks_for_location(location_id)
@@ -443,7 +500,7 @@ class AuthEngine:
         Supports overnight windows such as 22:00–06:00 where end < start.
         An empty/missing schedule_days means all days are allowed.
         """
-        now = datetime.now(tz=self._TZ)
+        now = datetime.now(tz=self._tz)
         current_day = DAY_NAMES[now.weekday()]
         current_time = now.time().replace(second=0, microsecond=0)
 

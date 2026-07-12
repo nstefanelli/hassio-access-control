@@ -4,6 +4,45 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.2] - 2026-07-12
+
+### Fixed (security / physical-access correctness)
+
+Three door-safety defects from an end-to-end review, each with a
+regression test that fails on the pre-fix code:
+
+- **Schedules now evaluate in the site's timezone.** All rule and group
+  schedule checks ran in a hardcoded `America/New_York`, so "cleaner,
+  Mon–Fri 9–5" meant Eastern time everywhere — a Los Angeles install
+  actually granted 06:00–14:00 local (and denied 14:00–17:00). The
+  auth engine now uses Home Assistant's configured `time_zone`
+  (fetched at startup and refreshed on HA recovery), falling back to
+  the `TZ` env var / container-local time until HA is reachable. The
+  scheduled-reboot hour follows the same zone.
+- **Remote-unlock auto-relock now covers entry-device-paired locks.**
+  The `remote_through_uah` relock path resolved locks with the bare
+  DB location-column lookup, missing locks paired via Entry Devices —
+  the only pairing method the UI offers. Result: "Auto re-lock on
+  remote unlock" silently never fired and the door stayed unlocked
+  indefinitely. The path now resolves through the auth engine's
+  canonical `get_locks_for_location()` (entry devices included).
+- **Protect NFC/fingerprint events are deduplicated and flood-gated.**
+  A single tap on a G6 doorbell arrives via BOTH the Protect WS and
+  the Access WS log path; the Protect nfc/fingerprint branch bypassed
+  the 10s dedup window and the event semaphore entirely, so one tap
+  unlocked — and auto-disarmed the alarm — twice. The branch now
+  records the camera's mapped door location in the shared dedup
+  window (falling back to camera id) and runs under the same
+  semaphore as every other event path.
+
+### Tests / harness
+
+- 6 new regression tests: schedule-timezone behavior (day boundary
+  across zones + invalid-zone rejection) and lifespan-driven WS
+  dispatch tests (Protect redelivery dedup, cross-path dedup against
+  the Access WS, camera-id fallback, remote-relock entry-device
+  resolution).
+
 ## [1.4.1] - 2026-07-06
 
 ### Changed (CI only — no runtime/app changes)

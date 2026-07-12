@@ -267,7 +267,15 @@ async def lifespan(app: FastAPI):
                 rm = app.state.relock_manager
                 if rm is None:
                     return
-                locks = await db.get_locks_for_location(loc_id)
+                # Resolve through the auth engine so entry-device-paired
+                # locks are included — the bare DB column lookup missed
+                # them, so a remote unlock never scheduled a relock and
+                # the door stayed open (e2e review 2026-07-12).
+                engine = app.state.auth_engine
+                if engine is not None:
+                    locks = await engine.get_locks_for_location(loc_id)
+                else:
+                    locks = await db.get_locks_for_location(loc_id)
                 for lock in locks:
                     if not lock.get("relock_on_remote") or lock["type"] != "ha_external":
                         continue
@@ -344,8 +352,25 @@ async def lifespan(app: FastAPI):
             if not ulp_id:
                 logger.info("Protect %s event with no ulp_id — unregistered credential", event)
                 return
+            # The same physical tap also arrives via the Access WS log
+            # path. Dedup on the camera's mapped door location so both
+            # paths share a key — without this, one tap unlocked (and
+            # auto-disarmed) twice (e2e review 2026-07-12). Falls back to
+            # camera_id when no mapping exists, which still suppresses
+            # Protect-side re-deliveries.
+            dedup_location = app.state.camera_to_location.get(camera_id, "") or camera_id
+            if _is_duplicate(ulp_id, dedup_location):
+                logger.debug(
+                    "Skipping duplicate Protect %s event for %s", event, ulp_id
+                )
+                return
+
+            async def _gated_protect_cred():
+                async with _event_semaphore:
+                    return await _handle_protect_access(auth_engine, camera_id, ulp_id, event)
+
             task = asyncio.create_task(
-                _handle_protect_access(auth_engine, camera_id, ulp_id, event),
+                _gated_protect_cred(),
                 name=f"protect-{event}-{camera_id}",
             )
             task.add_done_callback(_log_task_exception)
@@ -471,6 +496,20 @@ async def lifespan(app: FastAPI):
         # Restore lockdown mode persisted before a restart (incident control
         # must survive a reboot). Fail-safe: stays disabled if unreadable.
         await app.state.auth_engine.load_persisted_lockdown()
+
+        # Align schedule evaluation with the site's local timezone. HA's
+        # configured time_zone is authoritative; until it's available the
+        # engine falls back to TZ env / container-local time (see
+        # auth_engine._default_timezone). The HA health loop retries this
+        # on recovery if HA was down at boot.
+        if ha_ok:
+            try:
+                tz_name = await ha_client.get_timezone()
+                if tz_name:
+                    app.state.auth_engine.set_timezone(tz_name)
+            except Exception:
+                logger.exception("Failed to fetch HA timezone — schedules use %s",
+                                 app.state.auth_engine.tz)
 
         await sync_users()
 
@@ -649,6 +688,17 @@ async def lifespan(app: FastAPI):
                             await rm.rehydrate()
                         except Exception:
                             logger.exception("Relock rehydrate after HA recovery failed")
+                    # Refresh the schedule timezone — covers HA being down
+                    # at boot (the engine would still be on its TZ-env /
+                    # container-local fallback).
+                    engine = app.state.auth_engine
+                    if engine is not None:
+                        try:
+                            tz_name = await ha.get_timezone()
+                            if tz_name:
+                                engine.set_timezone(tz_name)
+                        except Exception:
+                            logger.exception("Timezone refresh after HA recovery failed")
                 elif previous_connected and not now_connected:
                     logger.warning("HA connection lost — %s", ha.last_error)
                 elif now_connected:
@@ -774,15 +824,21 @@ async def lifespan(app: FastAPI):
         # target hour can't accidentally trigger a second reboot.
         async def _scheduled_reboot_loop():
             from datetime import datetime as _dt
-            from zoneinfo import ZoneInfo as _ZI
             import shlex as _shlex
-            tz = _ZI("America/New_York")
             while True:
                 await asyncio.sleep(60)
                 try:
                     enabled = (await db.get_config("reboot_enabled")) == "1"
                     if not enabled:
                         continue
+                    # "Reboot at 04:00" means 04:00 in the site's timezone
+                    # (was hardcoded America/New_York). The auth engine's
+                    # zone tracks HA's time_zone; read it per-tick so a
+                    # late HA recovery is picked up.
+                    engine = app.state.auth_engine
+                    tz = engine.tz if engine is not None else (
+                        _dt.now(timezone.utc).astimezone().tzinfo
+                    )
                     raw_day = await db.get_config("reboot_day") or "daily"
                     raw_hour = await db.get_config("reboot_hour") or "4"
                     try:
