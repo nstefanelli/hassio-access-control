@@ -4,6 +4,27 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-07-12
+
+### Added
+
+- **Opt-in hub sync for third-party locks.** A new per-lock setting on the
+  Locks page — "Sync Access hub & door to this lock's state" — mirrors a
+  Home Assistant lock entity's state onto its associated UniFi Access
+  hub/door: when the HA lock reports `unlocked` the hub is held open
+  (`keep_unlock`), and when it reports `locked` the hub is reset to normal
+  locked behaviour. Off by default; only HA-external locks show the
+  toggle, and it requires the lock to be associated with an Access
+  location (via Entry Devices → Access NFC Reader, or the legacy
+  `access_location_id`). Sync is one-way (HA → hub), acts on observed
+  locked/unlocked transitions only (a restart or enabling the option
+  never moves a door by itself), and ignores `unavailable`/`unknown`/
+  `jammed` states so radio hiccups can't trigger spurious hub changes.
+  Failed syncs are retried with backoff until the hub converges, and an
+  `access_control_hub_sync_failed` HA event is fired (once per failing
+  transition) so automations can alert. Successful syncs appear in the
+  hub's lock history as `hub_sync` entries.
+
 ## [1.4.2] - 2026-07-12
 
 ### Fixed (security / physical-access correctness)

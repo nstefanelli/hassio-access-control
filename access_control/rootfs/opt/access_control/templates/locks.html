@@ -142,6 +142,14 @@
                    class="rounded bg-gray-800 border-gray-700" />
             Auto re-lock on device auth (face/PIN/NFC)
           </label>
+          {% if lock.type == 'ha_external' %}
+          <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer"
+                 title="Requires an Access location linked via Entry Devices. Unlocked holds the hub open; locked resets it.">
+            <input type="checkbox" name="sync_hub_state" value="1" {{ 'checked' if lock.sync_hub_state else '' }}
+                   class="rounded bg-gray-800 border-gray-700" />
+            Sync Access hub &amp; door to this lock's state
+          </label>
+          {% endif %}
           <div class="flex items-center gap-2">
             <label class="text-xs text-gray-500">Relock duration:</label>
             <input name="relock_duration" type="number" min="1" max="300" value="{{ lock.relock_duration }}"

@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS locks (
     buzz_enabled        INTEGER NOT NULL DEFAULT 1,
     buzz_duration       INTEGER NOT NULL DEFAULT 30,
     remote_buzz_enabled INTEGER NOT NULL DEFAULT 0,
-    access_location_id  TEXT
+    access_location_id  TEXT,
+    sync_hub_state      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS access_rules (
@@ -372,6 +373,16 @@ class Database:
                 )"""
             )
 
+            # Migration 18: opt-in hub sync — mirror a third-party HA lock's
+            # state onto its paired Access hub. Default 0 (off) so existing
+            # installs keep current behaviour.
+            async with self._db.execute("PRAGMA table_info(locks)") as cur:
+                cols = {row[1] for row in await cur.fetchall()}
+            if "sync_hub_state" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE locks ADD COLUMN sync_hub_state INTEGER NOT NULL DEFAULT 0"
+                )
+
             await self._db.commit()
         except Exception:
             await self._db.rollback()
@@ -592,11 +603,11 @@ class Database:
     async def update_lock_settings(
         self, lock_id: int, buzz_enabled: bool, relock_duration: int,
         access_location_id: str | None = None, relock_on_remote: bool = False,
-        relock_on_device_auth: bool = False,
+        relock_on_device_auth: bool = False, sync_hub_state: bool = False,
     ) -> None:
         await self._db.execute(
-            "UPDATE locks SET buzz_enabled = ?, relock_duration = ?, access_location_id = ?, relock_on_remote = ?, relock_on_device_auth = ? WHERE id = ?",
-            (1 if buzz_enabled else 0, relock_duration, access_location_id or None, 1 if relock_on_remote else 0, 1 if relock_on_device_auth else 0, lock_id),
+            "UPDATE locks SET buzz_enabled = ?, relock_duration = ?, access_location_id = ?, relock_on_remote = ?, relock_on_device_auth = ?, sync_hub_state = ? WHERE id = ?",
+            (1 if buzz_enabled else 0, relock_duration, access_location_id or None, 1 if relock_on_remote else 0, 1 if relock_on_device_auth else 0, 1 if sync_hub_state else 0, lock_id),
         )
         await self._db.commit()
 
