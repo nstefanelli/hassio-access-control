@@ -1,80 +1,88 @@
-# Access Control — REST API
+# REST API
 
-External programs (Home Assistant automations, scripts, dashboards on
-other hosts) can drive the app through a small Bearer-token REST API.
-Use it to:
+Access Control exposes a JSON API for monitoring, reporting, explicit lock
+control, local authorization schedules, and lockdown automation. The dashboard
+does not use these credentials; it has a separate HA Ingress/session and CSRF
+security path. Dashboard and API lock commands nevertheless run through the
+same command barrier, confirmation, re-lock, and audit service. Alarm
+auto-disarm is an additional `full`-scope capability and is never performed for
+`locks_only` calls.
 
-- Mirror the app's connection state into HA sensors
-- Trigger lockdown mode from an automation
-- Pull the recent access log into your dashboards
-- Build per-user reporting outside the app
+## Reachability
 
-The dashboard itself does **not** use this API — it uses a separate
-session-cookie + CSRF path under `/locks`, `/users`, etc. The two
-paths share the underlying database but have different auth.
+The supplied Home Assistant app is Ingress-only and does not publish port
+`8080` on the HA host. Therefore it does not promise a stable public API URL.
+Use the API only from a client that can reach the app's internal container
+hostname/port, or place a deliberate authenticated TLS proxy in front of it.
+Do not hard-code HA's per-session `/api/hassio_ingress/...` browser URL into an
+automation.
 
-## Reaching the API
-
-The app's web UI is reached through HA Ingress and has no host-side
-port. Reach the REST API the same way:
-
-- **From inside HA** — automations using `rest_command` /
-  `rest` sensors, or other add-ons on the Supervisor's `hassio` network,
-  can hit `http://<container-name>:8080/api/...` directly.
-- **From outside HA** — proxy through HA's own REST API. Easiest path:
-  configure a `rest_command` in HA and call that from your external
-  client via HA's standard token authentication. The Access Control
-  request stays inside the HA network.
-
-Direct external access to the app's API is not supported by default —
-flip `ports` back on in `config.yaml` if you absolutely need it, and
-expect to wear the security cost (no HA SSO, no ingress proxy).
+Examples below use `http://<reachable-app-host>:8080`. Substitute a hostname
+that is actually resolvable from the calling network. Publishing the port
+directly changes the threat model described in
+[Security model](SECURITY-MODEL.md).
 
 ## Authentication
 
-Every `/api/*` request needs an `Authorization: Bearer <api-key>`
-header. Generate API keys on the in-app **Settings** page. The raw
-key value is shown **once** at creation; only the SHA-256 hash is
-stored. Lose the key, you generate a new one.
+Every `/api/*` request requires an API key:
 
 ```http
-GET /api/health HTTP/1.1
-Authorization: Bearer ac_3xampleK3y_aBcDeF...
+Authorization: Bearer <api-key>
 ```
+
+Create a key on the dashboard **Settings** page. Its random value is shown once
+and only its SHA-256 digest is stored. Store the value as a secret; create and
+revoke a replacement if it is lost.
 
 ### Scopes
 
-Each key has one of three scopes:
+| Endpoint | `full` | `read_only` | `locks_only` |
+|---|:---:|:---:|:---:|
+| `GET /api/health` | yes | yes | yes |
+| `GET /api/locks` | yes | yes | yes |
+| `GET /api/log` | yes | yes | no |
+| `GET /api/users` | yes | yes | no |
+| `GET /api/debug` | yes | no | no |
+| `PUT /api/locks/{lock_id}/mode` | yes | no | yes |
+| `PUT /api/rules/{rule_id}/schedule` | yes | no | no |
+| `POST /api/lockdown` | yes | no | no |
 
-| Scope | What it can do |
-|-------|----------------|
-| `full` | All endpoints, including admin actions (lockdown, debug). Default scope; use sparingly. |
-| `read_only` | All GET endpoints (health, log, locks, users). Cannot toggle lockdown. |
-| `locks_only` | GET `/api/locks` + GET `/api/health` only. For automations that need lock state but shouldn't see user data. |
+`locks_only` can inspect locks and set their explicit operating mode, but
+cannot read identities/logs, modify authorization schedules, or control
+lockdown or alarm panels. There is intentionally no Bearer API buzz endpoint: a
+momentary unlock is not an idempotent desired-state operation.
 
-Insufficient scope → `403 Forbidden` with `{"detail": "API key scope 'X' insufficient"}`.
+An authenticated key with insufficient scope receives `403`. Missing or
+invalid credentials receive `401`.
 
-### Rate limiting
+### Authentication failure rate limit
 
-10 authentication failures per IP per 5 minutes triggers a 60-second
-lockout — `429 Too Many Requests`. Successful requests reset the
-counter. There is **no rate limit on successful authenticated
-requests**; you can poll as often as you want, within reason.
+Invalid API-key values are tracked per client IP. Ten failures in a five-minute
+window cause a 60-second lockout and `429 Too Many Requests`.
+A valid request clears an existing failure row. Successfully authenticated
+requests are otherwise not quota limited.
 
-## Endpoints
+The client IP is meaningful only behind the trusted proxy configuration used
+by the packaged app. Do not deploy behind an arbitrary forwarding proxy without
+reviewing which peer can set `X-Forwarded-For`.
+
+## Endpoint summary
+
+All timestamps originating in SQLite are UTC strings formatted as
+`YYYY-MM-DD HH:MM:SS` with no suffix. Treat response additions as compatible;
+consumers should ignore unknown fields.
 
 ### `GET /api/health`
 
-System health snapshot. Requires the `full`, `read_only`, or `locks_only`
-scope — every issued scope, but the guard is explicit so a future
-narrower scope must opt in rather than inherit access.
-
-**Response 200:**
+Returns a health snapshot. All three scopes are accepted.
 
 ```json
 {
   "status": "ok",
   "unvr_connected": true,
+  "access_open_api_configured": true,
+  "access_open_api_ready": true,
+  "access_open_api_error": null,
   "protect_connected": true,
   "ha_connected": true,
   "ha_last_error": null,
@@ -82,105 +90,88 @@ narrower scope must opt in rather than inherit access.
   "websocket_connected": true,
   "user_count": 14,
   "lock_count": 3,
-  "lockdown": false
+  "lockdown": false,
+  "lockdown_enforcement_pending": []
 }
 ```
 
-| Field | Meaning |
-|-------|---------|
-| `status` | Always `"ok"` if the request was authenticated. Use HTTP status for liveness. |
-| `unvr_connected` | Most recent state of the UniFi Access REST session. |
-| `protect_connected` | Most recent state of the UniFi Protect WebSocket. |
-| `ha_connected` | Last test result against HA. False during a Supervisor restart. |
-| `ha_last_error` | Last error string from a failed HA call, or `null`. |
-| `ha_circuit_state` | `"closed"`, `"open"`, or `"half_open"`. See the circuit-breaker section in the main README. |
-| `websocket_connected` | Access WebSocket open. False during a UNVR restart. |
-| `user_count` | Distinct users in the local DB. Includes hidden users. |
-| `lock_count` | Configured locks (HA-external + UniFi native), including hidden. |
-| `lockdown` | True if lockdown mode is active. All grants are denied while true. |
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | Always `ok` when the authenticated route completed. It is not aggregate upstream health. |
+| `unvr_connected` | boolean | Current Access REST/session connection state. The historical field name is retained for compatibility. |
+| `access_open_api_configured` | boolean | Whether the active Access client has an official Bearer token configured. |
+| `access_open_api_ready` | boolean | Whether the configured official API passed its latest startup/settings validation. |
+| `access_open_api_error` | string/null | Sanitized validation error class when the official API is configured but not ready. |
+| `protect_connected` | boolean | Current Protect client connection state. |
+| `ha_connected` | boolean | Current HA client connection state. |
+| `ha_last_error` | string/null | Most recent HA error, if any. |
+| `ha_circuit_state` | string | HA circuit breaker: `closed`, `open`, or `half_open`. |
+| `websocket_connected` | boolean | Access WebSocket state. |
+| `user_count` | integer | All local user rows, including hidden/deleted-upstream rows. |
+| `lock_count` | integer | Operable configured lock rows, including hidden rows but excluding upstream-missing native locks. |
+| `lockdown` | boolean | Current authorization-engine lockdown state. It normally matches persistence; on a failed transition the safer in-memory state can remain enabled while the request reports `503`. |
+| `lockdown_enforcement_pending` | array of strings | HA entity IDs whose synced Access hubs are not yet confirmed reset for the active lockdown. A non-empty list requires operator attention/retry. |
 
-**Use case:** wire this into an HA REST sensor that polls every minute
-and you'll get a single status badge on your dashboard.
-
----
+Use `GET /health/live` for process liveness and this endpoint for component
+health. Do not alert from `status` alone.
 
 ### `GET /api/log`
 
-Recent access events. Scope: `full` or `read_only`.
+Returns recent access/activity rows. Scope: `full` or `read_only`.
 
-**Query parameters:**
+Query:
 
-| Param | Type | Default | Range | Meaning |
-|-------|------|---------|-------|---------|
-| `limit` | int | 50 | 1–1000 | Number of most recent entries to return. |
-
-**Response 200:**
+| Parameter | Default | Constraint |
+|---|---:|---|
+| `limit` | 50 | Integer from 1 through 1000 |
 
 ```json
 {
   "entries": [
     {
       "id": 4218,
-      "timestamp": "2026-05-23T15:29:34+00:00",
+      "timestamp": "2026-07-12 15:29:34",
       "user_id": 1,
       "user_name": "Alex Morgan",
       "lock_id": 1,
-      "lock_name": "Front Door (Aqara U400)",
+      "lock_name": "Front Door",
       "method": "face",
       "result": "granted",
-      "reason": "Family group"
-    },
-    {
-      "id": 4217,
-      "timestamp": "2026-05-23T15:18:12+00:00",
-      "user_id": 3,
-      "user_name": "Sam Rivera",
-      "lock_id": 1,
-      "lock_name": "Front Door (Aqara U400)",
-      "method": "pin_code",
-      "result": "denied",
-      "reason": "Cleaning Service: outside schedule"
+      "reason": null
     }
   ]
 }
 ```
 
-| Field | Meaning |
-|-------|---------|
-| `id` | Auto-incrementing primary key. Stable across restarts. |
-| `timestamp` | ISO 8601 in UTC. |
-| `method` | One of `face`, `nfc`, `pin_code`, `fingerprint`, `remote_unlock`, `device_auth`. |
-| `result` | `granted`, `denied`, or `error`. |
-| `reason` | Human-readable explanation (group name, denial cause, etc.). |
+Rows can also represent denials, errors, manual actions, hub sync, doorbell
+rings, and system information. Do not build an enum from the example values
+without allowing future methods/results. Nullable identity/lock fields are
+expected for events that cannot be attributed to a user or lock.
 
-Log entries are retained for 90 days. Older entries are pruned by the
-nightly retention loop.
-
-**Use case:** populate an HA dashboard with the last N events, or
-forward to a SIEM via a small relay script.
-
----
+Access-log retention is 90 days.
 
 ### `GET /api/locks`
 
-All configured locks with current state. Scope: `full`, `read_only`, or
-`locks_only`.
-
-**Response 200:**
+Returns non-hidden, operable lock configuration. Scope: all three scopes.
 
 ```json
 {
   "locks": [
     {
       "id": 1,
-      "name": "Front Door (Aqara U400)",
       "type": "ha_external",
+      "device_id": null,
+      "location_id": null,
       "entity_id": "lock.front_door",
-      "location_id": "loc-001",
+      "name": "Front Door",
+      "door_name": null,
       "buzz_enabled": 1,
-      "buzz_duration": 5,
-      "relock_on_remote": 0,
-      "relock_on_device_auth": 0,
+      "buzz_duration": 30,
+      "remote_buzz_enabled": 0,
+      "access_location_id": "location-id",
+      "sync_hub_state": 0,
+      "relock_on_remote": 1,
+      "relock_on_device_auth": 1,
       "relock_duration": 30,
       "hidden": 0
     }
@@ -188,83 +179,186 @@ All configured locks with current state. Scope: `full`, `read_only`, or
 }
 ```
 
-`type` is either `ha_external` (HA `lock.*` entity driven via the HA
-REST API) or `native` (UniFi Access lock_rule driven via UniFi's API).
+The schema is migration-aware, so current rows may contain compatibility
+columns in addition to those shown. Boolean configuration values are currently
+serialized as SQLite integers. `type` is `access_native` or `ha_external`.
+Native rows retained for history after disappearing from a valid Access
+topology snapshot are upstream-missing and omitted; they return automatically
+if the same location is rediscovered.
 
-**Use case:** dynamically populate a dashboard of all door-state
-indicators. Pair with HA's own `lock.*` state listeners so you don't
-have to poll for state changes — this endpoint gives you the *config*,
-not live state.
+This endpoint returns configuration, not an authoritative live state for every
+lock. Read HA entity state or the relevant upstream system when live state is
+required.
 
----
+### `PUT /api/locks/{lock_id}/mode`
+
+Sets an explicit desired operating mode. Scope: `full` or `locks_only`.
+The JSON body is:
+
+```json
+{
+  "mode": "force_locked"
+}
+```
+
+`mode` is exactly one of:
+
+| Mode | HA external lock | Native UniFi Access lock |
+|---|---|---|
+| `force_locked` | Calls HA lock and confirms the entity becomes exactly `locked`. | Issues Access's immediate-lock operation, ending an active scheduled/temporary unlock, and confirms the door is locked. |
+| `hold_unlocked` | Calls HA unlock and confirms the entity becomes exactly `unlocked`. A pending app re-lock is canceled only after confirmation. | Applies Access `keep_unlock` and confirms both its rule and unlocked state. |
+| `follow_schedule` | Rejected with `409`; HA schedules are outside this app's override model. | Clears the app's native override and confirms Access accepted the reset, returning control to the Access schedule. |
+
+Restoring an Access schedule can immediately open a door when its unlock window
+is active. Consequently, lockdown rejects both `hold_unlocked` and
+`follow_schedule` with `409`; `force_locked` remains available as a fail-safe
+direction. The lockdown decision is checked again inside the shared physical-
+command barrier immediately before the command.
+
+Success returns `200` only after confirmation:
+
+```json
+{
+  "lock_id": 1,
+  "mode": "hold_unlocked",
+  "result": "granted",
+  "confirmed": true,
+  "confirmed_state": "unlocked",
+  "reason": null
+}
+```
+
+For `follow_schedule`, `confirmed_state` is `scheduled`: this confirms that the
+override was cleared, not that the physical door is necessarily closed. The
+active Access schedule determines its resulting state.
+
+The endpoint is idempotent desired-state control. Repeating the same mode does
+not invert it. A repeat may still reassert and re-confirm the upstream state,
+which makes bounded automation retries safe. Commands are audited as
+`api_lock`, `api_unlock`, or `api_restore_schedule`, attributed to the API key
+name without recording its Bearer secret.
+
+Failures use the same response shape with `confirmed: false` and a sanitized
+`reason`: `404` means the configured/operable lock does not exist, `409` means
+the requested mode conflicts with lockdown or the lock type, and `503` means
+the required client was unavailable, rejected the command, or did not confirm
+the requested result. A `503` must not be treated as proof that no physical
+transition occurred; inspect the authoritative controller state before an
+unsafe compensating action.
 
 ### `GET /api/users`
 
-All users known to the app. Scope: `full` or `read_only`.
-
-**Response 200:**
+Returns non-hidden synchronized users. Scope: `full` or `read_only`.
 
 ```json
 {
   "users": [
     {
       "id": 1,
-      "ulp_id": "u-001",
+      "ulp_id": "upstream-user-id",
       "name": "Alex Morgan",
-      "email": "alex@example.com",
+      "email": "alex@example.invalid",
       "status": "ACTIVE",
-      "hidden": 0
-    },
-    {
-      "id": 4,
-      "ulp_id": "u-004",
-      "name": "Casey Park - Visitor",
-      "email": "",
-      "status": "ACTIVE",
-      "hidden": 0
+      "hidden": 0,
+      "synced_at": "2026-07-12 15:20:00",
+      "rule_count": 2
     }
   ]
 }
 ```
 
-`ulp_id` is the UniFi Access user-platform ID — useful for correlating
-across UniFi's own API. `status` reflects UniFi's "active" /
-"deactivated" state.
+`ulp_id` is the UniFi Access user identifier. `status` is synchronized from
+UniFi or set by an app-level administrative action. `rule_count` counts direct
+individual access rules; group membership is separate. Sensitive encrypted PIN
+material is not part of the public response contract.
 
----
+### `PUT /api/rules/{rule_id}/schedule`
+
+Replaces the local authorization schedule on one individual user/lock rule.
+Scope: `full` only. This is the JSON equivalent of the schedule editor on the
+user detail page; both paths use the same validation and SQLite fields.
+
+```json
+{
+  "enabled": true,
+  "days": ["mon", "tue", "wed", "thu", "fri"],
+  "start": "08:30",
+  "end": "18:00"
+}
+```
+
+Allowed day values are `mon` through `sun`. Duplicate/input-order day values
+are normalized into week order. Times use 24-hour `HH:MM`. Days without times
+mean all day on those days; times without days mean every day. A start later
+than the end is an overnight window. An enabled schedule must have at least
+one day or a complete start/end pair, and a lone time bound is always rejected.
+
+Success returns the normalized persisted schedule while preserving the rule's
+separate enabled flag:
+
+```json
+{
+  "rule_id": 42,
+  "user_id": 7,
+  "enabled": true,
+  "schedule": {
+    "enabled": true,
+    "days": ["mon", "fri"],
+    "start": "22:00",
+    "end": "06:00"
+  }
+}
+```
+
+Unknown rules return `404`. Invalid schedules return `422` without modifying
+the existing row. Repeating an identical `PUT` leaves the same schedule.
+Changing this local authorization schedule does not immediately operate a
+door; it changes whether future reader credentials processed by this app may
+unlock that rule's lock. It does not edit the schedule stored in UniFi Access.
+Use a native lock's `follow_schedule` mode only to clear an app override and
+resume the already-configured Access schedule. Group schedules are not exposed
+by this endpoint.
 
 ### `POST /api/lockdown`
 
-Toggle lockdown mode. Scope: `full` only.
+Sets lockdown to an explicit desired state. Scope: `full` only. The request
+has no body and requires the boolean `enabled` query parameter:
 
-While lockdown is active, **every** access event is denied at the auth
-engine, regardless of group / schedule / individual rules. Locks
-controlled directly via HA still work (e.g., a manual unlock from the
-HA dashboard) — lockdown only affects the auth-engine path.
-
-**Request:** no body required.
-
-**Response 200:**
-
-```json
-{ "lockdown": true }
+```http
+POST /api/lockdown?enabled=true
 ```
 
-(The new state. The endpoint is a toggle — call again to disable.)
+```json
+{
+  "lockdown": true
+}
+```
 
-**Use case:** an HA automation tied to a panic button on a HASS keypad,
-or a "leaving for vacation" scene. Pair with HA's alarm panel for the
-canonical secure-the-house workflow.
+The returned boolean is the resulting state. Repeating the same request keeps
+that state, so duplicate delivery cannot accidentally invert lockdown. Use
+`enabled=false` deliberately to clear it; omitting `enabled` returns `422`.
 
----
+Lockdown is persisted across restart. Its state change shares a physical-
+command barrier with application unlocks, HA re-locks, and hub-sync commands:
+once an enable request completes, no older application unlock can issue later.
+Enabling lockdown also resets hubs the app may have held open. Repeating
+`enabled=true` may safely reassert those idempotent resets.
+
+If enabling cannot persist the desired value or cannot confirm every required
+hub reset, the endpoint returns `503` while retaining the safer enabled
+in-memory state. `GET /api/health` lists unresolved HA entity IDs in
+`lockdown_enforcement_pending`; retry `enabled=true` after restoring the
+database/Access path or correcting a pairing conflict. If `enabled=false`
+cannot be persisted, lockdown likewise remains enabled and the request returns
+`503`. On startup, an error reading the persisted value is interpreted
+fail-closed as enabled until an explicit disable succeeds.
+
+Lockdown does not prevent a separate HA user/integration or direct UniFi
+operator from issuing commands outside this application's authorization path.
 
 ### `GET /api/debug`
 
-Internal diagnostic snapshot — connection reconnect counters, circuit
-breaker state, seconds since last event per WebSocket client, pending
-re-lock divergence. Scope: `full` only.
-
-**Response 200:**
+Returns internal recovery signals. Scope: `full` only.
 
 ```json
 {
@@ -277,132 +371,124 @@ re-lock divergence. Scope: `full` only.
   "ha_connected": true,
   "ha_last_error": null,
   "ha_circuit_state": "closed",
-  "ws_last_event": "2026-05-23T15:29:34+00:00",
+  "ws_last_event": {
+    "access": "2026-07-12T15:29:34+00:00",
+    "protect": "2026-07-12T15:29:30+00:00"
+  },
   "pending_relocks_live": 1,
   "pending_relocks_db": 1
 }
 ```
 
-Notable signals:
+The `*_secs_since_last_event` values are `null` until that client has received
+an event in the current process. `ws_last_event` contains wall-clock UTC values
+for each source. Reconnect counters are diagnostic, not failure totals.
 
-- `access_secs_since_last_event > 14400` (4 hours) — the WS zombie
-  watchdog will force a reconnect on its next 5-minute tick.
-- `pending_relocks_db > pending_relocks_live` — the difference is stuck
-  re-lock rows that need HA-side recovery. Should drop to 0 when HA
-  reconnects.
-- `ha_circuit_state != "closed"` — HA REST calls are paused; check
-  `ha_last_error`.
+A durable re-lock count larger than the live-task count can be transient during
+startup, HA recovery, or an overdue retry. If it persists while HA is healthy,
+inspect process logs and the `access_control_relock_failed` HA event.
 
-**Use case:** an HA template sensor that watches for stuck re-locks or
-prolonged WS silence, with an alert on either condition.
-
----
-
-## Unauthenticated endpoint
+## Unauthenticated liveness
 
 ### `GET /health/live`
 
-Liveness probe. No auth, no scope. Returns `{"status":"ok"}` 200 as long
-as the FastAPI process is up and serving. Use this for external uptime
-monitors; do not use it for application-level health (it will report
-"ok" even if UNVR and HA are both down — for that, use `GET /api/health`
-with a key).
+Returns:
 
----
+```json
+{
+  "status": "ok"
+}
+```
+
+No API key is required. This proves only that the web process is serving. It
+does not query SQLite, HA, Access, or Protect and intentionally exposes no
+topology.
 
 ## Examples
 
-### HA REST sensor for health
-
-```yaml
-sensor:
-  - platform: rest
-    name: Access Control health
-    resource: http://<container>:8080/api/health
-    headers:
-      Authorization: !secret access_control_api_key
-    value_template: >-
-      {{ 'ok' if value_json.unvr_connected and value_json.ha_connected else 'degraded' }}
-    json_attributes:
-      - unvr_connected
-      - protect_connected
-      - ha_connected
-      - ha_circuit_state
-      - lockdown
-      - user_count
-      - lock_count
-    scan_interval: 60
-```
-
-Add to `secrets.yaml`:
-
-```yaml
-access_control_api_key: "Bearer ac_yourkey..."
-```
-
-### HA `rest_command` for lockdown toggle
-
-```yaml
-rest_command:
-  access_control_toggle_lockdown:
-    url: http://<container>:8080/api/lockdown
-    method: POST
-    headers:
-      Authorization: !secret access_control_api_key
-```
-
-Then call `rest_command.access_control_toggle_lockdown` from any
-automation.
-
-### Shell script: tail the last 5 events
+Check component health:
 
 ```bash
-curl -s \
-  -H "Authorization: Bearer $ACCESS_CONTROL_KEY" \
-  "http://<host>:8080/api/log?limit=5" \
-  | jq -r '.entries[] | "\(.timestamp) \(.result) \(.user_name // "?") at \(.lock_name)"'
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer ${ACCESS_CONTROL_API_KEY}" \
+  "http://<reachable-app-host>:8080/api/health" | jq .
 ```
 
-### Python: poll for stuck re-locks
+Fetch the five newest log rows:
 
-```python
-import httpx
-
-r = httpx.get(
-    "http://<host>:8080/api/debug",
-    headers={"Authorization": f"Bearer {API_KEY}"},
-    timeout=5,
-)
-r.raise_for_status()
-data = r.json()
-stuck = data["pending_relocks_db"] - data["pending_relocks_live"]
-if stuck > 0:
-    raise RuntimeError(f"{stuck} stuck re-lock rows — HA may be unreachable")
+```bash
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer ${ACCESS_CONTROL_API_KEY}" \
+  "http://<reachable-app-host>:8080/api/log?limit=5" \
+  | jq -r '.entries[] | [.timestamp, .result, .user_name, .lock_name] | @tsv'
 ```
 
-## Error responses
+Hold lock 1 unlocked and require confirmation:
 
-All endpoints return JSON for errors except where the response is a
-plain text from FastAPI's default handlers.
+```bash
+curl --fail --silent --show-error \
+  -X PUT \
+  -H "Authorization: Bearer ${ACCESS_CONTROL_API_KEY}" \
+  -H "Content-Type: application/json" \
+  --data '{"mode":"hold_unlocked"}' \
+  "http://<reachable-app-host>:8080/api/locks/1/mode" \
+  | jq '{result, confirmed_state}'
+```
 
-| Status | When |
-|--------|------|
-| `200` | Success |
-| `401` | Missing or invalid API key |
-| `403` | API key scope insufficient for this endpoint |
-| `422` | Invalid query parameter (e.g. `limit=0`) |
-| `429` | Rate limit hit (10 auth failures / 5 min from same IP) |
-| `500` | Internal error — check the app log |
+Restore a native Access lock to its existing upstream schedule by sending
+`{"mode":"follow_schedule"}` to the same endpoint. Use `force_locked` to
+terminate an active scheduled unlock and confirm the locked state.
 
-## Versioning
+Replace individual rule 42's local overnight authorization schedule:
 
-The API surface is small and is treated as part of the app's public
-contract. Breaking changes will:
+```bash
+curl --fail --silent --show-error \
+  -X PUT \
+  -H "Authorization: Bearer ${ACCESS_CONTROL_API_KEY}" \
+  -H "Content-Type: application/json" \
+  --data '{"enabled":true,"days":["mon","fri"],"start":"22:00","end":"06:00"}' \
+  "http://<reachable-app-host>:8080/api/rules/42/schedule" \
+  | jq .schedule
+```
 
-- Bump the minor version (`1.1.x` → `1.2.0`)
-- Be called out in `CHANGELOG.md` under a **Breaking** subsection
-- Keep the old shape working for at least one minor release where
-  practical
+Set lockdown deliberately:
 
-Adding a new field to an existing response is **not** considered a
-breaking change. Removing or renaming a field is.
+```bash
+curl --fail --silent --show-error \
+  -X POST \
+  -H "Authorization: Bearer ${ACCESS_CONTROL_API_KEY}" \
+  "http://<reachable-app-host>:8080/api/lockdown?enabled=true" \
+  | jq .lockdown
+```
+
+Use the same request for a bounded retry; it cannot toggle lockdown off. To
+clear lockdown, make the separate explicit request with `enabled=false`.
+
+## Errors
+
+Validation/authentication errors use JSON such as `{"detail":"..."}`. Lock-
+mode command errors retain the structured command response documented above.
+
+| Status | Meaning |
+|---:|---|
+| 200 | Request completed. Inspect component booleans for degraded health. |
+| 401 | Bearer credential missing, malformed, or invalid. |
+| 403 | Authenticated key lacks the endpoint's scope. |
+| 404 | A requested operable lock or authorization rule does not exist. |
+| 409 | A lock mode conflicts with lockdown or is unsupported by that lock type. |
+| 422 | Query or JSON validation failed, including an invalid mode, lockdown value, day, or incomplete schedule. |
+| 429 | Invalid-key lockout is active. |
+| 500 | Unexpected application error; inspect process logs. |
+| 503 | A required component is unavailable, a lock command was rejected/unconfirmed, or a lockdown persistence/physical-enforcement transition is incomplete. Inspect authoritative state, health, and logs. |
+
+Dynamic API responses are non-cacheable. Clients should use bounded timeouts,
+must not log Bearer keys, and should retry only operations whose desired-state
+semantics they understand.
+
+## Compatibility
+
+The changelog calls out breaking API changes. Adding fields is compatible;
+consumers should ignore unknown keys. Removing/renaming fields, changing scope
+requirements, or changing an endpoint's mutation semantics requires a
+documented release change. The Unreleased changelog records the lockdown
+endpoint's change from a toggle to this explicit desired-state contract.

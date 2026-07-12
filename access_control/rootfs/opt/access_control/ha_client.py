@@ -116,9 +116,9 @@ class HAClient:
         if self._circuit.is_open():
             _LOGGER.warning("HA circuit open — skipping %s.%s for %s", domain, service, entity_id)
             return False
-        await self._ensure_session()
         payload = extra_data if extra_data else {"entity_id": entity_id}
         try:
+            await self._ensure_session()
             async with self._session.post(
                 f"{self._url}/api/services/{domain}/{service}",
                 headers=self._headers(),
@@ -139,14 +139,16 @@ class HAClient:
             self._last_error = str(err)
             self._circuit.record_failure()
             return False
+        finally:
+            self._circuit.abort_probe()
 
     async def get_entity_state(self, entity_id: str) -> str | None:
         """Get the current state of any HA entity."""
         if self._circuit.is_open():
             _LOGGER.warning("HA circuit open — skipping get_entity_state for %s", entity_id)
             return None
-        await self._ensure_session()
         try:
+            await self._ensure_session()
             async with self._session.get(
                 f"{self._url}/api/states/{entity_id}",
                 headers=self._headers(),
@@ -169,6 +171,8 @@ class HAClient:
             self._last_error = str(err)
             self._circuit.record_failure()
             return None
+        finally:
+            self._circuit.abort_probe()
 
     async def get_timezone(self) -> str | None:
         """
@@ -179,8 +183,8 @@ class HAClient:
         if self._circuit.is_open():
             _LOGGER.warning("HA circuit open — skipping get_timezone")
             return None
-        await self._ensure_session()
         try:
+            await self._ensure_session()
             async with self._session.get(
                 f"{self._url}/api/config",
                 headers=self._headers(),
@@ -198,14 +202,16 @@ class HAClient:
             self._last_error = str(err)
             self._circuit.record_failure()
             return None
+        finally:
+            self._circuit.abort_probe()
 
     async def get_lock_entities(self) -> list[dict]:
         """Fetch all lock.* entities from HA with friendly name and state."""
         if self._circuit.is_open():
             _LOGGER.warning("HA circuit open — skipping get_lock_entities")
             return []
-        await self._ensure_session()
         try:
+            await self._ensure_session()
             async with self._session.get(
                 f"{self._url}/api/states",
                 headers=self._headers(),
@@ -221,6 +227,8 @@ class HAClient:
             _LOGGER.warning("HA get_lock_entities failed: %s", err)
             self._circuit.record_failure()
             return []
+        finally:
+            self._circuit.abort_probe()
 
         locks = []
         for entity in states:
@@ -241,8 +249,8 @@ class HAClient:
         if self._circuit.is_open():
             _LOGGER.warning("HA circuit open — skipping get_camera_entities")
             return []
-        await self._ensure_session()
         try:
+            await self._ensure_session()
             async with self._session.get(
                 f"{self._url}/api/states",
                 headers=self._headers(),
@@ -258,6 +266,8 @@ class HAClient:
             _LOGGER.warning("HA get_camera_entities failed: %s", err)
             self._circuit.record_failure()
             return []
+        finally:
+            self._circuit.abort_probe()
 
         cameras = []
         for entity in states:
@@ -278,8 +288,8 @@ class HAClient:
         if self._circuit.is_open():
             _LOGGER.warning("HA circuit open — skipping get_alarm_entities")
             return []
-        await self._ensure_session()
         try:
+            await self._ensure_session()
             async with self._session.get(
                 f"{self._url}/api/states",
                 headers=self._headers(),
@@ -295,6 +305,8 @@ class HAClient:
             _LOGGER.warning("HA get_alarm_entities failed: %s", err)
             self._circuit.record_failure()
             return []
+        finally:
+            self._circuit.abort_probe()
 
         alarms = []
         for entity in states:
@@ -335,8 +347,8 @@ class HAClient:
         if self._circuit.is_open():
             _LOGGER.warning("HA circuit open — skipping fire_event %s", event_type)
             return False
-        await self._ensure_session()
         try:
+            await self._ensure_session()
             async with self._session.post(
                 f"{self._url}/api/events/{event_type}",
                 headers=self._headers(),
@@ -351,6 +363,8 @@ class HAClient:
             _LOGGER.warning("HA fire_event %s failed: %s", event_type, err)
             self._circuit.record_failure()
             return False
+        finally:
+            self._circuit.abort_probe()
 
     async def close(self) -> None:
         if self._session and not self._session.closed:

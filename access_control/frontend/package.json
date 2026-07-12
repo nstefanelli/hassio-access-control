@@ -1,0 +1,14 @@
+{
+  "name": "access-control-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "tailwindcss -c tailwind.config.js -i src/app.css -o ../rootfs/opt/access_control/static/app.css --minify"
+  },
+  "devDependencies": {
+    "tailwindcss": "3.4.17"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

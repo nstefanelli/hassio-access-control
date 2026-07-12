@@ -30,3 +30,30 @@ body:
         looked at — and why they didn't fit.
     validations:
       required: false
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Physical-access and failure behavior
+      description: |
+        If this can lock/unlock a door, change alarm behavior, or grant access,
+        describe the safe result when HA, UniFi, the network, or input data is
+        unavailable. Note any migration or rollback impact.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Primary area
+      options:
+        - Authorization policy
+        - Locks / re-locks / hub sync
+        - Alarms / lockdown
+        - Visitors / schedules
+        - Dashboard / API
+        - Reliability / performance
+        - Packaging / operations / documentation
+        - Other
+    validations:
+      required: true

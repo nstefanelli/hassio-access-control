@@ -15,12 +15,11 @@ Covers:
 """
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import sys
 import unittest
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -57,12 +56,18 @@ def _fake_request(headers: dict[str, str]) -> SimpleNamespace:
         headers=headers,
         scope={"type": "http"},
         state=SimpleNamespace(),
+        url=SimpleNamespace(path="/"),
     )
 
 
 async def _passthrough(request):
     """A fake `call_next` that just echoes the request scope+state for assertions."""
-    return SimpleNamespace(scope=request.scope, state=request.state, status_code=200)
+    return SimpleNamespace(
+        scope=request.scope,
+        state=request.state,
+        status_code=200,
+        headers={},
+    )
 
 
 class TestIngressPathRegex(unittest.TestCase):
@@ -233,6 +238,11 @@ class TestIngressMiddleware(unittest.IsolatedAsyncioTestCase):
         # recognize the request as ingress; we just refused to authorize it)
         self.assertEqual(req.scope["root_path"], "/api/hassio_ingress/realtoken123")
         self.assertIsNone(req.state.ingress_user)
+        # The ingress wrapper is the outer boundary, so even its own early
+        # rejection receives the complete response policy.
+        self.assertEqual(resp.headers["Cache-Control"], "no-store")
+        self.assertEqual(resp.headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(resp.headers["X-Frame-Options"], "SAMEORIGIN")
 
     async def test_missing_ingress_header_ignores_sso_headers(self):
         # No X-Ingress-Path: SSO headers must NOT be trusted (could be
@@ -281,6 +291,17 @@ class TestIngressMiddleware(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req.scope["root_path"], "/api/hassio_ingress/realtoken123")
         self.assertTrue(req.state.ingress_active)
         self.assertIsNone(req.state.ingress_user)
+
+    async def test_dynamic_responses_are_no_store(self):
+        req = _fake_request({})
+        resp = await ingress_middleware(req, _passthrough)
+        self.assertEqual(resp.headers["Cache-Control"], "no-store")
+
+    async def test_static_responses_get_bounded_public_cache(self):
+        req = _fake_request({})
+        req.url.path = "/static/app.css"
+        resp = await ingress_middleware(req, _passthrough)
+        self.assertEqual(resp.headers["Cache-Control"], "public, max-age=3600")
 
 
 class TestSecurityHeaders(unittest.TestCase):

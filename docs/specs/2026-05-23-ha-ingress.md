@@ -1,8 +1,15 @@
 # HA Ingress integration — design
 
+> **Historical design note.** This proposal targeted v1.1.0 and is preserved
+> for design context. The current manifest, middleware, restart/watchdog
+> behavior, and security model have evolved. Do not implement or operate from
+> this file; use [Configuration](../CONFIGURATION.md),
+> [Architecture](../ARCHITECTURE.md), and
+> [Security model](../SECURITY-MODEL.md).
+
 **Date:** 2026-05-23
 **Target version:** 1.1.0
-**Status:** approved, building
+**Status:** historical — implemented for v1.1.0 and subsequently evolved
 
 ## Goal
 

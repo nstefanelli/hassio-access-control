@@ -1,0 +1,315 @@
+"""Web-boundary regressions found by the end-to-end review."""
+from __future__ import annotations
+
+import unittest
+from datetime import timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, call, patch
+from zoneinfo import ZoneInfo
+
+from fastapi.responses import HTMLResponse
+
+from access_control import web_routes
+
+
+def _request(
+    *, zone=timezone.utc, headers=None, db=None, access=None, ha=None,
+    auth_engine=None, relock_manager=None, physical_command_lock=None,
+):
+    if auth_engine is None:
+        auth_engine = SimpleNamespace(tz=zone, lockdown=False)
+    return SimpleNamespace(
+        headers=headers or {},
+        scope={},
+        state=SimpleNamespace(ingress_user=None, ingress_active=False),
+        client=SimpleNamespace(host="127.0.0.1"),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                auth_engine=auth_engine,
+                db=db,
+                access_client=access,
+                ha_client=ha,
+                enc_key=None,
+                lock_states={},
+                relock_manager=relock_manager,
+                physical_command_lock=physical_command_lock,
+            )
+        ),
+    )
+
+
+class SiteTimezoneTests(unittest.TestCase):
+    def test_site_timezone_comes_from_auth_engine(self) -> None:
+        berlin = ZoneInfo("Europe/Berlin")
+        self.assertIs(web_routes._site_timezone(_request(zone=berlin)), berlin)
+
+    def test_dst_gap_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            web_routes._parse_site_datetime(
+                "2026-03-08", "02:30", ZoneInfo("America/New_York")
+            )
+
+    def test_dst_fold_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            web_routes._parse_site_datetime(
+                "2026-11-01", "01:30", ZoneInfo("America/New_York")
+            )
+
+    def test_valid_local_time_retains_configured_zone(self) -> None:
+        zone = ZoneInfo("America/Los_Angeles")
+        parsed = web_routes._parse_site_datetime("2026-07-12", "14:30", zone)
+        self.assertEqual(parsed.tzinfo, zone)
+        self.assertEqual((parsed.hour, parsed.minute), (14, 30))
+
+
+class VisitorExtensionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_extension_cannot_end_before_future_visitor_start(self) -> None:
+        db = SimpleNamespace(
+            consume_rate_limit=AsyncMock(return_value=True),
+            get_visitor=AsyncMock(return_value={
+                "id": 7,
+                "name": "Future Guest",
+                "unvr_visitor_id": "visitor-7",
+                "start_time": "2999-01-01T10:00:00+00:00",
+                "end_time": "2999-01-02T10:00:00+00:00",
+                "status": 1,
+            }),
+            update_active_visitor_end_time=AsyncMock(return_value=True),
+            log_admin_action=AsyncMock(),
+        )
+        access = SimpleNamespace(update_visitor=AsyncMock())
+        response = await web_routes.extend_visitor(
+            7,
+            _request(db=db, access=access),
+            user="admin",
+            end_date="2998-01-01",
+            end_time="10:00",
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("after+the+visitor+start", response.headers["location"])
+        access.update_visitor.assert_not_awaited()
+        db.update_active_visitor_end_time.assert_not_awaited()
+
+
+class ManualLockActionSafetyTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _db_for(lock: dict) -> SimpleNamespace:
+        return SimpleNamespace(
+            get_lock=AsyncMock(return_value=lock),
+            log_access=AsyncMock(),
+        )
+
+    async def test_lockdown_rejects_forged_manual_unlock(self) -> None:
+        lock = {
+            "id": 4,
+            "type": "ha_external",
+            "entity_id": "lock.back",
+            "name": "Back Door",
+            "buzz_enabled": 1,
+        }
+        db = self._db_for(lock)
+        ha = SimpleNamespace(unlock=AsyncMock(return_value=True))
+        request = _request(
+            db=db,
+            ha=ha,
+            auth_engine=SimpleNamespace(tz=timezone.utc, lockdown=True),
+        )
+
+        response = await web_routes._lock_action(4, "unlock", "admin", request)
+
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("Lockdown+mode+active", response.headers["location"])
+        ha.unlock.assert_not_awaited()
+        db.log_access.assert_awaited_once_with(
+            method="manual_unlock",
+            result="denied",
+            lock_id=4,
+            lock_name="Back Door",
+            user_name="admin",
+            reason="Lockdown mode active",
+        )
+
+    async def test_lockdown_rejects_forged_manual_buzz(self) -> None:
+        lock = {
+            "id": 5,
+            "type": "ha_external",
+            "entity_id": "lock.front",
+            "name": "Front Door",
+            "buzz_enabled": 1,
+        }
+        db = self._db_for(lock)
+        ha = SimpleNamespace(unlock=AsyncMock(return_value=True))
+        request = _request(
+            db=db,
+            ha=ha,
+            auth_engine=SimpleNamespace(tz=timezone.utc, lockdown=True),
+        )
+
+        response = await web_routes._lock_action(5, "buzz", "admin", request)
+
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("Lockdown+mode+active", response.headers["location"])
+        ha.unlock.assert_not_awaited()
+        db.log_access.assert_awaited_once_with(
+            method="manual_buzz",
+            result="denied",
+            lock_id=5,
+            lock_name="Front Door",
+            user_name="admin",
+            reason="Lockdown mode active",
+        )
+
+    async def test_forged_buzz_is_rejected_when_disabled_for_lock(self) -> None:
+        lock = {
+            "id": 6,
+            "type": "ha_external",
+            "entity_id": "lock.side",
+            "name": "Side Door",
+            "buzz_enabled": 0,
+        }
+        db = self._db_for(lock)
+        ha = SimpleNamespace(unlock=AsyncMock(return_value=True))
+        request = _request(db=db, ha=ha)
+
+        response = await web_routes._lock_action(6, "buzz", "admin", request)
+
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("Buzz+is+disabled", response.headers["location"])
+        ha.unlock.assert_not_awaited()
+        db.log_access.assert_awaited_once_with(
+            method="manual_buzz",
+            result="denied",
+            lock_id=6,
+            lock_name="Side Door",
+            user_name="admin",
+            reason="Buzz is disabled for this lock",
+        )
+
+    async def test_accepted_lock_is_not_success_until_ha_confirms_state(self) -> None:
+        lock = {
+            "id": 7,
+            "type": "ha_external",
+            "entity_id": "lock.patio",
+            "name": "Patio Door",
+            "buzz_enabled": 1,
+        }
+        db = self._db_for(lock)
+        db.get_all_alarm_panels = AsyncMock(return_value=[])
+        paused = {"entity_id": "lock.patio", "deadline": 1234.0}
+        relock = SimpleNamespace(
+            pause=AsyncMock(return_value=paused),
+            resume=AsyncMock(),
+            cancel=AsyncMock(),
+        )
+        ha = SimpleNamespace(
+            lock=AsyncMock(return_value=True),
+            get_entity_state=AsyncMock(return_value="unlocked"),
+        )
+        request = _request(db=db, ha=ha, relock_manager=relock)
+
+        with patch(
+            "access_control.lock_actions.asyncio.sleep", new=AsyncMock()
+        ):
+            response = await web_routes._lock_action(7, "lock", "admin", request)
+
+        self.assertEqual(response.status_code, 303)
+        ha.get_entity_state.assert_has_awaits(
+            [call("lock.patio")] * 3
+        )
+        relock.resume.assert_awaited_once_with(paused)
+        relock.cancel.assert_not_awaited()
+        self.assertNotIn("lock.patio", request.app.state.lock_states)
+        db.log_access.assert_awaited_once_with(
+            method="manual_lock",
+            result="error",
+            lock_id=7,
+            lock_name="Patio Door",
+            user_name="admin",
+            reason="HA accepted lock command but entity was not confirmed locked",
+        )
+
+
+class HomeTemplateSafetyTests(unittest.TestCase):
+    def test_lockdown_hides_enabled_buzz_control(self) -> None:
+        template = web_routes.templates.env.get_template("home.html")
+        context = {
+            "user": "admin",
+            "page": "home",
+            "ingress_active": False,
+            "ingress_path": "",
+            "csrf_token": "csrf",
+            "locks": [{
+                "id": 7,
+                "name": "Garage",
+                "door_name": "Garage entry",
+                "buzz_enabled": 1,
+            }],
+            "alarm_panels": [],
+            "log_entries": [],
+            "ws_last_event": {},
+            "unvr_connected": True,
+            "protect_connected": True,
+            "ha_connected": True,
+            "ws_connected": True,
+        }
+
+        unlocked_html = template.render(**context, lockdown=False)
+        lockdown_html = template.render(**context, lockdown=True)
+
+        self.assertIn('action="locks/7/buzz"', unlocked_html)
+        self.assertNotIn('action="locks/7/buzz"', lockdown_html)
+        self.assertIn("Lockdown Active", lockdown_html)
+
+
+class RenderAndValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_background_poll_does_not_refresh_session_cookie(self) -> None:
+        request = _request(headers={"X-Background-Poll": "true"})
+        response = HTMLResponse("ok")
+        with patch.object(
+            web_routes, "get_session_user", return_value="admin"
+        ), patch.object(
+            web_routes, "generate_csrf_token", return_value="csrf"
+        ), patch.object(
+            web_routes.templates, "TemplateResponse", return_value=response
+        ), patch.object(
+            web_routes, "refresh_session_cookie"
+        ) as refresh:
+            rendered = await web_routes._render(
+                "home.html", request, {"request": request}
+            )
+
+        self.assertIs(rendered, response)
+        refresh.assert_not_called()
+        self.assertNotIn("set-cookie", rendered.headers)
+
+    async def test_unknown_api_key_scope_is_rejected_before_persistence(self) -> None:
+        db = SimpleNamespace(add_api_key=AsyncMock())
+        request = _request(db=db)
+        error_response = HTMLResponse("invalid", status_code=422)
+        with patch.object(
+            web_routes,
+            "_enforce_action_rate_limit",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            web_routes,
+            "_settings_with_result",
+            new=AsyncMock(return_value=error_response),
+        ) as render_error, patch.object(
+            web_routes, "generate_api_key"
+        ) as generate:
+            response = await web_routes.create_api_key(
+                request,
+                name="Integration",
+                scope="superuser",
+                user="admin",
+            )
+
+        self.assertIs(response, error_response)
+        render_error.assert_awaited_once()
+        generate.assert_not_called()
+        db.add_api_key.assert_not_awaited()
+
+
+if __name__ == "__main__":
+    unittest.main()

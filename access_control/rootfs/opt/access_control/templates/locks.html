@@ -78,6 +78,16 @@
           </button>
         </form>
 
+        {% if lock.type == 'access_native' %}
+        <!-- Relinquish an app override and resume the native Access schedule. -->
+        <form method="post" action="locks/{{ lock.id }}/follow-schedule" class="flex-1 min-w-[6rem]">
+          <button type="submit" class="btn-secondary w-full justify-center text-xs"
+                  title="Clear this app's override and resume the door's UniFi Access schedule">
+            Follow Schedule
+          </button>
+        </form>
+        {% endif %}
+
         <!-- Buzz (if enabled) -->
         {% if lock.buzz_enabled %}
         <form method="post" action="locks/{{ lock.id }}/buzz" class="flex-1 min-w-[4rem]">
@@ -144,10 +154,10 @@
           </label>
           {% if lock.type == 'ha_external' %}
           <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer"
-                 title="Requires the door linked via Entry Devices (Access location or Protect doorbell). The hub follows the lock's current state: unlocked holds it open, locked resets it.">
+                 title="Requires the door linked via Entry Devices. Home Assistant and Access changes reconcile in both directions; conflicts fail closed.">
             <input type="checkbox" name="sync_hub_state" value="1" {{ 'checked' if lock.sync_hub_state else '' }}
                    class="rounded bg-gray-800 border-gray-700" />
-            Sync Access hub &amp; door to this lock's state
+            Sync this lock &amp; Access door bidirectionally
           </label>
           {% endif %}
           <div class="flex items-center gap-2">
@@ -181,7 +191,6 @@
               <select name="device_type" class="input w-full text-xs" onchange="toggleDeviceFields(this, {{ lock.id }})">
                 <option value="access_reader">Access NFC Reader</option>
                 <option value="protect_doorbell">Protect Doorbell</option>
-                <option value="protect_camera">Protect Camera</option>
               </select>
               <div class="ed-access-{{ lock.id }}">
                 <select name="device_id" class="input w-full text-xs" onchange="autoFillDeviceName(this, {{ lock.id }})">
@@ -193,12 +202,9 @@
               </div>
               <div class="ed-protect-{{ lock.id }} hidden">
                 <select disabled class="input w-full text-xs ed-protect-select" onchange="autoFillDeviceName(this, {{ lock.id }})">
-                  <option value="">— Select doorbell/camera —</option>
+                  <option value="">— Select Protect doorbell —</option>
                   {% for db in protect_doorbells %}
                   <option value="{{ db.id }}" data-name="{{ db.name }}">{{ db.name }} (Doorbell)</option>
-                  {% endfor %}
-                  {% for cam in protect_cameras %}
-                  <option value="{{ cam.id }}" data-name="{{ cam.name }}">{{ cam.name }} (Camera)</option>
                   {% endfor %}
                 </select>
               </div>

@@ -35,20 +35,33 @@
     // direct-port and HA Ingress access modes. fetch() *should* resolve
     // relative URLs against <base href>, but being explicit avoids any
     // browser quirks and is clearer at review time.
-    var prefix = window.__INGRESS_PREFIX__ || '';
-    var url = prefix + '/settings';
+    // base.html emits <base href=".../"> before this script. Resolve against
+    // document.baseURI because deferred app.js has not initialized globals yet.
+    var url = new URL('settings', document.baseURI).toString();
     var attempts = 0;
     function tryReload() {
       attempts++;
-      fetch(url, {method: 'HEAD'}).then(function(r) {
-        if (r.ok) window.location.replace(url);
-      }).catch(function() {
-        if (attempts < 30) setTimeout(tryReload, 2000);
-      });
+      fetch(url, {method: 'GET', cache: 'no-store', credentials: 'same-origin'})
+        .then(function(r) {
+          if (r.ok) {
+            window.location.replace(url);
+          } else if (attempts < 30) {
+            setTimeout(tryReload, 2000);
+          }
+        })
+        .catch(function() {
+          if (attempts < 30) setTimeout(tryReload, 2000);
+        });
     }
     setTimeout(tryReload, 3000);
   })();
   </script>
+  {% endif %}
+
+  {% if restart_error %}
+  <div class="p-3 rounded-lg text-sm bg-red-900/40 border border-red-700 text-red-300">
+    {{ restart_error }}
+  </div>
   {% endif %}
 
   <!-- UniFi Console (primary — used for Protect and Access by default) -->
@@ -116,6 +129,32 @@
       </form>
     </div>
   </details>
+
+  <!-- Official Access Open API token -->
+  <div class="card space-y-3">
+    <div class="flex items-center justify-between gap-3">
+      <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Access API Token</h2>
+      <span class="text-xs {{ 'text-green-400' if access_api_token_configured else 'text-yellow-400' }}">
+        {{ 'Configured' if access_api_token_configured else 'Compatibility mode' }}
+      </span>
+    </div>
+    <p class="text-xs text-gray-600">
+      The official local Access API provides schedule-aware lock commands and
+      state readback. Create a token with <code>view:space</code> and
+      <code>edit:space</code>; the token is encrypted at rest and never shown again.
+    </p>
+    <form method="post" action="settings/access-api-token" class="space-y-3">
+      <input name="access_api_token" type="password" class="input w-full"
+             autocomplete="new-password"
+             placeholder="{{ 'Enter a replacement token' if access_api_token_configured else 'Paste Access API token' }}" />
+      <div class="flex gap-2">
+        <button type="submit" class="btn-primary text-sm">Test &amp; Save Token</button>
+        {% if access_api_token_configured %}
+        <button type="submit" name="clear" value="1" class="btn-secondary text-sm">Clear Token</button>
+        {% endif %}
+      </div>
+    </form>
+  </div>
 
   <!-- HA Connection -->
   <div class="card space-y-3">
@@ -210,7 +249,7 @@
       Restarts are managed by Home Assistant. Use the <strong>Restart</strong> button on
       the add-on page (Settings → Apps → Access Control) to restart the container.
     </p>
-    {% else %}
+    {% elif restart_available %}
     <div class="flex items-center justify-between">
       <div>
         <p class="text-sm text-gray-400">Restart the Access Control service. The page will reload automatically.</p>
@@ -225,9 +264,15 @@
         </button>
       </form>
     </div>
+    {% else %}
+    <p class="text-sm text-gray-500">
+      In-app restart is unavailable in this direct-host deployment. Configure
+      <code>RESTART_COMMAND</code> or restart the service with your process manager.
+    </p>
     {% endif %}
 
     <!-- Scheduled reboot -->
+    {% if restart_available %}
     <form method="post" action="settings/reboot-schedule"
           class="border-t border-gray-800 pt-4 space-y-3">
       <div class="flex items-start justify-between gap-4 flex-wrap">
@@ -276,6 +321,7 @@
         <button type="submit" class="btn-primary text-sm">Save schedule</button>
       </div>
     </form>
+    {% endif %}
   </div>
 
   <!-- Alarm Panels -->

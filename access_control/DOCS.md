@@ -1,193 +1,265 @@
-# Access Control — Documentation
+# Access Control operator guide
 
-Shown to the user in the app's **Documentation** tab inside Supervisor.
+This page is rendered in Home Assistant's app **Documentation** tab. The
+canonical, versioned guide set starts at the
+[documentation index](https://github.com/nstefanelli/hassio-access-control/blob/main/docs/README.md).
 
-## First-time setup
+## First run
 
-After starting the app, click **Access Control** in the HA sidebar (you
-must be an HA admin) or **Open Web UI** on the app page.
+1. Start the app and open **Access Control** from the HA sidebar as an
+   administrator.
+2. Enter the primary UNVR/Protect console and dedicated local account. If
+   Access runs elsewhere, fill all three optional separate Access console
+   fields. The accounts need the capabilities used by your deployment; use the
+   narrowest roles that work.
+3. Leave `use_supervisor_api: true` for the standard deployment. Supervisor
+   supplies the HA URL/token and the form hides long-lived-token fields.
+4. Create a token under **Access → Settings → General → Advanced → API Token**
+   with `view:space` and `edit:space`, and enter it during setup or later under
+   Settings. It enables the official local API's schedule-aware commands and
+   authoritative state readback.
+5. Add HA-external locks on **Locks**, associate each with the correct Access
+   reader/location or Protect doorbell, and verify manual state reads.
+6. Create groups, assign locks and members, then verify schedules/alarm flags
+   before testing credential access.
 
-The setup wizard guides you through:
+The setup endpoint closes permanently after configuration to prevent a second
+caller from taking over or rotating encryption metadata.
 
-1. **UniFi Console host** + a local service account with **Super Admin**
-   on both Access and Protect. See "Connecting to UniFi Access" below.
-2. **(Optional)** Home Assistant URL + long-lived token. By default the
-   app uses the Supervisor proxy (`use_supervisor_api: true`) and you
-   can leave these blank. Only fill them in if you want the app to
-   talk to a different HA instance.
-3. **(Optional)** Split console: Access and Protect running on different
-   UniFi consoles.
+## Single and split UniFi consoles
 
-After setup, visit **Locks** to wire HA `lock.*` entities to physical
-doors / readers.
+By default the primary console supplies both Access and Protect. For a split
+deployment, enter the Protect host in the primary first-run fields and complete
+all three optional Access host/user/password fields. Setup tests both targets
+before saving. Secret metadata and related credential fields are committed as
+one serialized configuration bundle rather than partially.
 
-## Connecting to UniFi Access
+First setup also persists a hash of a stable Access site identifier. The app
+matches that namespace against every stable console/site identifier exposed at
+login and falls back to stable Access-building IDs when required by the UniFi
+firmware. It verifies the binding before publishing every initial, replacement,
+REST-reauthenticated, or WebSocket-reconnected Access session. Settings can
+publish new Access credentials/hosts or change which single/split target
+supplies Access only when the candidate is the same verified site. A different
+Access site requires a fresh initialization so its site-scoped user and door
+IDs cannot inherit existing grants. This is not a TLS certificate pin: UniFi
+TLS peers remain unverified and require a trusted management network.
 
-The app uses a UniFi local service account that has access to **both**
-the Access and Protect applications on your console.
+## Authentication and HA connection
 
-1. In the UniFi Console, open **Settings → Admins & Users → Add Admin**.
-2. Create a local-only user (e.g. `homeassistant`). Grant **Super Admin**
-   on both Access and Protect. Owner is not required for normal
-   operation.
-3. Enter those credentials in the app's Settings page.
+The standard app uses HA Ingress and is restricted to HA administrators. It
+does not expose a host port. State-changing forms use CSRF protection in
+addition to SSO.
 
-> **Note:** Some user-management actions (delete / disable users) require
-> the **Owner** rank that only one admin per console has. The app works
-> around this with app-level "disable" (removes group memberships +
-> disables rules + sets status=`disabled`).
+With `use_supervisor_api: true`, the runtime HA source is
+`http://supervisor/core` plus Supervisor's rotating token. Disable that option
+only to configure a different HA instance with a long-lived token.
 
-## Authentication
+The Access API token is different from this app's own Bearer API keys. It is
+sent only to the selected Access host's official local HTTPS API on port
+`12445`, is encrypted in SQLite, and is never rendered after saving. A custom
+deployment may set `ACCESS_CONTROL_ACCESS_API_TOKEN`; that runtime value takes
+precedence over the encrypted database value. If a configured token is
+invalid, expired, or under-scoped, the operation fails rather than silently
+falling back to the private username/password session path. With no token,
+compatibility mode remains available, but private-API rule/state readback is
+firmware-dependent and cannot give the same assurance after every `reset`.
 
-The app integrates with HA's authentication via **HA Ingress** and
-`auth_api: true`. When you click the sidebar entry:
+## Locks and re-locks
 
-- You're already authenticated by HA — no second password.
-- Your HA admin status is what gates access. Non-admin users hitting the
-  ingress URL get 403 with a clear message.
-- The legacy in-app login is hidden under SSO.
+Access Control supports UniFi-native doors and HA `lock.*` entities. For an HA
+lock, configure a 1–300 second re-lock duration and independently choose:
 
-If you'd like family members to access the dashboard, give them the
-**Administrator** role in HA's user settings.
+- dashboard buzz (timed unlock);
+- re-lock after a matching UniFi remote-unlock event;
+- re-lock after an authorized face/PIN/NFC/fingerprint event.
 
-## Re-lock behavior
+For timed unlocks, the new pending re-lock is persisted and armed **before**
+the physical HA unlock. A failure or timeout is ambiguous, so the earliest of
+the prior and new deadlines remains armed; a sole new intent is never removed.
+Pending rows survive restart, retry after HA recovery, and surface
+`access_control_relock_failed` when immediate retries fail. Manual overrides
+that do not create a new timer similarly preserve the earlier safety timer on
+failure. An accepted manual/retry lock service call is not treated as complete
+until bounded state reads report exactly `locked`; otherwise the durable timer
+remains available for another attempt.
 
-Each lock has three independent re-lock toggles (Locks page):
+Native Access locks absent from a valid non-empty topology snapshot are marked
+upstream-missing and excluded from normal dashboard, authorization, API-count,
+and pairing lookups. Their local row and history remain dormant, and the same
+location revives them automatically if it returns. An empty or malformed
+snapshot cannot mass-retire an existing native-door inventory.
 
-- **Buzz button** — manual UI button; always does timed unlock+relock.
-- **Remote relock** — auto-relock after an unlock via the UniFi mobile
-  app (`remote_through_uah` event).
-- **Device-auth relock** — auto-relock after a successful face / PIN /
-  NFC / fingerprint authentication.
+Native dashboard actions have distinct rule semantics:
 
-All three share a single configurable timer. Pending re-locks are
-persisted to SQLite and re-armed on app restart — a re-lock scheduled
-just before a restart still fires.
+- **Unlock** applies `keep_unlock` and holds the door open persistently;
+- **Lock** applies `lock_now`, terminating the current unlock schedule and any
+  temporary unlock instead of misusing `reset` as a lock command;
+- **Follow Schedule** applies `reset` and returns control to Access-native
+  behavior. If the native schedule is currently active, the confirmed result
+  can be unlocked immediately.
 
-## Hub sync for third-party locks (optional)
+Official-API writes require a strict success response and bounded follow-up
+rule/relay reads. A transport success alone is not logged as a completed door
+state change.
 
-For an HA lock (e.g. Aqara / Z-Wave / Zigbee deadbolt) mounted on a door
-that also has a UniFi Access hub, you can optionally keep the hub and
-door in sync with the lock's state. Enable **Sync Access hub & door to
-this lock's state** in the lock's Settings on the Locks page (off by
-default).
+Application unlocks, re-locks, hub commands, and lockdown changes share a
+physical-command barrier. Once enabling lockdown completes, an application
+unlock that started under the older state cannot issue afterward.
 
-While enabled:
+## Optional bidirectional hub sync
 
-- HA lock reports **unlocked** → the paired hub is held open
-  (`keep_unlock`), so the strike/maglock doesn't fight an open deadbolt.
-- HA lock reports **locked** → the hub is reset to normal locked
-  behaviour.
+For a mapped HA-external lock, **Sync Access hub & door to this lock's state**
+reconciles the HA entity and Access door in both directions. An HA-only change
+is applied to Access; an Access-only rule/relay change—including activation or
+deactivation of an Access unlock schedule—is applied to HA. Newer Access rule
+events wake the reconcile immediately, but are hints only: the app performs
+authenticated readback before acting. The five-second poll is authoritative
+and catches dropped events, firmware without those events, and external drift.
 
-Requirements & behaviour notes:
+Normal opening uses `keep_unlock`; a normal lock uses `lock_now`. Fail-safe
+directions such as lockdown, unreadable state, or an origin conflict use
+`keep_lock` so restoring a native schedule cannot reopen the door during the
+incident. Removing the opt-in or explicitly choosing **Follow Schedule** uses
+`reset` only to return control to Access, never as proof of a lock.
 
-- The lock must be linked to its door via an **Entry Device** — either
-  an *Access NFC Reader* pointing at the door's Access location, or a
-  *Protect Doorbell* (G6 Entry) on that door. Hiding the native hub
-  card from the Locks page doesn't break sync — hiding is cosmetic.
-- Sync is one-way (HA lock → hub) and **converges**: the app polls the
-  lock entity every few seconds and drives the hub to match the lock's
-  *current* state. Enabling the option while the lock is unlocked holds
-  the hub open within a few seconds; a restart re-asserts whatever the
-  lock currently reports. (The hub commands are idempotent state-sets,
-  so re-asserting an already-correct state does nothing physically.)
-- `unavailable` / `unknown` / `jammed` states are ignored, so a brief
-  radio dropout can't trigger a spurious hub change.
-- **Lockdown wins.** While lockdown mode is active the hub is never
-  held open by sync, even if the HA lock reports unlocked — and the
-  door does not pop open when lockdown is lifted. (HA entity state can
-  be written by any HA token or integration; enabling this option
-  extends trust in HA state to physical door position, so lockdown
-  must override it.)
-- **Flap protection.** Hub drives are spaced at least 10 s apart, and a
-  lock that cycles pathologically (8+ drives in 5 minutes — failing
-  hardware or abuse, well past normal use or hand-testing) suspends
-  sync for 10 minutes, fail-safes the hub back to normal locked
-  behaviour, and fires the failure event with `reason: flapping`.
-- **No stranded doors.** Turning the option off, hiding the lock, or
-  deleting it while the hub is held open drives the hub back to reset
-  (retried until it succeeds) instead of leaving the door open.
-- If driving the hub fails, the app retries with backoff until the hub
-  converges and fires an `access_control_hub_sync_failed` HA event
-  (payload includes a `reason` field) so your automations can alert.
-- Successful syncs show up in the hub's lock history as `hub_sync`
-  entries.
+The last fully confirmed HA/Access observation is persisted so a restart can
+distinguish a new change from stale disagreement. On first observation, a
+mismatch resolves locked unless authenticated readback proves that an active
+Access schedule and the relay are both unlocked. Later, an HA-only change wins
+on Access, an Access-only change wins on HA, equal simultaneous changes are
+accepted, and opposing/simultaneous or unreadable changes resolve locked.
+Every commanded side is read back before convergence is persisted.
 
-## Visitors / guests
+Before sending `keep_unlock`, the app durably records which hub it may own.
+Startup, shutdown, HA loss, and lockdown drive the safe locked direction; an
+unconfirmed result remains queued and observable rather than being treated as
+converged. Pairing changes close removed hubs before opening replacements. If
+independent HA entities resolve to one physical hub, every involved pairing is
+locked and suppressed with `reason=shared_hub_conflict` until the mapping is
+one-to-one. Backoff and flap damping bound repeated commands.
 
-The **Visitors** page creates time-windowed visitors via the UniFi
-Visitor API. UniFi enforces the start/end times natively; the app writes
-the PIN (encrypted) so admins can look it up later.
+Complete bidirectional behavior should be operated with the official Access
+API token. Tokenless compatibility mode can parse known private rule shapes,
+but some firmware cannot report an unambiguous physical state after returning
+to native behavior; that limitation is surfaced as an unconfirmed operation.
+This feature makes both HA and Access state part of the physical-door path and
+is off by default.
 
-Names get " - Visitor" appended in UniFi so they're easy to identify in
-the UniFi UI.
+## Groups, alarms, and schedules
 
-## Groups & schedules
+An active group grants all or selected locks. An individual rule is a fallback
+grant when no group covers that lock; it is not a deny override.
 
-Groups carry the access policy. A user can be in 0..N groups. The auth
-engine grants access if **any** active group permits the unlock at the
-event time.
+Group alarm flags can block armed-home/armed-away access or permit auto-disarm.
+Unknown, mixed, triggered, night-armed, pending, and transitional alarm states
+are treated conservatively when armed-state blocks apply.
 
-Per-group settings:
+Schedules use HA's configured timezone and support days-only, time-only,
+combined, and overnight windows. Enabled schedules with no restriction or one
+missing time bound fail closed. For an overnight window, the after-midnight
+portion belongs to the prior selected day.
 
-- `all_locks` vs specific lock assignments
-- `can_disarm` — auto-disarm the alarm if it's armed
-- `blocked_when_armed_away` / `blocked_when_armed_home`
-- `schedule_enabled` + days + start/end time
+## Visitors
 
-**Individual rules** per user / per lock override groups (useful for
-one-off "this user can use this lock only on Tuesdays" cases).
+The Visitors page creates UniFi visitor windows with an optional door, 4–8
+digit PIN, and notes. Times use the HA site timezone; daylight-saving gaps and
+ambiguous repeated-hour values are rejected. The current UI does not reveal a
+submitted PIN later, so retain it securely if the visitor needs it.
 
-## Health & observability
+## Monitoring
 
-- `GET /health/live` — unauthenticated liveness probe (Supervisor probe).
-- `GET /api/health` — Access / Protect / HA connection state, circuit
-  breaker state, last HA error.
-- `GET /api/debug` — closed-connection counts, seconds since last event
-  per client, live vs DB re-lock task divergence.
+- Dashboard home: connection state, alarms, lockdown, recent activity, locks.
+- `GET /health/live`: unauthenticated process liveness only.
+- `GET /api/health`: authenticated Access/Protect/HA/component state.
+- `GET /api/debug`: full-scope reconnect, event-age, circuit, and pending
+  re-lock diagnostics.
+- HA events: `access_control_relock_failed` and
+  `access_control_hub_sync_failed` are alert-worthy.
 
-Both authenticated endpoints require an `Authorization: Bearer <key>`
-header. Generate keys on the Settings page.
+API keys are created under Settings and shown once. The API has monitoring,
+reporting, diagnostics, confirmed lock/unlock/follow-schedule operations, local
+authorization schedule updates, and a full-scope lockdown setter. `locks_only`
+keys never auto-disarm alarm panels, and momentary buzz is intentionally absent.
+Lockdown requires an explicit desired state, such as
+`POST /api/lockdown?enabled=true`, and repeating that request cannot toggle it
+off. A startup read error restores lockdown fail-closed. If persistence or
+physical hub enforcement is incomplete, the setter returns `503` while the
+safer in-memory state remains enabled; `/api/health` exposes unresolved entity
+IDs in `lockdown_enforcement_pending`. See the
+[API contract](https://github.com/nstefanelli/hassio-access-control/blob/main/docs/API.md).
 
-## Backups
+## Restart and updates
 
-`/data/access_control.db` is the sole stateful file. Supervisor backups
-include `/data` automatically. To make an out-of-band copy:
+Use Home Assistant's app page for ordinary restarts. Under Ingress, Settings
+shows that instruction instead of an in-app manual-restart button. The optional
+scheduled restart remains available because it requests restart through
+Supervisor; it runs in HA's site timezone and skips when a door event occurred
+in the previous five minutes. In direct-host mode, the manual control and its
+"Restarting service" reload banner appear only when a restart mechanism is
+available; otherwise Settings explains that restart is unavailable. The
+watchdog's liveness URL checks only the web process, not upstream health.
 
-```bash
-# From HAOS
-cp /usr/share/hassio/addons/data/<slug>_access_control/access_control.db \
-   /backup/access_control-$(date +%F).db
-```
+Before updating, read the
+[changelog](https://github.com/nstefanelli/hassio-access-control/blob/main/access_control/CHANGELOG.md)
+and create a verified backup.
 
-## Troubleshooting
+## Safe backups
 
-**Sidebar entry doesn't appear.** Confirm you're logged in as an HA admin
-— `panel_admin: true` hides the sidebar from non-admins. Also reload the
-HA frontend (Ctrl+F5) after first install.
+Prefer a Home Assistant full/partial backup that includes Access Control. The
+database uses SQLite WAL while running; never `cp` only the live
+`access_control.db` file. Outside Supervisor, either stop the app before
+copying a closed database or use SQLite's online `.backup` command, then run
+`PRAGMA integrity_check` on the copy.
 
-**"Admin access required" 403 page.** You're logged into HA as a
-non-admin user. Give your HA user the **Administrator** role and
-re-load.
+Treat the database and backups as secrets. In environment-key mode, the exact
+`ACCESS_CONTROL_SECRET_KEY` is not stored in the database and must be backed up
+separately. See the full
+[backup and recovery runbook](https://github.com/nstefanelli/hassio-access-control/blob/main/docs/OPERATIONS.md#backup).
 
-**Bookmarks to `http://<ha-host>:8080` stopped working after upgrade.**
-The direct port was removed in v1.1.0. Use the HA sidebar or the app
-page's "Open Web UI" button instead.
+## Common problems
 
-**WebSocket keeps disconnecting.** Usually a UniFi session expiry after a
-UNVR restart. The app handles that — its WS clients log a single
-"session expired" and reconnect. If you see continuous 401s, double-check
-the service-account credentials.
+**Sidebar missing / 403:** the panel is HA-admin-only. Refresh the frontend and
+verify the current HA user has Administrator access.
 
-**HA connection fails on startup.** Check that
-`http://supervisor/core/api/` is reachable from inside the container.
-The app logs the exact failure message and surfaces it on the home page
-status badge.
+**HA disconnected:** in default mode, verify Supervisor is healthy and provides
+its token. In remote mode, replace the configured long-lived token. A partial
+HA environment URL/token pair is invalid.
 
-## Logs
+**Secret key mismatch:** restore the exact environment key used at first setup
+with its matching database. A new key cannot decrypt old values. A database-key
+installation intentionally ignores a key injected later.
 
-- **App logs (uvicorn + app):** Supervisor app log tab.
-- **Access events:** in-app **Activity** page; retained 90 days.
-- **Admin actions:** in-app **Settings** page (audit log). Sessions
-  authenticated via HA SSO show up as `ha:<HA-display-name>` so you can
-  tell them apart from any legacy cookie sessions.
+**Access/Protect 401 loop:** re-enter the correct dedicated local credentials,
+verify application permissions, and check single/split host assignment.
+Repeated WebSocket authentication failures stop rather than replay forever.
+
+**Access API token rejected:** verify TCP `12445` is reachable from the app,
+the token is not expired, and it has `view:space` plus `edit:space`. Saving a
+token performs read-only doors/rule validation. A configured token error never
+falls back to compatibility mode; replace or explicitly clear it. Clearing the
+token removes authoritative official-API confirmation, so re-test native Lock,
+Unlock, Follow Schedule, and every bidirectionally synced pair.
+
+**Access site identity mismatch:** the proposed host authenticated as a
+different Access namespace, or UniFi did not expose enough stable identity data
+to verify the persisted binding. Restore the same site/endpoint or reinitialize
+deliberately with a fresh database for a different site; do not copy the old
+grants into the new namespace. Any TLS certificate fingerprint observed
+internally by the client is diagnostic only and is not the site binding.
+
+**Unexpected denial:** inspect the Activity reason, user status, device mapping,
+group/individual grant, schedule and HA timezone, all alarm block flags, and
+lockdown state. Unknown alarm state and corrupt schedule data fail
+conservatively.
+
+**Hub sync not moving:** confirm the lock is visible, HA-external, opted in,
+mapped to a location with a native hub, and reports exactly `locked` or
+`unlocked`. Confirm the Access API token and port `12445` before relying on
+schedule synchronization. Unknown/unavailable state, Access readback failure,
+HA loss, or simultaneous disagreement resolves locked instead of being
+ignored. Check logs/failure events for
+`no_paired_hub`, `shared_hub_conflict`, backoff, or flapping.
+
+For full recovery steps and a bug-report checklist, use the
+[operations guide](https://github.com/nstefanelli/hassio-access-control/blob/main/docs/OPERATIONS.md).

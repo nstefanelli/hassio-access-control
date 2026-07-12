@@ -1,21 +1,20 @@
-"""
-Hub sync manager — optionally mirrors a third-party HA lock's state onto
-its associated UniFi Access hub/door.
+"""Bidirectional Home Assistant lock ↔ UniFi Access door convergence.
 
-For HA-external locks that opted in via the per-lock ``sync_hub_state``
-setting (off by default), this manager polls the HA lock entity and
-drives the paired native Access hub so the door follows the physical
-lock:
+Opted-in ``ha_external`` locks and their paired native Access doors are
+observed every poll. Authenticated Access schedule/temporary-rule events wake
+the same reconciliation early; event payloads are never accepted as physical
+proof. With rule and relay readback available, a change on either side drives
+the other. Older compatibility clients retain safe HA→Access behavior.
 
-- HA lock ``unlocked`` → hub ``keep_unlock`` (persistent hold-open)
-- HA lock ``locked``   → hub ``reset`` (normal locked behaviour)
+Command semantics are explicit:
 
-Semantics are DESIRED-STATE: the hub converges to the lock's current
-state. Enabling the option (or restarting the add-on) drives the hub to
-match within one poll — "if the lock is unlocked, the hub is unlocked"
-holds from the moment sync is on, not only after the next change. The
-hub calls are idempotent state-sets, so re-asserting an already-correct
-state is harmless.
+- HA-origin unlock → ``keep_unlock`` (persistent app-owned override)
+- HA-origin lock → ``lock_now`` (close now; later schedules remain eligible)
+- lockdown, conflict, or untrusted state → ``keep_lock`` until safe release
+- deliberate opt-out/shutdown → ``reset`` to return native schedule ownership
+
+Startup mismatches and concurrent changes are locked-wins, except for an
+authenticated active Access schedule whose relay is also confirmed unlocked.
 
 Pairing between the HA lock and the hub reuses the existing association
 model, resolved in this order:
@@ -31,41 +30,20 @@ Native locks at those locations provide the hub ``device_id`` to drive —
 including locks the user hid from the dashboard (hiding is cosmetic and
 must not silently break sync).
 
-Safety properties (all verified by tests/test_hub_sync.py):
-
-- One-way HA → hub, so sync cannot feed back into itself.
-- States other than ``locked``/``unlocked`` (``unavailable``,
-  ``unknown``, ``jammed``, …) are never acted on, so a Z-Wave/Zigbee
-  hiccup can't trigger a spurious change.
-- **Lockdown**: while app lockdown is active, the hub is never driven to
-  hold-open — the unlocked state is recorded as applied instead, so the
-  hub stays closed AND the door does not pop open the moment lockdown is
-  lifted. Lock-direction convergence still applies (locking during
-  lockdown is always safe). HA entity state is writable by any HA user
-  token or integration, so without this check a lockdown could be
-  defeated by faking an "unlocked" state write.
-- **Flap protection**: hub drives per entity are spaced at least
-  ``_MIN_APPLY_INTERVAL`` apart (a deferred change still applies once
-  the interval passes — sync converges to the real state). A lock that
-  cycles pathologically (``_FLAP_THRESHOLD`` drives inside
-  ``_FLAP_WINDOW``) suspends sync for that entity for
-  ``_FLAP_SUSPEND`` seconds, fail-safes any held-open hub back to
-  ``reset``, and fires ``access_control_hub_sync_failed`` with
-  ``reason: flapping``. Thresholds are tuned so normal household use —
-  including a person testing the feature by toggling the deadbolt a few
-  times — never trips suspension.
-- **Release on drop**: when a synced lock leaves the opted-in set
-  (option turned off, lock hidden, or lock deleted) while its hub is
-  held open, the hub is driven back to ``reset`` rather than being
-  silently stranded in ``keep_unlock``. Releases retry with backoff
-  until they succeed.
+Persistent ``keep_unlock`` and ``keep_lock`` ownership is written to SQLite,
+including the official Access door id, before the physical command. Recovery
+first closes uncertain doors, then replaces app-owned ``keep_lock`` only after
+readback proves HA and Access are safe. A failed release retains ownership for
+retry, preventing both stranded-open doors and silently suppressed schedules.
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
 import logging
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from .database import Database
 
@@ -94,6 +72,25 @@ _FLAP_WINDOW = 300.0
 _FLAP_THRESHOLD = 8
 _FLAP_SUSPEND = 600.0
 
+_HA_CONFIRM_ATTEMPTS = 3
+_HA_CONFIRM_DELAY = 0.25
+_ACCESS_OBSERVE_ATTEMPTS = 3
+_ACCESS_OBSERVE_DELAY = 0.15
+
+_ACCESS_OPEN_RULES = {"schedule", "keep_unlock", "custom"}
+_ACCESS_CLOSED_RULES = {
+    "keep_lock",
+    "lock_early",
+    "lock_now",
+}
+_ACCESS_NATIVE_RULES = {"reset", "normal", "native"}
+_ACCESS_STATE_EVENTS = {
+    "access.unlock_schedule.activate",
+    "access.unlock_schedule.deactivate",
+    "access.temporary_unlock.start",
+    "access.temporary_unlock.end",
+}
+
 
 class HubSyncManager:
     """
@@ -114,6 +111,7 @@ class HubSyncManager:
         on_hub_state: Optional[Callable[[str, str], None]] = None,
         lockdown_getter: Optional[Callable[[], bool]] = None,
         camera_map_getter: Optional[Callable[[], dict]] = None,
+        command_lock: Optional[asyncio.Lock] = None,
     ) -> None:
         # Clients are fetched lazily via getters — same rationale as
         # RelockManager: credential updates from Settings swap the client
@@ -129,9 +127,23 @@ class HubSyncManager:
         self._on_hub_state = on_hub_state
         self._lockdown_getter = lockdown_getter
         self._get_camera_map = camera_map_getter
+        self._command_lock = command_lock or asyncio.Lock()
+        self._poll_lock = asyncio.Lock()
+        # ``enforce_lockdown`` sets this before waiting for ``_poll_lock``.
+        # A normal pass that already owns the lock observes it between remote
+        # operations and during retry waits, then yields promptly so incident
+        # enforcement is not queued behind minutes of unrelated retries.
+        self._urgent_lockdown = asyncio.Event()
+        self._urgent_lockdown_waiters = 0
         # entity_id → last state the paired hub is known to match. Absent
         # key = not yet converged (fresh enable / restart / post-suspend).
         self._applied: dict[str, str] = {}
+        # Pairing is part of desired state. Remember both its stable device-id
+        # signature and the full rows used for the last successful convergence
+        # so a topology/settings change can reset removed hubs before opening
+        # newly paired ones, even when the HA state itself did not change.
+        self._pairing_signature: dict[str, tuple[str, ...]] = {}
+        self._paired_hubs: dict[str, list[dict]] = {}
         # entity_id → monotonic deadline before which we skip retrying
         self._backoff_until: dict[str, float] = {}
         # entities whose current failing change already fired the
@@ -142,105 +154,558 @@ class HubSyncManager:
         self._last_applied_at: dict[str, float] = {}
         self._apply_times: dict[str, list[float]] = {}
         self._suspended_until: dict[str, float] = {}
-        # entity_id → hub lock rows we currently hold open (keep_unlock).
-        # Used to release hubs when a deleted lock leaves the synced set.
+        # Entities whose paired hub has been explicitly reset during the
+        # current lockdown. This prevents repeated reset traffic on every
+        # poll while still forcing a one-time fail-safe reset when lockdown
+        # begins, including when the hub had previously been held open.
+        self._lockdown_reset: set[str] = set()
+        # entity_id → hub rows under app-owned persistent Access rules. Open
+        # and closed overrides are tracked separately: keep_unlock must first
+        # fail safe to keep_lock after an uncertain restart, while keep_lock
+        # must later be replaced so it cannot suppress future schedules.
         self._held_open: dict[str, list[dict]] = {}
+        self._held_locked: dict[str, list[dict]] = {}
         # entity_id → hubs that still need to be driven back to reset
         # after their lock left the synced set; retried with backoff.
         self._pending_release: dict[str, list[dict]] = {}
         self._release_backoff: dict[str, float] = {}
+        self._recovery_complete = False
+        self._lockdown_unresolved: set[str] = set()
+        self._fail_safe_reset_eids: set[str] = set()
+        # Bidirectional origin tracking. These observations are persisted only
+        # after both sides are confirmed, allowing a restart to distinguish a
+        # new HA-only change from a new Access-only change without confusing an
+        # Access-origin schedule with an app-owned keep-unlock override.
+        self._last_ha_observed: dict[str, str] = {}
+        self._last_access_observed: dict[str, str] = {}
+        self._last_access_rule: dict[str, str] = {}
+        self._last_converged: dict[str, str] = {}
+        self._sync_state_loaded = False
+        # A remote Access unlock is momentary. While its durable HA relock is
+        # live, do not echo HA's temporary unlocked state back as keep_unlock.
+        self._access_momentary_until: dict[str, float] = {}
+        # Event hints reduce latency. They are never trusted as proof of an
+        # unsafe open; reconciliation still performs authenticated readback.
+        self._dirty_locations: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     async def poll_once(self) -> int:
+        """Serialize and execute one desired-state convergence pass."""
+        async with self._poll_lock:
+            return await self._poll_once()
+
+    @property
+    def lockdown_unresolved(self) -> tuple[str, ...]:
+        """Entity ids whose hubs are not yet confirmed reset in lockdown."""
+        return tuple(sorted(self._lockdown_unresolved))
+
+    @staticmethod
+    def is_access_state_event(event_type: str) -> bool:
+        """Return whether an Access event can change a persistent door rule."""
+        return event_type in _ACCESS_STATE_EVENTS
+
+    def mark_access_momentary(self, entity_id: str, duration: float) -> None:
+        """Suppress HA→Access echo for an Access-origin momentary unlock.
+
+        The caller must first persist the matching HA relock. This marker is
+        intentionally in memory: after a crash the durable relock is restored,
+        while startup conflict handling remains locked-wins.
+        """
+        self._access_momentary_until[entity_id] = (
+            time.monotonic() + max(0.0, float(duration))
+        )
+
+    async def reconcile_location(
+        self, location_id: str, event_type: str | None = None
+    ) -> int:
+        """Immediately reconcile a location after an Access rule event.
+
+        Event payloads are only wake-up hints. In particular, an activate/start
+        event cannot unlock HA until the current rule and door state have been
+        read back from the authenticated, site-bound Access client.
+        """
+        if not location_id:
+            return 0
+        if event_type and event_type not in _ACCESS_STATE_EVENTS:
+            return 0
+        if location_id in self._dirty_locations:
+            return 0
+        self._dirty_locations.add(location_id)
+        try:
+            return await self.poll_once()
+        finally:
+            self._dirty_locations.discard(location_id)
+
+    async def recover(self) -> int:
+        """Fail-safe durable persistent-rule ownership after startup.
+
+        This deliberately needs only the Access client.  Persisted rows are
+        merged into the in-memory release queue, then every hub is held locked.
+        A failed or unavailable close leaves both the database row and queue in
+        place for the normal poll loop to retry.  During a persisted lockdown
+        the same pass also closes every currently synced pairing without
+        consulting Home Assistant.
+
+        Returns the number of confirmed close commands.
+        """
+        async with self._poll_lock:
+            await self._load_persisted_sync_state()
+            await self._load_persisted_holds()
+            self._recovery_complete = True
+            lockdown_active = self._in_lockdown()
+            recovered_eids = (
+                set(self._held_open)
+                | set(self._held_locked)
+                | set(self._pending_release)
+            )
+            # An unclean exit left an app-owned open override behind. Closing it
+            # must use persistent keep_lock until HA is trustworthy again; a
+            # plain reset could immediately resume an active unlock schedule.
+            self._fail_safe_reset_eids.update(recovered_eids)
+            if recovered_eids:
+                # Resolve the current pairing too: a topology change may have
+                # added location data or another hub after the durable row was
+                # written. The held+resolved union must all be safe before this
+                # entity is considered reset for the current incident.
+                all_locks = await self._db.get_all_locks(include_hidden=True)
+                for eid in recovered_eids:
+                    await self._queue_release(eid, all_locks)
+            self._release_backoff.clear()
+            reset_count = await self._process_pending_releases(
+                force=True, enforcing_lockdown=lockdown_active
+            )
+            if lockdown_active:
+                for eid in recovered_eids:
+                    if eid not in self._pending_release:
+                        self._lockdown_reset.add(eid)
+                        self._applied[eid] = "unlocked"
+                reset_count += await self._poll_once(enforcing_lockdown=True)
+            return reset_count
+
+    async def shutdown(self) -> int:
+        """Best-effort release of every app-owned rule before shutdown.
+
+        Non-lockdown shutdown restores native schedules. During lockdown it
+        retains keep_lock. Failed commands remain durable for :meth:`recover`.
+        """
+        async with self._poll_lock:
+            await self._load_persisted_sync_state()
+            await self._load_persisted_holds()
+            self._recovery_complete = True
+            try:
+                all_locks = await self._db.get_all_locks(include_hidden=True)
+            except Exception:
+                _LOGGER.exception("Hub sync: lock lookup failed during shutdown")
+                all_locks = None
+            for eid in (
+                set(self._applied)
+                | set(self._held_open)
+                | set(self._held_locked)
+                | set(self._pending_release)
+            ):
+                await self._queue_release(eid, all_locks)
+            self._release_backoff.clear()
+            if not self._in_lockdown():
+                # A graceful, non-incident stop deliberately returns native
+                # schedule ownership instead of carrying keep_lock forward.
+                self._fail_safe_reset_eids.difference_update(
+                    self._pending_release
+                )
+            return await self._process_pending_releases(
+                force=True,
+                enforcing_lockdown=self._in_lockdown(),
+            )
+
+    async def enforce_lockdown(self) -> int:
+        """Immediately fail-safe synced hubs when lockdown is enabled."""
+        self._urgent_lockdown_waiters += 1
+        self._urgent_lockdown.set()
+        try:
+            async with self._poll_lock:
+                # A lockdown callback may run before startup recovery has had an
+                # opportunity to rebuild in-memory ownership.
+                await self._load_persisted_holds()
+                self._recovery_complete = True
+                # A new incident must earn a fresh physical reset even if lockdown
+                # toggled off/on between scheduled polls.
+                self._lockdown_reset.clear()
+                held_eids = list(
+                    set(self._held_open)
+                    | set(self._held_locked)
+                    | set(self._pending_release)
+                )
+                all_locks = await self._db.get_all_locks(include_hidden=True)
+                for eid in held_eids:
+                    await self._queue_release(eid, all_locks=all_locks)
+                reset_count = await self._process_pending_releases(
+                    force=True, enforcing_lockdown=True
+                )
+                for eid in held_eids:
+                    if eid not in self._pending_release:
+                        self._lockdown_reset.add(eid)
+                        self._applied[eid] = "unlocked"
+                # Also reset every opted-in pairing, including after a cold start
+                # where in-memory held-open tracking is empty. HA state is not
+                # needed for the safe (reset) direction.
+                reset_count += await self._poll_once(enforcing_lockdown=True)
+                if self._lockdown_unresolved:
+                    raise RuntimeError(
+                        "Lockdown hub reset remains unresolved for: "
+                        + ", ".join(sorted(self._lockdown_unresolved))
+                    )
+                return reset_count
+        finally:
+            self._urgent_lockdown_waiters -= 1
+            if self._urgent_lockdown_waiters == 0:
+                self._urgent_lockdown.clear()
+
+    async def _poll_once(self, *, enforcing_lockdown: bool = False) -> int:
         """
         One sync pass over all opted-in locks. Returns the number of
         state changes successfully applied to hubs.
         """
-        ha = self._get_ha()
-        if ha is None or not getattr(ha, "connected", False):
+        if self._urgent_lockdown.is_set() and not enforcing_lockdown:
             return 0
+
+        if not self._sync_state_loaded:
+            await self._load_persisted_sync_state()
+
+        # A failed one-shot startup recovery must not permanently lose durable
+        # ownership. Retry the read on every poll until it succeeds; loaded
+        # rows enter the normal pending-release retry path immediately.
+        if not self._recovery_complete:
+            await self._load_persisted_sync_state()
+            await self._load_persisted_holds()
+            self._recovery_complete = True
+            recovered_eids = (
+                set(self._held_open)
+                | set(self._held_locked)
+                | set(self._pending_release)
+            )
+            # This fallback is used when explicit startup recovery was skipped
+            # or interrupted. Never restore a possibly active schedule before
+            # first replacing an untrusted keep_unlock with keep_lock.
+            self._fail_safe_reset_eids.update(recovered_eids)
+            await self._process_pending_releases(
+                force=True, enforcing_lockdown=enforcing_lockdown
+            )
 
         # include_hidden so a just-hidden lock's row is still available
         # for hub resolution when we release its held-open hub below.
         all_locks = await self._db.get_all_locks(include_hidden=True)
-        synced = [
+        synced_rows = [
             lock for lock in all_locks
             if lock.get("type") == "ha_external"
             and lock.get("sync_hub_state")
             and lock.get("entity_id")
             and not lock.get("hidden")
         ]
+        # Multiple legacy rows can name the same HA entity. Treat them as one
+        # desired-state owner whose pairing is the union of every row, so HA is
+        # sampled once and no second row is hidden by the state fast-path.
+        synced = self._group_synced_locks(synced_rows)
         current_eids = {lock["entity_id"] for lock in synced}
+        lifecycle_lockdown = enforcing_lockdown or self._in_lockdown()
 
         # Entities that left the opted-in set (option off / hidden /
         # deleted): release any hub we hold open, then drop tracking so
         # re-enabling later re-converges from scratch.
-        for eid in list(self._applied):
+        for eid in (
+            set(self._applied)
+            | set(self._held_open)
+            | set(self._held_locked)
+            | set(self._pairing_signature)
+            | set(self._paired_hubs)
+            | set(self._last_converged)
+        ):
             if eid not in current_eids:
+                if lifecycle_lockdown:
+                    # Ownership for a removed/disabled pairing remains closed
+                    # for the incident. Releasing or dropping it here could
+                    # resume a schedule during lockdown; the first post-
+                    # lockdown poll performs the deliberate release instead.
+                    continue
                 await self._queue_release(eid, all_locks)
+                await self._clear_persisted_convergence(eid)
                 self._drop_tracking(eid)
         self._failure_notified &= current_eids
 
-        await self._process_pending_releases()
+        await self._process_pending_releases(
+            enforcing_lockdown=enforcing_lockdown
+        )
+
+        if self._urgent_lockdown.is_set() and not enforcing_lockdown:
+            return 0
+
+        # Resolve every logical pairing once per pass. The same snapshot feeds
+        # pairing-change cleanup, shared-hub conflict detection, and actuation;
+        # otherwise a concurrent topology refresh could make those stages
+        # disagree about which physical hub they own.
+        resolved_results = await asyncio.gather(
+            *(self._resolve_hub_locks(lock) for lock in synced),
+            return_exceptions=True,
+        )
+        resolved_by_eid: dict[str, list[dict]] = {}
+        for lock, resolved in zip(synced, resolved_results):
+            eid = lock["entity_id"]
+            if isinstance(resolved, BaseException):
+                _LOGGER.error(
+                    "Hub sync: pairing resolution failed for %s: %s", eid, resolved
+                )
+                if self._held_open.get(eid) or self._held_locked.get(eid):
+                    await self._queue_release(eid, all_locks=None)
+                continue
+            resolved_by_eid[eid] = resolved
+            self._prepare_pairing_change(eid, resolved)
+
+        # A removed pairing must be reset before a newly paired hub can be
+        # held open. Failures stay in ``_pending_release`` and the unsafe
+        # direction below is suppressed until a later retry succeeds.
+        await self._process_pending_releases(
+            enforcing_lockdown=enforcing_lockdown
+        )
+
+        if self._urgent_lockdown.is_set() and not enforcing_lockdown:
+            return 0
+
+        lockdown_active = lifecycle_lockdown
+        if not lockdown_active:
+            # Lockdown uses persistent keep_lock so a schedule cannot reopen the
+            # door during an incident. Retain a release marker after the mode is
+            # lifted; normal reconciliation first confirms both sides locked,
+            # then replaces keep_lock with schedule-aware lock_now. That leaves
+            # this interval closed while allowing future schedules to run.
+            self._fail_safe_reset_eids.update(self._lockdown_reset)
+            self._lockdown_reset.clear()
+
+        # During lockdown, continuously verify the authenticated Access
+        # rule/relay and HA state. A direct HA command or Access schedule event
+        # can occur after initial enforcement; a one-shot marker must never
+        # become a bypass. Unreadable state is reasserted fail-closed.
+        if lockdown_active:
+            applied_count = 0
+            for lock in synced:
+                eid = lock["entity_id"]
+                hubs = resolved_by_eid.get(eid)
+                if hubs is None:
+                    continue
+                if (
+                    eid in self._lockdown_reset
+                    and await self._lockdown_pair_confirmed(lock, hubs)
+                ):
+                    continue
+                self._lockdown_reset.discard(eid)
+                _LOGGER.warning(
+                    "Hub sync: LOCKDOWN forcing paired hub(s) for %s closed",
+                    lock.get("name", eid),
+                )
+                access_safe = await self._apply_state(
+                    lock,
+                    "locked",
+                    hubs=hubs,
+                    enforcing_lockdown=True,
+                    fail_safe=True,
+                )
+                ha_safe = True
+                ha = self._get_ha()
+                if self._method(ha, "lock") is not None:
+                    ha_safe = await self._drive_ha_state(
+                        lock, "locked", fail_safe=True
+                    )
+                if access_safe and ha_safe:
+                    self._lockdown_reset.add(eid)
+                    # Conservative observed baseline: after lockdown lifts, an
+                    # HA entity still reporting unlocked must not reopen the
+                    # hub. A later locked observation re-arms normal following.
+                    self._applied[eid] = "unlocked"
+                    self._backoff_until.pop(eid, None)
+                    self._failure_notified.discard(eid)
+                    applied_count += 1
+            self._lockdown_unresolved = (
+                current_eids.difference(self._lockdown_reset)
+                | set(self._pending_release)
+            )
+            return applied_count
+        self._lockdown_unresolved.clear()
+
+        conflict_eids = await self._fail_safe_shared_hub_owners(
+            synced, resolved_by_eid=resolved_by_eid
+        )
+        if self._urgent_lockdown.is_set() and not enforcing_lockdown:
+            return 0
+        if conflict_eids:
+            # A hub with multiple independent desired-state owners is
+            # ambiguous. Never follow any of them open; keep retrying reset
+            # until the configuration is made one-to-one.
+            synced = [
+                lock for lock in synced
+                if lock["entity_id"] not in conflict_eids
+            ]
+
+        # Drop detection/releases above need only Access and must run while HA
+        # is offline. Live desired-state convergence below does require HA.
+        ha = self._get_ha()
+        if ha is None or not getattr(ha, "connected", False):
+            # A persistent hold-open is a lease on HA's desired state. Once HA
+            # is unavailable, that lease has no trustworthy owner: reset every
+            # hub we may hold instead of leaving a door open indefinitely.
+            access_for_fail_safe = self._get_access()
+            bidirectional_fail_safe = self._supports_bidirectional_access(
+                access_for_fail_safe
+            )
+            for lock in synced:
+                eid = lock["entity_id"]
+                if bidirectional_fail_safe:
+                    self._fail_safe_reset_eids.add(eid)
+                    hubs = resolved_by_eid.get(eid)
+                    if hubs is not None:
+                        await self._apply_state(
+                            lock, "locked", hubs=hubs, fail_safe=True
+                        )
+                elif (
+                    self._held_open.get(eid)
+                    or self._applied.get(eid) == "unlocked"
+                ):
+                    self._fail_safe_reset_eids.add(eid)
+                    await self._queue_release(eid, all_locks, lock)
+            await self._process_pending_releases(
+                force=True, enforcing_lockdown=enforcing_lockdown
+            )
+            return 0
+
+        poll_time = time.monotonic()
+        # Always observe HA state. Backoff, flap suspension, and damping are
+        # protections against repeated unsafe hold-open commands; they must
+        # never delay a safe reset after an ambiguous/partial apply.
+        candidates = list(synced)
+        fetched_states = await asyncio.gather(
+            *(ha.get_entity_state(lock["entity_id"]) for lock in candidates),
+            return_exceptions=True,
+        )
+        access = self._get_access()
+        bidirectional = self._supports_bidirectional_access(access)
+        if bidirectional:
+            fetched_access = await asyncio.gather(
+                *(
+                    self._observe_access_side(
+                        access,
+                        resolved_by_eid.get(lock["entity_id"], []),
+                        entity_id=lock["entity_id"],
+                    )
+                    for lock in candidates
+                ),
+                return_exceptions=True,
+            )
+        else:
+            fetched_access = [None] * len(candidates)
+
+        if self._urgent_lockdown.is_set() and not enforcing_lockdown:
+            return 0
 
         applied_count = 0
-        for lock in synced:
+        for lock, state, access_observation in zip(
+            candidates, fetched_states, fetched_access
+        ):
             eid = lock["entity_id"]
+            if self._urgent_lockdown.is_set() and not enforcing_lockdown:
+                return applied_count
             now = time.monotonic()
-            if self._suspended_until.get(eid, 0.0) > now:
+            if bidirectional:
+                hubs = resolved_by_eid.get(eid, [])
+                if isinstance(access_observation, BaseException):
+                    _LOGGER.error(
+                        "Hub sync: Access observation raised for %s: %s",
+                        eid,
+                        access_observation,
+                    )
+                    access_state, access_rule, schedule_active = (
+                        None,
+                        f"error:{type(access_observation).__name__}",
+                        False,
+                    )
+                else:
+                    access_state, access_rule, schedule_active = access_observation
+                safe_ha_state = None if isinstance(state, BaseException) else state
+                applied_count += await self._reconcile_bidirectional(
+                    lock,
+                    safe_ha_state,
+                    access_state,
+                    access_rule,
+                    schedule_active,
+                    hubs,
+                )
                 continue
-            if self._backoff_until.get(eid, 0.0) > now:
-                continue
-
-            try:
-                state = await ha.get_entity_state(eid)
-            except Exception:
-                _LOGGER.exception("Hub sync: state fetch raised for %s", eid)
+            if isinstance(state, BaseException):
+                _LOGGER.error(
+                    "Hub sync: state fetch raised for %s: %s", eid, state
+                )
+                if self._held_open.get(eid) or self._applied.get(eid) == "unlocked":
+                    self._fail_safe_reset_eids.add(eid)
+                    await self._queue_release(eid, all_locks, lock)
                 continue
             if state not in ("locked", "unlocked"):
+                if self._held_open.get(eid) or self._applied.get(eid) == "unlocked":
+                    _LOGGER.warning(
+                        "Hub sync: HA state %r for %s is not trustworthy; "
+                        "resetting owned hold(s)",
+                        state,
+                        eid,
+                    )
+                    self._fail_safe_reset_eids.add(eid)
+                    await self._queue_release(eid, all_locks, lock)
                 continue
 
             prev = self._applied.get(eid)
-            if state == prev:
+            needs_safe_reset = bool(
+                state == "locked"
+                and (
+                    self._held_open.get(eid)
+                    or self._held_locked.get(eid)
+                    or eid in self._fail_safe_reset_eids
+                )
+            )
+
+            if state == prev and not needs_safe_reset:
                 # Converged. Any failing change self-reverted — clear the
                 # notify flag so the NEXT failure alerts again.
                 self._failure_notified.discard(eid)
                 continue
 
-            # Flap damping: space hub drives out. Deferring keeps the old
-            # applied state, so convergence happens after the interval if
-            # the states still differ.
-            if now - self._last_applied_at.get(eid, 0.0) < _MIN_APPLY_INTERVAL:
-                _LOGGER.debug(
-                    "Hub sync: change for %s deferred (min interval)", eid
-                )
-                continue
+            if state == "unlocked":
+                # A pending safe release owns this entity; never reopen until
+                # that reset is confirmed. Backoff/suspension/damping apply
+                # only to the unsafe direction.
+                if eid in self._pending_release:
+                    continue
+                if self._suspended_until.get(eid, 0.0) > poll_time:
+                    continue
+                if self._backoff_until.get(eid, 0.0) > poll_time:
+                    continue
+                last_applied_at = self._last_applied_at.get(eid)
+                if (
+                    last_applied_at is not None
+                    and now - last_applied_at < _MIN_APPLY_INTERVAL
+                ):
+                    _LOGGER.debug(
+                        "Hub sync: hold-open for %s deferred (min interval)", eid
+                    )
+                    continue
 
-            # Flap suspension: an entity that keeps earning drives is
-            # cycling abnormally — stop following it.
-            recent = [
-                t for t in self._apply_times.get(eid, ())
-                if now - t <= _FLAP_WINDOW
-            ]
-            self._apply_times[eid] = recent
-            if len(recent) >= _FLAP_THRESHOLD:
-                await self._suspend_flapping(lock)
-                continue
+                recent = [
+                    t for t in self._apply_times.get(eid, ())
+                    if now - t <= _FLAP_WINDOW
+                ]
+                self._apply_times[eid] = recent
+                if len(recent) >= _FLAP_THRESHOLD:
+                    await self._suspend_flapping(lock)
+                    continue
 
-            # Lockdown: never hold a hub open off an HA state write while
-            # lockdown is active. Record the state as applied instead of
-            # deferring, so the door also doesn't pop open when lockdown
-            # lifts. Lock-direction convergence is always allowed.
-            if state == "unlocked" and self._in_lockdown():
-                _LOGGER.warning(
-                    "Hub sync: %s reported unlocked during LOCKDOWN — "
-                    "hub stays closed",
-                    lock.get("name", eid),
-                )
-                self._applied[eid] = state
+            hubs = resolved_by_eid.get(eid)
+            if hubs is None:
+                self._backoff_until[eid] = time.monotonic() + _FAILURE_BACKOFF
                 continue
 
             if prev is None:
@@ -253,8 +718,15 @@ class HubSyncManager:
                     "Hub sync: %s changed %s → %s — syncing paired hub(s)",
                     lock.get("name", eid), prev, state,
                 )
-            if await self._apply_state(lock, state):
+            if await self._apply_state(
+                lock,
+                state,
+                hubs=hubs,
+                enforcing_lockdown=enforcing_lockdown,
+            ):
                 self._applied[eid] = state
+                if state == "locked":
+                    self._fail_safe_reset_eids.discard(eid)
                 self._backoff_until.pop(eid, None)
                 self._failure_notified.discard(eid)
                 applied_count += 1
@@ -263,11 +735,144 @@ class HubSyncManager:
                 # after the backoff — the hub must converge.
                 self._backoff_until[eid] = time.monotonic() + _FAILURE_BACKOFF
 
+        # Invalid/unknown states above may have queued fail-safe resets.
+        await self._process_pending_releases(
+            force=True, enforcing_lockdown=enforcing_lockdown
+        )
+
         return applied_count
 
     # ------------------------------------------------------------------
     # Internal — state application
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _method(obj: Any, name: str) -> Any:
+        """Return a real/explicit method without MagicMock auto-children.
+
+        The production client exposes bound coroutine methods. Older unit
+        fixtures use an unspecced MagicMock, where plain getattr fabricates a
+        callable for every name; treating those as capabilities would silently
+        enable bidirectional behavior in legacy tests and deployments using an
+        older injected client.
+        """
+        if obj is None:
+            return None
+        explicit = vars(obj).get(name)
+        if explicit is not None:
+            return explicit
+        class_attr = getattr(type(obj), name, None)
+        if class_attr is None:
+            return None
+        method = getattr(obj, name, None)
+        if inspect.iscoroutinefunction(class_attr) or callable(method):
+            return method
+        return None
+
+    def _supports_bidirectional_access(self, access: Any) -> bool:
+        return bool(
+            self._method(access, "get_lock_rule")
+            and self._method(access, "get_door_state")
+        )
+
+    @staticmethod
+    def _access_available(access: Any) -> bool:
+        if access is None:
+            return False
+        connected = bool(vars(access).get("connected", False))
+        if isinstance(getattr(type(access), "connected", None), property):
+            connected = bool(access.connected)
+        open_api = bool(vars(access).get("open_api_configured", False))
+        if isinstance(
+            getattr(type(access), "open_api_configured", None), property
+        ):
+            open_api = bool(access.open_api_configured)
+        return connected or open_api
+
+    @staticmethod
+    def _group_synced_locks(locks: list[dict]) -> list[dict]:
+        """Collapse duplicate HA entity rows into one logical sync owner."""
+        grouped: dict[str, dict] = {}
+        for lock in locks:
+            eid = lock["entity_id"]
+            logical = grouped.get(eid)
+            if logical is None:
+                logical = dict(lock)
+                logical["_sync_rows"] = [lock]
+                grouped[eid] = logical
+            else:
+                logical["_sync_rows"].append(lock)
+        return list(grouped.values())
+
+    @staticmethod
+    def _hub_signature(hubs: list[dict]) -> tuple[str, ...]:
+        """Return a stable physical-device signature for a resolved pairing."""
+        return tuple(sorted({
+            str(hub["device_id"])
+            for hub in hubs
+            if hub.get("device_id")
+        }))
+
+    def _prepare_pairing_change(self, eid: str, current_hubs: list[dict]) -> None:
+        """Queue removed hubs for reset and invalidate stale convergence.
+
+        Unsafe ownership is already durable in ``hub_sync_holds``. This method
+        only moves the matching in-memory rows into the release queue; the row
+        is cleared later, and only after Access confirms the reset command.
+        """
+        current_signature = self._hub_signature(current_hubs)
+        previous_signature = self._pairing_signature.get(eid)
+
+        known_hubs: list[dict] = []
+        self._append_unique_hubs(known_hubs, self._paired_hubs.get(eid, []))
+        self._append_unique_hubs(known_hubs, self._held_open.get(eid, []))
+        self._append_unique_hubs(known_hubs, self._held_locked.get(eid, []))
+        # Durable owned rows may include a hub removed after the last confirmed
+        # pairing. Keep that device in the stale set until its override is
+        # explicitly released; the prior signature alone is not exhaustive.
+        known_signature = tuple(sorted(
+            set(previous_signature or ())
+            | set(self._hub_signature(known_hubs))
+        ))
+        changed = (
+            previous_signature is not None
+            and previous_signature != current_signature
+        )
+        stale_ids = set(known_signature).difference(current_signature)
+        if not changed and not stale_ids:
+            return
+
+        _LOGGER.warning(
+            "Hub sync pairing changed for %s: %s → %s; resetting removed hubs",
+            eid,
+            known_signature,
+            current_signature,
+        )
+        stale_hubs = [
+            hub for hub in known_hubs
+            if str(hub.get("device_id")) in stale_ids
+        ]
+        if stale_hubs:
+            pending = self._pending_release.setdefault(eid, [])
+            self._append_unique_hubs(pending, stale_hubs)
+            self._release_backoff.pop(eid, None)
+
+        # Even an expansion with no removed hubs must re-converge so the newly
+        # paired device receives the current desired state.
+        self._applied.pop(eid, None)
+        self._pairing_signature.pop(eid, None)
+        self._paired_hubs.pop(eid, None)
+        self._backoff_until.pop(eid, None)
+        self._last_applied_at.pop(eid, None)
+        self._failure_notified.discard(eid)
+        self._last_ha_observed.pop(eid, None)
+        self._last_access_observed.pop(eid, None)
+        self._last_access_rule.pop(eid, None)
+        self._last_converged.pop(eid, None)
+        # A pairing update during an active incident must earn a reset for the
+        # newly resolved hubs; the old one-time lockdown acknowledgement only
+        # covered the previous physical set.
+        self._lockdown_reset.discard(eid)
 
     def _in_lockdown(self) -> bool:
         if self._lockdown_getter is None:
@@ -277,45 +882,720 @@ class HubSyncManager:
         except Exception:
             # Fail closed: if lockdown state can't be read, behave as if
             # lockdown is active — suppressing a hold-open is the safe
-            # direction for a physical door.
             _LOGGER.exception("Hub sync: lockdown getter raised — failing closed")
             return True
 
-    async def _apply_state(self, lock: dict, state: str) -> bool:
+    async def _fail_safe_shared_hub_owners(
+        self,
+        synced: list[dict],
+        *,
+        resolved_by_eid: Optional[dict[str, list[dict]]] = None,
+        enforcing_lockdown: bool = False,
+    ) -> set[str]:
+        """Reset and suppress entities that resolve to a shared Access hub."""
+        if resolved_by_eid is None:
+            resolved_results = await asyncio.gather(
+                *(self._resolve_hub_locks(lock) for lock in synced),
+                return_exceptions=True,
+            )
+            resolved_by_eid = {}
+            for lock, resolved in zip(synced, resolved_results):
+                if isinstance(resolved, BaseException):
+                    _LOGGER.error(
+                        "Hub sync: conflict resolution failed for %s: %s",
+                        lock.get("entity_id"),
+                        resolved,
+                    )
+                    continue
+                resolved_by_eid[lock["entity_id"]] = resolved
+
+        by_eid: dict[str, list[dict]] = {}
+        owners: dict[str, set[str]] = {}
+        for lock in synced:
+            eid = lock["entity_id"]
+            resolved = resolved_by_eid.get(eid)
+            if resolved is None:
+                continue
+            by_eid[eid] = resolved
+            for hub in resolved:
+                owners.setdefault(hub["device_id"], set()).add(eid)
+
+        conflict_devices = {
+            device_id for device_id, eids in owners.items() if len(eids) > 1
+        }
+        conflict_eids = {
+            eid
+            for device_id in conflict_devices
+            for eid in owners[device_id]
+        }
+        if not conflict_eids:
+            return set()
+
+        reset_hubs: dict[str, dict] = {}
+        for eid in conflict_eids:
+            for hub in by_eid.get(eid, []):
+                reset_hubs[hub["device_id"]] = hub
+
+        for hub in reset_hubs.values():
+            if self._urgent_lockdown.is_set() and not enforcing_lockdown:
+                return set()
+            device_id = hub["device_id"]
+            hub_name = hub.get("name", device_id)
+            hub_owners = [
+                eid
+                for eid in conflict_eids
+                if any(
+                    item.get("device_id") == device_id
+                    for item in by_eid.get(eid, [])
+                )
+            ]
+            ownership_recorded = True
+            for eid in hub_owners:
+                self._fail_safe_reset_eids.add(eid)
+                try:
+                    await self._record_hub_state(
+                        eid,
+                        hub,
+                        "locked",
+                        persistent_lock=True,
+                    )
+                except Exception:
+                    ownership_recorded = False
+                    _LOGGER.exception(
+                        "Could not persist shared-hub keep_lock ownership for %s",
+                        hub_name,
+                    )
+            drove = await self._drive_hub(
+                device_id,
+                "locked",
+                hub_name,
+                location_id=hub.get("location_id"),
+                enforcing_lockdown=enforcing_lockdown,
+                fail_safe=ownership_recorded,
+                force_transient=not ownership_recorded,
+            )
+            if not drove:
+                _LOGGER.error("Could not fail-safe shared Access hub %s", hub_name)
+
+        for eid in conflict_eids:
+            if self._urgent_lockdown.is_set() and not enforcing_lockdown:
+                return set()
+            conflict_lock = next(
+                (row for row in synced if row["entity_id"] == eid),
+                None,
+            )
+            if (
+                conflict_lock is not None
+                and self._supports_bidirectional_access(self._get_access())
+            ):
+                await self._drive_ha_state(
+                    conflict_lock, "locked", fail_safe=True
+                )
+            self._applied[eid] = "unlocked"
+            if eid not in self._failure_notified:
+                self._failure_notified.add(eid)
+                lock = conflict_lock or {"name": eid}
+                await self._notify_sync_failed(
+                    eid,
+                    lock.get("name", eid),
+                    reason="shared_hub_conflict",
+                )
+        _LOGGER.error(
+            "Hub sync suppressed %d entity(s): multiple HA locks resolve to "
+            "the same Access hub",
+            len(conflict_eids),
+        )
+        return conflict_eids
+
+    async def _lockdown_pair_confirmed(
+        self,
+        lock: dict,
+        hubs: list[dict],
+    ) -> bool:
+        """Re-read both sides before honoring a lockdown-safe marker."""
+        access = self._get_access()
+        if not self._supports_bidirectional_access(access):
+            # Compatibility mode cannot prove a schedule or temporary rule did
+            # not reopen the door, so periodically reassert keep_lock.
+            return False
+        observations = await asyncio.gather(
+            *(self._observe_access_hub(access, hub) for hub in hubs),
+            return_exceptions=True,
+        )
+        access_safe = all(
+            not isinstance(item, BaseException)
+            and item[0] == "locked"
+            and item[1].get("type") == "keep_lock"
+            for item in observations
+        )
+        if not access_safe:
+            return False
+
+        ha = self._get_ha()
+        if (
+            ha is None
+            or not getattr(ha, "connected", False)
+            or self._method(ha, "lock") is None
+        ):
+            # Access is the fail-safe physical boundary during HA outages and
+            # for legacy test/compatibility clients without command methods.
+            return True
+        try:
+            return await ha.get_entity_state(lock["entity_id"]) == "locked"
+        except Exception:
+            return False
+
+    async def _observe_access_hub(
+        self, access: Any, hub: dict
+    ) -> tuple[str | None, dict, bool]:
+        """Return effective state, normalized rule, and active-schedule flag."""
+        get_rule = self._method(access, "get_lock_rule")
+        get_state = self._method(access, "get_door_state")
+        if get_rule is None or get_state is None:
+            raise RuntimeError("Access client lacks lock-rule readback")
+        device_id = hub["device_id"]
+        location_id = hub.get("location_id")
+        for attempt in range(_ACCESS_OBSERVE_ATTEMPTS):
+            rule_result, door_state = await asyncio.gather(
+                get_rule(device_id, location_id=location_id),
+                get_state(device_id, location_id=location_id),
+            )
+            if not isinstance(rule_result, dict):
+                raise ValueError("Access lock-rule response is not an object")
+            rule_type = str(rule_result.get("type") or "").strip().lower()
+            if rule_type not in (
+                _ACCESS_OPEN_RULES | _ACCESS_CLOSED_RULES | _ACCESS_NATIVE_RULES
+            ):
+                raise ValueError(f"unknown Access lock-rule type {rule_type!r}")
+            if door_state not in {"locked", "unlocked"}:
+                raise ValueError(f"unknown Access door state {door_state!r}")
+            # Access can publish its new schedule/hold rule just before the
+            # relay catches up. Give that normal transition a bounded chance
+            # to settle before classifying it as inconsistent.
+            if (
+                rule_type in _ACCESS_OPEN_RULES
+                and door_state == "locked"
+                and attempt + 1 < _ACCESS_OBSERVE_ATTEMPTS
+            ):
+                await asyncio.sleep(_ACCESS_OBSERVE_DELAY)
+                continue
+            break
+
+        if rule_type in _ACCESS_OPEN_RULES:
+            if door_state == "unlocked":
+                effective = "unlocked"
+            elif rule_type == "schedule":
+                # First-person-in and freshly activating schedules can validly
+                # report schedule+locked. Preserve the schedule and mirror the
+                # conservative relay state instead of replacing it with
+                # keep_lock.
+                effective = "locked"
+            else:
+                effective = None
+        elif rule_type in _ACCESS_CLOSED_RULES:
+            # A credential buzz can briefly open the relay while persistent
+            # intent remains closed. Never turn that pulse into HA unlock.
+            effective = "locked"
+        elif rule_type in _ACCESS_NATIVE_RULES:
+            # The relay can briefly report unlocked for an ordinary credential
+            # buzz while the persistent rule remains native/reset. That is not
+            # a schedule/override intent and must not become an HA keep-open.
+            # Access reports `schedule` when a persistent schedule is active.
+            effective = "locked"
+        else:  # pragma: no cover - exhaustive sets above
+            effective = None
+        return (
+            effective,
+            dict(rule_result),
+            rule_type == "schedule",
+        )
+
+    async def _observe_access_side(
+        self,
+        access: Any,
+        hubs: list[dict],
+        *,
+        entity_id: str,
+    ) -> tuple[str | None, str, bool]:
+        """Observe all hubs as one logical Access side.
+
+        Multi-hub disagreement or one malformed/unreadable row is ambiguous
+        and therefore returns no state. The caller's locked-wins path handles
+        the fail-safe action.
+        """
+        if not hubs:
+            return None, "no-hubs", False
+        if not self._access_available(access):
+            return None, "disconnected", False
+        results = await asyncio.gather(
+            *(self._observe_access_hub(access, hub) for hub in hubs),
+            return_exceptions=True,
+        )
+        states: list[str] = []
+        fingerprint_rows: list[dict] = []
+        schedules: list[bool] = []
+        invalid = False
+        ownership_superseded = False
+        for hub, result in zip(hubs, results):
+            if isinstance(result, BaseException):
+                invalid = True
+                fingerprint_rows.append(
+                    {
+                        "device_id": hub.get("device_id"),
+                        "error": type(result).__name__,
+                    }
+                )
+                _LOGGER.warning(
+                    "Hub sync: Access readback failed for %s: %s",
+                    hub.get("name", hub.get("device_id")),
+                    result,
+                )
+                continue
+            state, rule, schedule_active = result
+            rule_type = str(rule.get("type") or "")
+            device_id = hub.get("device_id")
+            owns_open = any(
+                item.get("device_id") == device_id
+                for item in self._held_open.get(entity_id, [])
+            )
+            owns_locked = any(
+                item.get("device_id") == device_id
+                for item in self._held_locked.get(entity_id, [])
+            )
+            if (
+                (owns_open and rule_type != "keep_unlock")
+                or (owns_locked and rule_type != "keep_lock")
+            ):
+                # An authenticated Access/UI action replaced our persistent
+                # rule. Clear only the ownership proven superseded; otherwise a
+                # later restart would incorrectly reassert the old override.
+                try:
+                    await self._record_hub_state(entity_id, hub, "locked")
+                    ownership_superseded = True
+                except Exception as exc:
+                    invalid = True
+                    _LOGGER.warning(
+                        "Hub sync: could not clear superseded override for %s: %s",
+                        hub.get("name", device_id),
+                        exc,
+                    )
+            fingerprint_rows.append(
+                {"device_id": hub.get("device_id"), "rule": rule, "state": state}
+            )
+            if state is None:
+                invalid = True
+            else:
+                states.append(state)
+            schedules.append(schedule_active)
+        if (
+            ownership_superseded
+            and not self._held_open.get(entity_id)
+            and not self._held_locked.get(entity_id)
+        ):
+            self._fail_safe_reset_eids.discard(entity_id)
+        fingerprint = json.dumps(
+            sorted(fingerprint_rows, key=lambda row: str(row.get("device_id"))),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if invalid or len(states) != len(hubs) or len(set(states)) != 1:
+            return None, fingerprint, False
+        return states[0], fingerprint, bool(schedules and all(schedules))
+
+    async def _drive_ha_state(
+        self, lock: dict, state: str, *, fail_safe: bool = False
+    ) -> bool:
+        """Command and confirm one HA lock without holding the barrier on reads."""
+        eid = lock["entity_id"]
+        lock_name = lock.get("name", eid)
+        accepted = False
+        ha = None
+        try:
+            async with self._command_lock:
+                ha = self._get_ha()
+                if ha is None or not getattr(ha, "connected", False):
+                    return False
+                if state == "unlocked" and self._in_lockdown():
+                    return False
+                command = ha.unlock if state == "unlocked" else ha.lock
+                accepted = bool(await command(eid))
+            if not accepted:
+                return False
+            for attempt in range(_HA_CONFIRM_ATTEMPTS):
+                if await ha.get_entity_state(eid) == state:
+                    return True
+                if attempt < _HA_CONFIRM_ATTEMPTS - 1:
+                    await asyncio.sleep(_HA_CONFIRM_DELAY)
+        except Exception:
+            _LOGGER.exception(
+                "Hub sync: HA command/confirmation failed for %s (→ %s)",
+                lock_name,
+                state,
+            )
+        if accepted:
+            _LOGGER.error(
+                "Hub sync: HA accepted %s for %s but state was not confirmed",
+                state,
+                lock_name,
+            )
+        if fail_safe:
+            await self._notify_sync_failed(eid, lock_name, reason="ha_lock_unconfirmed")
+        return False
+
+    async def _reconcile_bidirectional(
+        self,
+        lock: dict,
+        ha_state: Any,
+        access_state: str | None,
+        access_rule: str,
+        schedule_active: bool,
+        hubs: list[dict],
+    ) -> int:
+        """Reconcile one logical pair using source-change detection."""
+        eid = lock["entity_id"]
+        valid_ha = ha_state in {"locked", "unlocked"}
+        valid_access = access_state in {"locked", "unlocked"}
+        now = time.monotonic()
+
+        momentary_until = self._access_momentary_until.get(eid, 0.0)
+        if momentary_until:
+            if ha_state == "locked":
+                self._access_momentary_until.pop(eid, None)
+            elif now < momentary_until and ha_state == "unlocked":
+                # The Access event already opened the native door. A durable
+                # RelockManager intent owns HA's temporary divergence; writing
+                # keep_unlock here would turn it into a persistent override.
+                self._last_ha_observed[eid] = "unlocked"
+                if valid_access:
+                    self._last_access_observed[eid] = access_state
+                    self._last_access_rule[eid] = access_rule
+                return 0
+            elif now >= momentary_until:
+                self._access_momentary_until.pop(eid, None)
+                valid_ha = False  # expired lease falls into locked-wins
+
+        previous_ha = self._last_ha_observed.get(eid)
+        previous_access = self._last_access_observed.get(eid)
+        previous_rule = self._last_access_rule.get(eid)
+        fresh = previous_ha is None or previous_access is None
+
+        if not valid_ha or not valid_access:
+            desired = "locked"
+            source = "untrusted_state"
+            fail_safe = True
+        elif ha_state == access_state:
+            desired = ha_state
+            source = "already_converged"
+            fail_safe = False
+        elif fresh:
+            # On an unbaselined mismatch, opening either side is unsafe. The
+            # sole exception is an authenticated readback of an active Access
+            # schedule whose physical door state is also unlocked.
+            if schedule_active and access_state == "unlocked":
+                desired = "unlocked"
+                source = "access_schedule_startup"
+                fail_safe = False
+            elif schedule_active and access_state == "locked":
+                # A first-person-in or relay-transition schedule is valid
+                # Access-owned intent even while physically closed. Mirror the
+                # conservative state without replacing the schedule rule.
+                desired = "locked"
+                source = "access_schedule_startup_closed"
+                fail_safe = False
+            else:
+                desired = "locked"
+                source = "startup_conflict"
+                fail_safe = True
+        else:
+            ha_changed = ha_state != previous_ha
+            access_changed = (
+                access_state != previous_access or access_rule != previous_rule
+            )
+            if ha_changed and not access_changed:
+                desired = ha_state
+                source = "ha"
+                fail_safe = False
+            elif access_changed and not ha_changed:
+                desired = access_state
+                source = "access"
+                fail_safe = False
+            elif ha_changed and access_changed and ha_state == access_state:
+                desired = ha_state
+                source = "both_same"
+                fail_safe = False
+            else:
+                desired = "locked"
+                source = "concurrent_conflict"
+                fail_safe = True
+
+        if fail_safe:
+            # Do not reinterpret the first good read after an outage/malformed
+            # sample as a fresh Access-origin request to open. The incident is
+            # unresolved until both sides have actually confirmed locked.
+            self._fail_safe_reset_eids.add(eid)
+        if eid in self._fail_safe_reset_eids:
+            desired = "locked"
+            fail_safe = True
+
+        changed = False
+        if ha_state != desired:
+            if not await self._drive_ha_state(
+                lock, desired, fail_safe=fail_safe or desired == "locked"
+            ):
+                self._last_ha_observed[eid] = (
+                    ha_state if valid_ha else "locked"
+                )
+                self._last_access_observed[eid] = (
+                    access_state if valid_access else "locked"
+                )
+                self._last_access_rule[eid] = access_rule
+                return 0
+            ha_state = desired
+            changed = True
+
+        release_fail_safe_override = bool(
+            eid in self._fail_safe_reset_eids
+            and desired == "locked"
+            and ha_state == "locked"
+            and access_state == "locked"
+        )
+        if access_state != desired or release_fail_safe_override:
+            if not await self._apply_state(
+                lock,
+                desired,
+                hubs=hubs,
+                # Once both sides are confirmed locked, use lock_now rather
+                # than another keep_lock. This releases the persistent incident
+                # override without resuming the currently active schedule.
+                fail_safe=fail_safe and not release_fail_safe_override,
+                unsafe_expected_access=(
+                    access_rule
+                    if source == "ha" and desired == "unlocked"
+                    else None
+                ),
+            ):
+                # HA may already have moved. Keep the desired baseline absent so
+                # the next pass retries rather than treating this partial apply
+                # as a new external HA change.
+                self._last_ha_observed[eid] = ha_state
+                self._last_access_observed[eid] = (
+                    access_state if valid_access else "locked"
+                )
+                self._last_access_rule[eid] = access_rule
+                return 0
+            access_state = desired
+            access_rule = f"command:{desired}"
+            changed = True
+
+        try:
+            await self._persist_convergence(
+                eid=eid,
+                desired=desired,
+                source=source,
+                access_rule=access_rule,
+                hubs=hubs,
+            )
+        except Exception:
+            _LOGGER.exception("Could not persist hub-sync convergence for %s", eid)
+            if desired == "unlocked":
+                # Do not leave an unsafe state whose origin cannot survive a
+                # restart. Best-effort close both sides; durable hold ownership
+                # remains until Access confirms the safe direction.
+                await self._drive_ha_state(lock, "locked", fail_safe=True)
+                await self._apply_state(
+                    lock, "locked", hubs=hubs, fail_safe=True
+                )
+            return 0
+
+        self._pairing_signature[eid] = self._hub_signature(hubs)
+        self._paired_hubs[eid] = [dict(hub) for hub in hubs]
+        if desired == "locked":
+            self._fail_safe_reset_eids.discard(eid)
+        self._failure_notified.discard(eid)
+        return 1 if changed else 0
+
+    async def _apply_state(
+        self,
+        lock: dict,
+        state: str,
+        *,
+        hubs: Optional[list[dict]] = None,
+        enforcing_lockdown: bool = False,
+        fail_safe: bool = False,
+        unsafe_expected_access: str | None = None,
+    ) -> bool:
         """Drive all hubs paired with ``lock`` to ``state``. True on success."""
         eid = lock["entity_id"]
         lock_name = lock.get("name", eid)
 
-        access = self._get_access()
-        if access is None or not getattr(access, "connected", False):
-            _LOGGER.warning(
-                "Hub sync for %s deferred — Access client unavailable", lock_name
-            )
-            return False
-
-        hubs = await self._resolve_hub_locks(lock)
+        if hubs is None:
+            hubs = await self._resolve_hub_locks(lock)
         if not hubs:
-            # Misconfiguration (option on, no paired Access door). Warn and
-            # treat as applied so we don't re-warn every backoff cycle; the
-            # next state change will warn again if still unpaired.
+            # Misconfiguration (option on, no paired Access door). Do NOT
+            # report success: doing so records the HA state as applied, so a
+            # hub paired later never converges until the HA lock changes
+            # again. Retain the unapplied state and retry with backoff.
             _LOGGER.warning(
                 "Hub sync enabled for %s but no associated Access hub found — "
                 "link the door via Entry Devices (Access location or Protect "
                 "doorbell) or the legacy access_location_id",
                 lock_name,
             )
-            return True
+            if eid not in self._failure_notified:
+                self._failure_notified.add(eid)
+                await self._notify_sync_failed(
+                    eid, lock_name, reason="no_paired_hub"
+                )
+            return False
 
         ok_all = True
         drove_any = False
+        expected_rows: dict[str, dict] = {}
+        if unsafe_expected_access is not None:
+            try:
+                decoded = json.loads(unsafe_expected_access)
+                expected_rows = {
+                    str(row["device_id"]): row
+                    for row in decoded
+                    if isinstance(row, dict) and row.get("device_id")
+                }
+            except (TypeError, ValueError, KeyError):
+                _LOGGER.warning(
+                    "Hub sync refused unsafe write for %s: invalid observation guard",
+                    lock_name,
+                )
+                return False
         for hub in hubs:
             device_id = hub["device_id"]
             hub_name = hub.get("name", device_id)
-            if not await self._drive_hub(access, device_id, state, hub_name):
+            durable_state_ok = True
+            persistent_lock = bool(
+                state == "locked" and (enforcing_lockdown or fail_safe)
+            )
+            persistent_rule_requested = persistent_lock
+            force_transient = False
+            release_persistent = bool(
+                state == "locked"
+                and any(
+                    item.get("device_id") == device_id
+                    for item in self._held_locked.get(eid, [])
+                )
+                and not persistent_rule_requested
+            )
+            if state == "unlocked" or persistent_lock:
+                if self._in_lockdown():
+                    if state == "unlocked":
+                        _LOGGER.warning(
+                            "Hub sync refused hold-open for %s because lockdown "
+                            "became active before the physical command",
+                            hub_name,
+                        )
+                        ok_all = False
+                        break
+                try:
+                    # Write-ahead ownership closes the crash window between a
+                    # successful persistent command and persistence. A stale
+                    # row is safe: recovery reasserts keep_lock before release.
+                    if persistent_lock:
+                        await self._record_hub_state(
+                            eid,
+                            hub,
+                            state,
+                            persistent_lock=True,
+                        )
+                except Exception:
+                    _LOGGER.exception(
+                        "Hub sync refused persistent rule for %s because durable "
+                        "ownership could not be recorded",
+                        hub_name,
+                    )
+                    if state == "unlocked":
+                        ok_all = False
+                        continue
+                    # A failed safety-bookkeeping write must not leave the door
+                    # open. During persisted lockdown, still apply keep_lock;
+                    # otherwise use non-persistent lock_now so a crash cannot
+                    # strand future schedules disabled.
+                    durable_state_ok = False
+                    persistent_lock = False
+                    force_transient = not enforcing_lockdown
+
+            async def before_command(hub_row: dict = hub) -> None:
+                if state == "unlocked":
+                    await self._record_hub_state(eid, hub_row, "unlocked")
+
+            async def unsafe_guard(hub_row: dict = hub) -> bool:
+                if unsafe_expected_access is None:
+                    return True
+                expected = expected_rows.get(str(hub_row.get("device_id")))
+                if expected is None:
+                    return False
+                ha = self._get_ha()
+                access = self._get_access()
+                if (
+                    ha is None
+                    or not getattr(ha, "connected", False)
+                    or not self._access_available(access)
+                    or await ha.get_entity_state(eid) != "unlocked"
+                ):
+                    return False
+                try:
+                    current_state, current_rule, _active = (
+                        await self._observe_access_hub(access, hub_row)
+                    )
+                except Exception:
+                    return False
+                current = {
+                    "device_id": hub_row.get("device_id"),
+                    "rule": current_rule,
+                    "state": current_state,
+                }
+                if current != expected:
+                    _LOGGER.info(
+                        "Hub sync suppressed stale HA-origin unlock for %s; "
+                        "Access changed after observation",
+                        hub_name,
+                    )
+                    return False
+                return True
+
+            drove = await self._drive_hub(
+                device_id,
+                state,
+                hub_name,
+                location_id=hub.get("location_id"),
+                enforcing_lockdown=enforcing_lockdown,
+                fail_safe=fail_safe,
+                force_transient=force_transient,
+                release_persistent=release_persistent,
+                guard=unsafe_guard if unsafe_expected_access is not None else None,
+                before_command=before_command if state == "unlocked" else None,
+            )
+            if self._urgent_lockdown.is_set() and not enforcing_lockdown:
+                return False
+            if (
+                drove
+                and state == "locked"
+                and not persistent_lock
+                and not persistent_rule_requested
+            ):
+                try:
+                    # force_lock/reset replaces any persistent app override.
+                    # Clear ownership only after Access confirms that command.
+                    await self._record_hub_state(eid, hub, state)
+                except Exception:
+                    _LOGGER.exception(
+                        "Hub sync reset %s but could not clear durable "
+                        "ownership",
+                        hub_name,
+                    )
+                    durable_state_ok = False
+            if not drove:
                 ok_all = False
                 continue
             drove_any = True
-            self._record_hub_state(eid, hub, state)
+            if not durable_state_ok:
+                ok_all = False
             if self._on_hub_state is not None:
                 try:
                     self._on_hub_state(device_id, state)
@@ -339,20 +1619,72 @@ class HubSyncManager:
             self._last_applied_at[eid] = now
             self._apply_times.setdefault(eid, []).append(now)
 
-        if not ok_all and eid not in self._failure_notified:
+        if (
+            not ok_all
+            and eid not in self._failure_notified
+            and (enforcing_lockdown or not self._urgent_lockdown.is_set())
+        ):
             self._failure_notified.add(eid)
             await self._notify_sync_failed(eid, lock_name, reason="apply_failed")
+        if ok_all:
+            self._pairing_signature[eid] = self._hub_signature(hubs)
+            self._paired_hubs[eid] = [dict(hub) for hub in hubs]
         return ok_all
 
-    def _record_hub_state(self, eid: str, hub: dict, state: str) -> None:
-        """Track which hubs we currently hold open for ``eid``."""
-        held = self._held_open.setdefault(eid, [])
+    async def _record_hub_state(
+        self,
+        eid: str,
+        hub: dict,
+        state: str,
+        *,
+        persistent_lock: bool = False,
+    ) -> None:
+        """Durably track app-owned persistent rules before physical writes."""
+        held_open = self._held_open.setdefault(eid, [])
+        held_locked = self._held_locked.setdefault(eid, [])
         if state == "unlocked":
-            if not any(h.get("id") == hub.get("id") for h in held):
-                held.append(hub)
-        else:
+            await self._db.record_hub_sync_hold(
+                eid,
+                hub["device_id"],
+                hub.get("id"),
+                hub.get("name", hub["device_id"]),
+                hub_location_id=hub.get("location_id"),
+                override_type="keep_unlock",
+            )
+            if not any(
+                h.get("device_id") == hub.get("device_id") for h in held_open
+            ):
+                held_open.append(hub)
+            self._held_locked[eid] = [
+                h for h in held_locked
+                if h.get("device_id") != hub.get("device_id")
+            ]
+        elif persistent_lock:
+            await self._db.record_hub_sync_hold(
+                eid,
+                hub["device_id"],
+                hub.get("id"),
+                hub.get("name", hub["device_id"]),
+                hub_location_id=hub.get("location_id"),
+                override_type="keep_lock",
+            )
+            if not any(
+                h.get("device_id") == hub.get("device_id") for h in held_locked
+            ):
+                held_locked.append(hub)
             self._held_open[eid] = [
-                h for h in held if h.get("id") != hub.get("id")
+                h for h in held_open
+                if h.get("device_id") != hub.get("device_id")
+            ]
+        else:
+            await self._db.clear_hub_sync_hold(eid, hub["device_id"])
+            self._held_open[eid] = [
+                h for h in held_open
+                if h.get("device_id") != hub.get("device_id")
+            ]
+            self._held_locked[eid] = [
+                h for h in held_locked
+                if h.get("device_id") != hub.get("device_id")
             ]
 
     async def _suspend_flapping(self, lock: dict) -> None:
@@ -382,6 +1714,121 @@ class HubSyncManager:
     # Internal — release of held-open hubs
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _append_unique_hubs(target: list[dict], hubs: list[dict]) -> None:
+        """Merge hubs by stable Access device id, preserving full rows."""
+        known = {hub.get("device_id"): hub for hub in target}
+        for hub in hubs:
+            device_id = hub.get("device_id")
+            if not device_id:
+                continue
+            existing = known.get(device_id)
+            if existing is not None:
+                for key, value in hub.items():
+                    if (
+                        value is not None
+                        and (
+                            existing.get(key) is None
+                            or existing.get(key) == ""
+                        )
+                    ):
+                        existing[key] = value
+                continue
+            target.append(hub)
+            known[device_id] = hub
+
+    async def _load_persisted_holds(self) -> None:
+        """Merge durable ownership rows into held and release tracking."""
+        rows = await self._db.get_hub_sync_holds()
+        for row in rows:
+            eid = row["entity_id"]
+            hub = {
+                "id": row.get("hub_lock_id"),
+                "device_id": row["hub_device_id"],
+                "location_id": row.get("hub_location_id"),
+                "name": row.get("hub_name") or row["hub_device_id"],
+                "type": "access_native",
+            }
+            override_type = row.get("override_type") or "keep_unlock"
+            owned = (
+                self._held_locked if override_type == "keep_lock"
+                else self._held_open
+            )
+            self._append_unique_hubs(owned.setdefault(eid, []), [hub])
+            self._append_unique_hubs(
+                self._pending_release.setdefault(eid, []), [hub]
+            )
+
+    async def _load_persisted_sync_state(self) -> None:
+        """Restore only fully confirmed origin observations."""
+        if self._sync_state_loaded:
+            return
+        getter = self._method(self._db, "get_hub_sync_states")
+        if getter is None:
+            self._sync_state_loaded = True
+            return
+        rows = await getter()
+        for row in rows:
+            eid = row.get("entity_id")
+            ha_state = row.get("ha_state")
+            access_state = row.get("access_state")
+            desired = row.get("desired_state")
+            if (
+                not eid
+                or ha_state not in {"locked", "unlocked"}
+                or access_state not in {"locked", "unlocked"}
+                or desired not in {"locked", "unlocked"}
+            ):
+                _LOGGER.warning(
+                    "Ignoring malformed durable hub-sync state for %r", eid
+                )
+                continue
+            self._last_ha_observed[eid] = ha_state
+            self._last_access_observed[eid] = access_state
+            self._last_access_rule[eid] = str(
+                row.get("access_rule_fingerprint") or ""
+            )
+            self._last_converged[eid] = desired
+            try:
+                signature = json.loads(row.get("pairing_signature") or "[]")
+            except (TypeError, ValueError):
+                signature = []
+            if isinstance(signature, list) and all(
+                isinstance(device_id, str) for device_id in signature
+            ):
+                self._pairing_signature[eid] = tuple(sorted(signature))
+        self._sync_state_loaded = True
+
+    async def _persist_convergence(
+        self,
+        *,
+        eid: str,
+        desired: str,
+        source: str,
+        access_rule: str,
+        hubs: list[dict],
+    ) -> None:
+        setter = self._method(self._db, "set_hub_sync_state")
+        if setter is not None:
+            await setter(
+                entity_id=eid,
+                desired_state=desired,
+                source=source,
+                ha_state=desired,
+                access_state=desired,
+                access_rule_fingerprint=access_rule,
+                pairing_signature=json.dumps(self._hub_signature(hubs)),
+            )
+        self._last_ha_observed[eid] = desired
+        self._last_access_observed[eid] = desired
+        self._last_access_rule[eid] = access_rule
+        self._last_converged[eid] = desired
+
+    async def _clear_persisted_convergence(self, eid: str) -> None:
+        clearer = self._method(self._db, "clear_hub_sync_state")
+        if clearer is not None:
+            await clearer(eid)
+
     async def _queue_release(
         self,
         eid: str,
@@ -395,23 +1842,36 @@ class HubSyncManager:
         re-establishes the applied state); the in-memory held-open record
         covers deleted rows.
         """
-        held = self._held_open.get(eid, [])
+        held: list[dict] = []
+        self._append_unique_hubs(held, self._held_open.get(eid, []))
+        self._append_unique_hubs(held, self._held_locked.get(eid, []))
         baseline_unlocked = self._applied.get(eid) == "unlocked"
         if not held and not baseline_unlocked:
             return
+        if baseline_unlocked:
+            self._append_unique_hubs(held, self._paired_hubs.get(eid, []))
 
         if lock_row is None and all_locks is not None:
-            lock_row = next(
-                (l for l in all_locks if l.get("entity_id") == eid), None
-            )
-        hubs: list[dict] = []
+            matching_rows = [
+                row for row in all_locks if row.get("entity_id") == eid
+            ]
+            grouped = self._group_synced_locks(matching_rows)
+            lock_row = grouped[0] if grouped else None
+        resolved: list[dict] = []
         if lock_row is not None:
             try:
-                hubs = await self._resolve_hub_locks(lock_row)
+                resolved = await self._resolve_hub_locks(lock_row)
             except Exception:
                 _LOGGER.exception("Hub sync: release resolution failed for %s", eid)
-        if not hubs:
-            hubs = list(held)
+        # Union, never fallback: partial multi-hub apply can leave a held hub
+        # that no longer resolves from the latest topology. Conversely, the
+        # current resolution can include another hub that may have received
+        # keep-unlock just before a partial failure. Resetting the union is
+        # harmless and prevents either path from stranding a door open.
+        hubs: list[dict] = []
+        self._append_unique_hubs(hubs, held)
+        self._append_unique_hubs(hubs, self._pending_release.get(eid, []))
+        self._append_unique_hubs(hubs, resolved)
         if not hubs:
             _LOGGER.warning(
                 "Hub sync disabled for %s while unlocked, but no paired hub "
@@ -425,33 +1885,96 @@ class HubSyncManager:
             eid, len(hubs),
         )
         pending = self._pending_release.setdefault(eid, [])
-        for hub in hubs:
-            if not any(h.get("id") == hub.get("id") for h in pending):
-                pending.append(hub)
+        self._append_unique_hubs(pending, hubs)
         self._release_backoff.pop(eid, None)
 
-    async def _process_pending_releases(self) -> None:
-        """Drive queued hubs back to reset; keep failures for retry."""
+    async def _process_pending_releases(
+        self,
+        *,
+        force: bool = False,
+        enforcing_lockdown: bool = False,
+    ) -> int:
+        """Drive queued hubs back to reset; keep failures for retry.
+
+        Returns the number of confirmed resets. ``force`` ignores an existing
+        retry deadline for lifecycle safety paths (startup/shutdown/lockdown).
+        """
         if not self._pending_release:
-            return
-        access = self._get_access()
+            return 0
         now = time.monotonic()
+        reset_count = 0
         for eid in list(self._pending_release):
-            if self._release_backoff.get(eid, 0.0) > now:
-                continue
-            if access is None or not getattr(access, "connected", False):
-                self._release_backoff[eid] = now + _FAILURE_BACKOFF
+            if self._urgent_lockdown.is_set() and not enforcing_lockdown:
+                return reset_count
+            if not force and self._release_backoff.get(eid, 0.0) > now:
                 continue
             remaining: list[dict] = []
-            for hub in self._pending_release[eid]:
+            pending_hubs = list(self._pending_release[eid])
+            for index, hub in enumerate(pending_hubs):
+                if self._urgent_lockdown.is_set() and not enforcing_lockdown:
+                    self._append_unique_hubs(remaining, pending_hubs[index:])
+                    break
                 device_id = hub["device_id"]
                 hub_name = hub.get("name", device_id)
-                if not await self._drive_hub(access, device_id, "locked", hub_name):
+                persistent_lock = bool(
+                    enforcing_lockdown or eid in self._fail_safe_reset_eids
+                )
+                ownership_recorded = True
+                if persistent_lock:
+                    try:
+                        # Write ownership before a keep_lock command. If the
+                        # process exits between these operations, recovery may
+                        # send one extra safe close but cannot strand a rule.
+                        await self._record_hub_state(
+                            eid,
+                            hub,
+                            "locked",
+                            persistent_lock=True,
+                        )
+                    except Exception:
+                        ownership_recorded = False
+                        _LOGGER.exception(
+                            "Hub sync refused fail-safe rule for %s because "
+                            "durable ownership could not be recorded",
+                            hub_name,
+                        )
+                drove = await self._drive_hub(
+                    device_id,
+                    "locked",
+                    hub_name,
+                    location_id=hub.get("location_id"),
+                    enforcing_lockdown=enforcing_lockdown,
+                    fail_safe=persistent_lock and ownership_recorded,
+                    restore_native=not persistent_lock,
+                    force_transient=(
+                        persistent_lock
+                        and not ownership_recorded
+                        and not enforcing_lockdown
+                    ),
+                )
+                if persistent_lock and not ownership_recorded:
+                    # The physical close may have succeeded, but lifecycle
+                    # ownership is unresolved. Keep retrying and keep lockdown
+                    # visibly unresolved rather than claiming convergence.
                     remaining.append(hub)
                     continue
+                if drove and not persistent_lock:
+                    try:
+                        await self._record_hub_state(eid, hub, "locked")
+                    except Exception:
+                        _LOGGER.exception(
+                            "Hub sync reset %s but could not clear durable "
+                            "ownership; retaining it for retry",
+                            hub_name,
+                        )
+                        drove = False
+                if not drove:
+                    remaining.append(hub)
+                    continue
+                reset_count += 1
                 if self._on_hub_state is not None:
                     try:
-                        self._on_hub_state(device_id, "locked")
+                        self._on_hub_state(device_id, drove)
                     except Exception:
                         _LOGGER.exception(
                             "on_hub_state callback raised for %s", device_id
@@ -472,14 +1995,30 @@ class HubSyncManager:
             else:
                 del self._pending_release[eid]
                 self._release_backoff.pop(eid, None)
+                # The hub is now confirmed reset. This suppresses repeat
+                # fail-safe traffic while HA remains invalid and lets the
+                # first later valid `unlocked` observation reconverge open.
+                if eid in self._fail_safe_reset_eids:
+                    self._applied[eid] = "locked"
+        return reset_count
 
     def _drop_tracking(self, eid: str) -> None:
         self._applied.pop(eid, None)
+        self._pairing_signature.pop(eid, None)
+        self._paired_hubs.pop(eid, None)
         self._backoff_until.pop(eid, None)
         self._last_applied_at.pop(eid, None)
         self._apply_times.pop(eid, None)
         self._suspended_until.pop(eid, None)
+        self._lockdown_reset.discard(eid)
         self._held_open.pop(eid, None)
+        self._held_locked.pop(eid, None)
+        self._fail_safe_reset_eids.discard(eid)
+        self._last_ha_observed.pop(eid, None)
+        self._last_access_observed.pop(eid, None)
+        self._last_access_rule.pop(eid, None)
+        self._last_converged.pop(eid, None)
+        self._access_momentary_until.pop(eid, None)
 
     # ------------------------------------------------------------------
     # Internal — resolution / actuation / alerting
@@ -496,9 +2035,12 @@ class HubSyncManager:
         included: hiding a hub card from the dashboard is cosmetic and
         must not silently break sync.
         """
-        location_ids: set[str] = set()
-        if lock.get("access_location_id"):
-            location_ids.add(lock["access_location_id"])
+        rows = lock.get("_sync_rows") or [lock]
+        location_ids: set[str] = {
+            row["access_location_id"]
+            for row in rows
+            if row.get("access_location_id")
+        }
 
         camera_map: dict = {}
         if self._get_camera_map is not None:
@@ -508,60 +2050,190 @@ class HubSyncManager:
                 _LOGGER.exception("Hub sync: camera map getter raised")
 
         try:
-            devices_by_lock = await self._db.get_entry_devices_for_locks([lock["id"]])
+            lock_ids = [row["id"] for row in rows]
+            devices_by_lock = await self._db.get_entry_devices_for_locks(lock_ids)
         except Exception:
-            _LOGGER.exception("Hub sync: entry-device lookup failed for lock %s", lock.get("id"))
+            _LOGGER.exception(
+                "Hub sync: entry-device lookup failed for lock(s) %s",
+                [row.get("id") for row in rows],
+            )
             devices_by_lock = {}
-        for device in devices_by_lock.get(lock["id"], []):
-            device_id = device.get("device_id")
-            if not device_id:
-                continue
-            if device.get("type") == "access_reader":
-                location_ids.add(device_id)
-            elif device.get("type") == "protect_doorbell":
-                mapped = camera_map.get(device_id)
-                if mapped:
-                    location_ids.add(mapped)
-                else:
-                    _LOGGER.debug(
-                        "Hub sync: doorbell %s has no camera→location mapping yet",
-                        device_id,
-                    )
+        for row in rows:
+            for device in devices_by_lock.get(row["id"], []):
+                device_id = device.get("device_id")
+                if not device_id:
+                    continue
+                if device.get("type") == "access_reader":
+                    location_ids.add(device_id)
+                elif device.get("type") == "protect_doorbell":
+                    mapped = camera_map.get(device_id)
+                    if mapped:
+                        location_ids.add(mapped)
+                    else:
+                        _LOGGER.debug(
+                            "Hub sync: doorbell %s has no camera→location mapping yet",
+                            device_id,
+                        )
 
         hubs: list[dict] = []
-        seen_ids: set[int] = set()
-        for location_id in location_ids:
+        seen_device_ids: set[str] = set()
+        for location_id in sorted(location_ids):
             for candidate in await self._db.get_locks_for_location(
                 location_id, include_hidden=True
             ):
                 if (
                     candidate.get("type") == "access_native"
                     and candidate.get("device_id")
-                    and candidate["id"] not in seen_ids
+                    and candidate["device_id"] not in seen_device_ids
                 ):
                     hubs.append(candidate)
-                    seen_ids.add(candidate["id"])
+                    seen_device_ids.add(candidate["device_id"])
         return hubs
 
     async def _drive_hub(
-        self, access: Any, device_id: str, state: str, hub_name: str
-    ) -> bool:
-        """Call the Access API with bounded retries. True on success."""
-        for attempt in range(1, _APPLY_RETRIES + 1):
+        self,
+        device_id: str,
+        state: str,
+        hub_name: str,
+        *,
+        location_id: str | None = None,
+        enforcing_lockdown: bool = False,
+        fail_safe: bool = False,
+        restore_native: bool = False,
+        force_transient: bool = False,
+        release_persistent: bool = False,
+        guard: Callable[[], Awaitable[bool]] | None = None,
+        before_command: Callable[[], Awaitable[None]] | None = None,
+    ) -> str | None:
+        """Call Access with bounded retries and return confirmed relay state.
+
+        Incident/shutdown safety passes make one breadth-first attempt per
+        hub. Durable ownership keeps failures queued for later convergence;
+        spending the retry delay on the first broken hub would postpone every
+        still-open hub behind it. Normal convergence retains bounded retries.
+        """
+        max_attempts = 1 if enforcing_lockdown else _APPLY_RETRIES
+        for attempt in range(1, max_attempts + 1):
+            if self._urgent_lockdown.is_set() and not enforcing_lockdown:
+                return False
             try:
-                if state == "unlocked":
-                    await access.unlock_persistent(device_id)
-                else:
-                    await access.lock(device_id)
-                _LOGGER.info("Hub sync: %s driven to %s", hub_name, state)
-                return True
+                # Hold the global barrier for exactly one physical request.
+                # Retry sleeps and SQLite bookkeeping remain outside it, so a
+                # degraded hub cannot stall every unrelated door for 30+s.
+                async with self._command_lock:
+                    if self._urgent_lockdown.is_set() and not enforcing_lockdown:
+                        return False
+                    if state == "unlocked" and self._in_lockdown():
+                        _LOGGER.warning(
+                            "Hub sync refused hold-open for %s during lockdown",
+                            hub_name,
+                        )
+                        return False
+                    # Settings publishes and retires Access clients under this
+                    # same barrier. Resolve the getter only now so a waiter can
+                    # never re-authenticate or command the object that Settings
+                    # just closed.
+                    access = self._get_access()
+                    if not self._access_available(access):
+                        _LOGGER.warning(
+                            "Hub sync attempt %d/%d deferred for %s — current "
+                            "Access client unavailable",
+                            attempt,
+                            max_attempts,
+                            hub_name,
+                        )
+                    else:
+                        if guard is not None and not await guard():
+                            return None
+                        if before_command is not None:
+                            await before_command()
+                        if state == "unlocked" and self._in_lockdown():
+                            _LOGGER.warning(
+                                "Hub sync aborted hold-open for %s because "
+                                "lockdown activated during write-ahead",
+                                hub_name,
+                            )
+                            return None
+                        if state == "unlocked":
+                            command = self._method(access, "hold_unlocked")
+                            if command is not None:
+                                confirmation = await command(
+                                    device_id, location_id=location_id
+                                )
+                            else:
+                                confirmation = await access.unlock_persistent(
+                                    device_id
+                                )
+                        elif force_transient:
+                            command = self._method(access, "force_lock")
+                            if command is not None:
+                                confirmation = await command(
+                                    device_id, location_id=location_id
+                                )
+                            else:
+                                confirmation = await access.lock(device_id)
+                        elif release_persistent:
+                            command = self._method(
+                                access, "release_persistent_lock"
+                            )
+                            if command is None:
+                                command = self._method(access, "force_lock")
+                            if command is not None:
+                                confirmation = await command(
+                                    device_id, location_id=location_id
+                                )
+                            else:
+                                confirmation = await access.lock(device_id)
+                        elif restore_native:
+                            command = self._method(access, "restore_native_rule")
+                            if command is not None:
+                                confirmation = await command(
+                                    device_id, location_id=location_id
+                                )
+                            else:
+                                confirmation = await access.lock(device_id)
+                        elif enforcing_lockdown or fail_safe:
+                            command = self._method(access, "hold_locked")
+                            if command is not None:
+                                confirmation = await command(
+                                    device_id, location_id=location_id
+                                )
+                            else:
+                                confirmation = await access.lock(device_id)
+                        else:
+                            command = self._method(access, "force_lock")
+                            if command is not None:
+                                confirmation = await command(
+                                    device_id, location_id=location_id
+                                )
+                            else:
+                                confirmation = await access.lock(device_id)
+                        _LOGGER.info("Hub sync: %s driven to %s", hub_name, state)
+                        if isinstance(confirmation, dict):
+                            confirmed_state = confirmation.get("state")
+                            if confirmed_state in {"locked", "unlocked"}:
+                                return str(confirmed_state)
+                        return state
             except Exception:
                 _LOGGER.exception(
                     "Hub sync attempt %d/%d failed for %s (→ %s)",
-                    attempt, _APPLY_RETRIES, hub_name, state,
+                    attempt, max_attempts, hub_name, state,
                 )
-                if attempt < _APPLY_RETRIES:
+            if attempt < max_attempts:
+                if enforcing_lockdown:
                     await asyncio.sleep(_APPLY_RETRY_DELAY)
+                    continue
+                try:
+                    # Wake immediately when incident enforcement queues behind
+                    # this poll instead of making it wait out a retry sleep.
+                    await asyncio.wait_for(
+                        self._urgent_lockdown.wait(),
+                        timeout=_APPLY_RETRY_DELAY,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                if self._urgent_lockdown.is_set():
+                    return False
         return False
 
     async def _notify_sync_failed(

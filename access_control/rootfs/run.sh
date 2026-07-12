@@ -45,12 +45,6 @@ fi
 # Persistence: /data is the add-on's persistent volume (survives updates).
 export DATA_DIR=/data
 
-# RESTART_COMMAND is exec'd with shlex.split() when the user clicks the
-# "Restart Service" button in the app's Settings page. In a container we
-# want that path to be a no-op; the Supervisor's watchdog and "Restart"
-# button on the add-on page own real restarts.
-export RESTART_COMMAND="/bin/true"
-
 # Auto-configure HA URL + token from Supervisor when requested. The app's
 # main.py honors ACCESS_CONTROL_HA_URL and ACCESS_CONTROL_HA_TOKEN env-var
 # overrides on every startup.

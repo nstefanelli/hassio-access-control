@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.util
 import json
@@ -466,7 +467,7 @@ class TestAuthEngineScheduleInactiveDenies(unittest.IsolatedAsyncioTestCase):
         engine = make_engine(db, ha=ha)
 
         # Patch datetime.now inside auth_engine to return a Wednesday (weekday=2)
-        from datetime import datetime, timezone
+        from datetime import datetime
         from zoneinfo import ZoneInfo
         wednesday = datetime(2026, 4, 22, 12, 0, 0, tzinfo=ZoneInfo("America/New_York"))  # 2026-04-22 is a Wednesday
         with patch("access_control.auth_engine.datetime") as mock_dt:
@@ -475,6 +476,38 @@ class TestAuthEngineScheduleInactiveDenies(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["granted"])
         ha.unlock.assert_not_awaited()
+
+    async def test_enabled_schedule_with_only_one_time_bound_fails_closed(self) -> None:
+        """A partially saved schedule must never degrade into all-day access."""
+        user = make_active_user()
+        group = {
+            "id": 61,
+            "name": "Incomplete schedule",
+            "all_locks": True,
+            "schedule_enabled": True,
+            "schedule_days": "",
+            "schedule_start": "08:00",
+            "schedule_end": None,
+            "blocked_when_armed_away": False,
+            "blocked_when_armed_home": False,
+            "can_disarm": False,
+        }
+        ha = make_ha(alarm_state="disarmed")
+        db = make_db(user=user, groups=[group], locks=[make_lock()])
+        engine = make_engine(db, ha=ha)
+
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+
+        self.assertFalse(result["granted"])
+        ha.unlock.assert_not_awaited()
+
+    async def test_enabled_empty_schedule_fails_closed(self) -> None:
+        engine = make_engine(make_db())
+        self.assertFalse(engine._check_schedule({
+            "schedule_days": "",
+            "schedule_start": None,
+            "schedule_end": None,
+        }))
 
 
 class TestAuthEngineBlockedArmedAway(unittest.IsolatedAsyncioTestCase):
@@ -631,6 +664,128 @@ class TestAuthEngineRestrictiveAlarmStates(unittest.IsolatedAsyncioTestCase):
         ha.unlock.assert_not_awaited()
         ha.alarm_disarm.assert_not_awaited()
 
+    async def test_literal_unknown_state_blocks(self) -> None:
+        """HA's literal ``unknown`` state is not equivalent to disarmed."""
+        user = make_active_user()
+        panel = {"entity_id": "alarm_control_panel.main"}
+        ha = make_ha(alarm_state="unknown")
+        db = make_db(
+            user=user,
+            groups=[self._blocked_group()],
+            locks=[make_lock()],
+            alarm_panels=[panel],
+        )
+        engine = make_engine(db, ha=ha)
+
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+
+        self.assertFalse(result["granted"])
+        self.assertIn("unknown", result["reason"])
+        ha.unlock.assert_not_awaited()
+
+    async def test_configured_panel_without_ha_is_unknown_not_disarmed(self) -> None:
+        panel = {"entity_id": "alarm_control_panel.main"}
+        db = make_db(alarm_panels=[panel])
+        engine = AuthEngine(
+            db=db,
+            access_client=None,
+            ha_client=None,
+            relock_tasks={},
+        )
+
+        self.assertEqual(await engine._get_alarm_state(), "unknown")
+
+    async def test_mixed_armed_modes_are_restrictive(self) -> None:
+        """Away+home panels must not collapse to one mode and bypass a flag."""
+        user = make_active_user()
+        group = {
+            **self._blocked_group(),
+            "blocked_when_armed_away": False,
+            "blocked_when_armed_home": True,
+        }
+        panels = [
+            {"entity_id": "alarm_control_panel.house"},
+            {"entity_id": "alarm_control_panel.garage"},
+        ]
+        ha = make_ha()
+        ha.get_entity_state = AsyncMock(side_effect=["armed_away", "armed_home"])
+        db = make_db(
+            user=user,
+            groups=[group],
+            locks=[make_lock()],
+            alarm_panels=panels,
+        )
+        engine = make_engine(db, ha=ha)
+
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+
+        self.assertFalse(result["granted"])
+        self.assertIn("unknown", result["reason"])
+        ha.unlock.assert_not_awaited()
+
+    async def test_disarmed_result_is_never_cached(self) -> None:
+        """A panel that arms just after a permissive read must be re-read."""
+        panel = {"entity_id": "alarm_control_panel.main"}
+        db = make_db(alarm_panels=[panel])
+        ha = make_ha()
+        ha.get_entity_state = AsyncMock(side_effect=["disarmed", "armed_away"])
+        engine = make_engine(db, ha=ha)
+
+        self.assertEqual(await engine._get_alarm_state(), "disarmed")
+        self.assertEqual(await engine._get_alarm_state(), "armed_away")
+        self.assertEqual(ha.get_entity_state.await_count, 2)
+
+
+class TestAuthEngineLastMomentLockdown(unittest.IsolatedAsyncioTestCase):
+    async def test_lockdown_enabled_during_rule_lookup_prevents_unlock(self) -> None:
+        """A concurrent lockdown wins until the physical command is issued."""
+        user = make_active_user()
+        ha = make_ha(alarm_state="disarmed")
+        db = make_db(user=user, groups=[], locks=[make_lock()])
+        engine = make_engine(db, ha=ha)
+
+        async def authorize_then_lock_down(*_args):
+            engine._lockdown = True
+            return {"enabled": 1, "schedule_enabled": 0}
+
+        db.get_rules_for_user_and_lock = AsyncMock(
+            side_effect=authorize_then_lock_down
+        )
+
+        result = await engine.process_event("ulp-1", "door-1", method="nfc")
+
+        self.assertFalse(result["granted"])
+        self.assertIn("Lockdown", result["reason"])
+        ha.unlock.assert_not_awaited()
+
+
+class TestAuthEngineLocationResolution(unittest.IsolatedAsyncioTestCase):
+    async def test_access_location_resolves_inverse_protect_camera_mapping(self) -> None:
+        """Access events carry a location id while pairing stores camera id."""
+        lock = make_lock()
+        db = make_db(locks=[])
+
+        async def paired_locks(device_type, *, device_id):
+            if device_type == "protect_doorbell" and device_id == "camera-g6":
+                return [lock]
+            return []
+
+        db.get_locks_by_entry_device = AsyncMock(side_effect=paired_locks)
+        engine = AuthEngine(
+            db=db,
+            access_client=None,
+            ha_client=make_ha(),
+            relock_tasks={},
+            camera_map_getter=lambda: {"camera-g6": "location-front"},
+        )
+
+        locks = await engine.get_locks_for_location("location-front")
+
+        self.assertEqual(locks, [lock])
+        db.get_locks_by_entry_device.assert_any_await(
+            "protect_doorbell", device_id="camera-g6"
+        )
+
 
 class TestAuthEngineLockdownPersistence(unittest.IsolatedAsyncioTestCase):
     """Regression: lockdown must persist across restart (2026-07-05 fix)."""
@@ -658,6 +813,69 @@ class TestAuthEngineLockdownPersistence(unittest.IsolatedAsyncioTestCase):
         engine = make_engine(db)
         await engine.load_persisted_lockdown()
         self.assertFalse(engine.lockdown)
+
+    async def test_load_persisted_lockdown_read_error_fails_closed(self) -> None:
+        db = make_db(user=make_active_user())
+        db.get_config = AsyncMock(side_effect=OSError("database unavailable"))
+        engine = make_engine(db)
+
+        await engine.load_persisted_lockdown()
+
+        self.assertTrue(engine.lockdown)
+
+    async def test_failed_disable_remains_fail_closed(self) -> None:
+        db = make_db(user=make_active_user())
+        engine = make_engine(db)
+        engine._lockdown = True
+        db.set_config = AsyncMock(side_effect=RuntimeError("disk full"))
+
+        with self.assertRaises(RuntimeError):
+            await engine.set_lockdown(False)
+
+        self.assertTrue(engine.lockdown)
+
+    async def test_concurrent_transitions_are_serialized(self) -> None:
+        db = make_db(user=make_active_user())
+        writes: list[str] = []
+        disable_started = asyncio.Event()
+        release_disable = asyncio.Event()
+
+        async def persist(_key, value):
+            writes.append(value)
+            if value == "0":
+                disable_started.set()
+                await release_disable.wait()
+
+        db.set_config = AsyncMock(side_effect=persist)
+        engine = make_engine(db)
+        engine._lockdown = True
+
+        disable = asyncio.create_task(engine.set_lockdown(False))
+        await disable_started.wait()
+        enable = asyncio.create_task(engine.set_lockdown(True))
+        await asyncio.sleep(0)
+        self.assertTrue(engine.lockdown)
+        release_disable.set()
+        await asyncio.gather(disable, enable)
+
+        self.assertEqual(writes, ["0", "1"])
+        self.assertTrue(engine.lockdown)
+
+    async def test_enforcement_failure_surfaces_but_keeps_lockdown_enabled(self) -> None:
+        db = make_db(user=make_active_user())
+        enforce = AsyncMock(side_effect=RuntimeError("hub still open"))
+        engine = AuthEngine(
+            db=db,
+            access_client=None,
+            ha_client=make_ha(),
+            on_lockdown_enabled=enforce,
+        )
+
+        with self.assertRaises(RuntimeError):
+            await engine.set_lockdown(True)
+
+        self.assertTrue(engine.lockdown)
+        enforce.assert_awaited_once()
 
 
 class TestScheduleTimezone(unittest.TestCase):

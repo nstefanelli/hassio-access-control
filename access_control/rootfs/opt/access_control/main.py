@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import sys
@@ -34,19 +35,29 @@ logging.basicConfig(
 )
 
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .access_client import AccessClient
 from .api_routes import router as api_router
 from .auth_engine import AuthEngine
-from .config import decrypt_value, derive_key
+from .config import (
+    SECRET_KEY_SOURCE_DATABASE,
+    decrypt_value,
+    derive_key,
+    resolve_secret_key,
+    secret_key_fingerprint,
+)
 from .database import Database
-from .ha_creds import resolve_ha_creds as _resolve_ha_creds
+from .ha_creds import (
+    MissingHACredentialsError,
+    resolve_ha_creds as _resolve_ha_creds,
+)
 from .hub_sync import HubSyncManager
 from .protect_client import ProtectClient
 from .ha_client import HAClient
 from .relock_manager import RelockManager
+from .service_restart import request_service_restart
 from .web_routes import router as web_router
 from . import web_auth
 
@@ -74,14 +85,15 @@ def _log_task_exception(task: asyncio.Task) -> None:
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def _lifespan_inner(app: FastAPI):
     """Startup and shutdown logic wired via the lifespan context manager."""
 
     # --- Startup ---
 
+    app.state.lifecycle_cleanup_complete = False
     db = Database()
-    await db.connect()
     app.state.db = db
+    await db.connect()
 
     # Determine whether the app is configured
     admin_username = await db.get_config("admin_username")
@@ -99,6 +111,9 @@ async def lifespan(app: FastAPI):
     app.state.relock_manager: RelockManager | None = None
     app.state.hub_sync_manager: HubSyncManager | None = None
     app.state.camera_to_location = {}
+    app.state.event_topology_ready = False
+    app.state.access_generation = 0
+    app.state.restart_request_error = None
     app.state.sync_users = None
     app.state.on_access_event = None
     app.state.on_protect_event = None
@@ -110,15 +125,65 @@ async def lifespan(app: FastAPI):
     # Stash creds + ws restart helpers so the supervisor loops can use them after
     # initial bring-up failures or platform reboots.
     app.state.unvr_creds = None  # (host, user, pass)
+    app.state.access_creds = None  # (host, user, pass)
+    app.state.access_api_token = None
+    app.state.access_open_api_ready = False
+    app.state.access_open_api_error = None
+    app.state.access_console_identity = None
+    app.state.start_access_client = None
     app.state.start_protect_client = None
+    app.state.access_started_client = None
+    app.state.protect_started_client = None
     app.state.seed_lock_states = None
+    app.state.physical_command_lock = asyncio.Lock()
+    app.state.setup_lock = asyncio.Lock()
+    app.state.settings_update_lock = asyncio.Lock()
+    app.state.access_start_lock = asyncio.Lock()
+    app.state.protect_start_lock = asyncio.Lock()
+    app.state.topology_sync_lock = asyncio.Lock()
+    app.state.visitor_operation_locks = {}
+    app.state.access_data_lock = asyncio.Lock()
+
+    # Door-event work is deliberately fire-and-forget during normal
+    # operation, but it still needs an owner so shutdown can cancel and await
+    # it before clients and SQLite are closed underneath an in-flight task.
+    event_tasks: set[asyncio.Task] = set()
+
+    def _track_event_task(
+        task: asyncio.Task, *, critical: bool = False
+    ) -> None:
+        if critical:
+            setattr(task, "_access_control_critical", True)
+        event_tasks.add(task)
+
+        def _done(completed: asyncio.Task) -> None:
+            event_tasks.discard(completed)
+            _log_task_exception(completed)
+
+        task.add_done_callback(_done)
+
+    async def _drain_event_tasks() -> None:
+        """Cancel queued source events before a live-client publication swap."""
+        current = asyncio.current_task()
+        pending = [task for task in event_tasks if task is not current]
+        for task in pending:
+            if (
+                not task.done()
+                and not getattr(task, "_access_control_critical", False)
+            ):
+                task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    app.state.drain_event_tasks = _drain_event_tasks
+    app.state.track_background_task = _track_event_task
 
     # Track recently processed events to deduplicate between Protect fast-path and Access WS
     _recent_events: dict[str, float] = {}
 
     def _is_duplicate(ulp_id: str, location_id: str, event_id: str = "") -> bool:
         """
-        Check if this access event was already processed in the last 10s.
+        Check if this access event was already processed in the last 3s.
 
         Tracks two keys so that the *cross-path* duplicate (Protect fast-path
         + Access standard-path firing for the same physical tap) is caught
@@ -128,10 +193,12 @@ async def lifespan(app: FastAPI):
         - ``event_id`` — set only when the Access log payload carries it;
           protects against the same Access log being delivered twice
         """
-        now = time.time()
-        # Prune entries older than 10 seconds
+        now = time.monotonic()
+        # Cross-client copies arrive almost together. Keep the window short so
+        # a genuine retry after a failed first attempt is not suppressed.
+        dedup_window = 3.0
         for k in list(_recent_events):
-            if now - _recent_events[k] > 10:
+            if now - _recent_events[k] > dedup_window:
                 del _recent_events[k]
 
         key_loc = f"{ulp_id}:{location_id}"
@@ -147,50 +214,90 @@ async def lifespan(app: FastAPI):
 
     async def sync_users() -> None:
         """Fetch users, native locks, and camera map from the current Access client."""
-        access_client = app.state.access_client
-        if not access_client:
-            logger.warning("sync_users() skipped — Access client not initialized")
-            return
+        async with app.state.topology_sync_lock:
+            access_client = app.state.access_client
+            generation = app.state.access_generation
+            if not access_client:
+                logger.warning("sync_users() skipped — Access client not initialized")
+                return
 
-        logger.info("Starting user/lock sync…")
-        try:
-            # Batch every upsert into ONE transaction: this runs every
-            # 15 minutes forever, and per-row commits were thousands of
-            # fsync'd write transactions/day at idle — real SD-card wear
-            # on the hosts this targets (e2e review 2026-07-12).
-            # upsert_user additionally skips unchanged rows entirely.
-            users = await access_client.fetch_users()
-            active_ulp_ids: list[str] = []
-            for u in users:
-                ulp_id = u.get("ulp_id", "")
-                if not ulp_id:
-                    continue
-                await db.upsert_user(
-                    ulp_id=ulp_id,
-                    name=u.get("name", ""),
-                    email=u.get("email") or None,
-                    status=u.get("status", "active"),
-                    commit=False,
+            logger.info("Starting user/lock sync…")
+            # Do not apply user/door identifiers from a cached session until
+            # its authenticated Access namespace has been revalidated. This
+            # complements per-login and per-WebSocket-upgrade verification.
+            await access_client.verify_console_identity()
+            # Fetch independent snapshots concurrently, then apply both on a
+            # dedicated SQLite connection in one transaction.  The former
+            # commit=False batch shared the request connection, so an unrelated
+            # request could commit a half-finished topology snapshot (or have
+            # its own writes rolled back when this function failed).
+            users, bootstrap = await asyncio.gather(
+                access_client.fetch_users(), access_client.get_bootstrap()
+            )
+            if (
+                access_client is not app.state.access_client
+                or generation != app.state.access_generation
+            ):
+                logger.warning(
+                    "Discarding topology snapshot from a retired Access client"
                 )
-                active_ulp_ids.append(ulp_id)
-            # mark_deleted_users commits internally, flushing the user
-            # batch with it.
-            await db.mark_deleted_users(active_ulp_ids)
-            logger.info("Synced %d users", len(active_ulp_ids))
-
-            bootstrap = await access_client.get_bootstrap()
+                return
             doors = access_client.parse_doors_and_devices(bootstrap)
-            hub_devices = [d for d in doors if not d.get("is_camera")]
-            for door in hub_devices:
-                await db.upsert_native_lock(
-                    device_id=door["device_id"],
-                    location_id=door["location_id"],
-                    name=door["name"],
-                    door_name=door.get("door_name"),
-                    commit=False,
+            hub_devices = [
+                door for door in doors
+                if isinstance(door, dict) and not door.get("is_camera")
+            ]
+            valid_users = [
+                user for user in users
+                if isinstance(user, dict) and user.get("ulp_id")
+            ]
+            valid_hubs = [
+                door for door in hub_devices
+                if door.get("device_id") and door.get("location_id")
+            ]
+            if not valid_users and await db.get_user_count():
+                raise RuntimeError(
+                    "Access returned no valid users while local users exist; "
+                    "refusing an untrusted topology snapshot"
                 )
-            await db.commit()
-            logger.info("Synced %d native lock(s)", len(hub_devices))
+            if not valid_hubs:
+                existing_locks = await db.get_all_locks(include_hidden=True)
+                if any(
+                    lock.get("type") == "access_native"
+                    and lock.get("upstream_present", 1)
+                    for lock in existing_locks
+                ):
+                    raise RuntimeError(
+                        "Access returned no valid doors while native locks "
+                        "exist; refusing an untrusted topology snapshot"
+                    )
+            stats = await db.sync_topology(users, hub_devices)
+            if (
+                access_client is not app.state.access_client
+                or generation != app.state.access_generation
+            ):
+                # The old snapshot may have committed, but event intake was
+                # marked unready by the swap. Never publish its camera map or
+                # re-enable authorization; the queued current-client sync is
+                # the only generation allowed to do that.
+                logger.warning(
+                    "Topology changed clients during database apply; keeping "
+                    "event intake fail-closed"
+                )
+                return
+            logger.info(
+                "Topology sync: users=%d (+%d/~%d/deleted=%d/unchanged=%d), "
+                "locks=%d (+%d/~%d/unchanged=%d)",
+                stats["users_seen"],
+                stats["users_inserted"],
+                stats["users_updated"],
+                stats["users_marked_deleted"],
+                stats["users_unchanged"],
+                stats["locks_seen"],
+                stats["locks_inserted"],
+                stats["locks_updated"],
+                stats["locks_unchanged"],
+            )
 
             new_map: dict[str, str] = {}
             raw = bootstrap if isinstance(bootstrap, list) else bootstrap.get("data", [])
@@ -203,16 +310,8 @@ async def lifespan(app: FastAPI):
                                 if dev.get("is_camera"):
                                     new_map[dev.get("unique_id", "")] = door_id
             app.state.camera_to_location = new_map
+            app.state.event_topology_ready = True
             logger.info("Camera→location map: %d entries", len(new_map))
-
-        except Exception:
-            logger.exception("sync_users() failed")
-            # Discard any half-written batch so a later commit from an
-            # unrelated write can't flush partial sync state.
-            try:
-                await db.rollback()
-            except Exception:
-                logger.exception("sync_users() rollback failed")
 
     # Semaphore to cap concurrent process_event invocations during event floods
     _event_semaphore = asyncio.Semaphore(5)
@@ -221,8 +320,49 @@ async def lifespan(app: FastAPI):
     def on_access_event(message: dict) -> None:
         """Dispatch relevant Access events to the auth engine."""
         app.state.ws_last_event["access"] = datetime.now(timezone.utc).isoformat()
+        if not app.state.event_topology_ready:
+            logger.warning(
+                "Dropping Access event while topology is being refreshed"
+            )
+            return
         event_type: str = message.get("event", "") or message.get("type", "")
         if not event_type:
+            return
+
+        def _queue_access_state_reconcile(
+            location: str, access_event_type: str
+        ) -> bool:
+            manager = app.state.hub_sync_manager
+            if (
+                manager is None
+                or not manager.is_access_state_event(access_event_type)
+                or not location
+            ):
+                return False
+            task = asyncio.create_task(
+                manager.reconcile_location(location, access_event_type),
+                name=f"access-state-{access_event_type}-{location}",
+            )
+            # A schedule transition changes physical desired state. Drain it
+            # across a client swap/shutdown just like durable relock work.
+            _track_event_task(task, critical=True)
+            return True
+
+        # Newer Access versions can emit schedule/temporary-rule events
+        # directly rather than wrapping them in access.logs.add. They often
+        # have no actor, so dispatch before credential identity filtering.
+        if HubSyncManager.is_access_state_event(event_type):
+            data = message.get("data", {})
+            if not isinstance(data, dict):
+                return
+            location_id = (
+                data.get("location_id")
+                or data.get("door_id")
+                or data.get("unique_id")
+                or message.get("event_object_id")
+                or ""
+            )
+            _queue_access_state_reconcile(location_id, event_type)
             return
 
         auth_engine = app.state.auth_engine
@@ -254,13 +394,22 @@ async def lifespan(app: FastAPI):
 
             evt = meta.get("event", {}) if "_source" in data else data
             evt_type = evt.get("event_type", "") or evt.get("type", "")
+            door = meta.get("door", {})
+            if HubSyncManager.is_access_state_event(evt_type):
+                location_id = (
+                    door.get("id")
+                    or data.get("location_id")
+                    or data.get("door_id")
+                    or ""
+                )
+                _queue_access_state_reconcile(location_id, evt_type)
+                return
             result = data.get("result", "") or evt.get("result", "")
             if "unlock" not in evt_type and result != "ACCESS":
                 return
 
             actor = meta.get("actor", {})
             ulp_id = actor.get("id", "")
-            door = meta.get("door", {})
             location_id = door.get("id", "")
 
             auth_info = meta.get("authentication", {})
@@ -293,7 +442,25 @@ async def lifespan(app: FastAPI):
         else:
             return
 
-        if not ulp_id or not location_id:
+        if not location_id:
+            return
+        if not ulp_id:
+            if method == "remote_through_uah":
+                # Remote/API/automation unlock logs do not consistently carry
+                # a person actor. Relock is a door-safety reaction and must not
+                # depend on that optional identity; use a stable dedup subject.
+                ulp_id = "remote"
+            else:
+                return
+
+        # Apply dedup before the remote-unlock early return too. Re-delivered
+        # remote events used to replace the durable relock row and extend the
+        # deadline indefinitely.
+        if _is_duplicate(ulp_id, location_id, event_id=event_id):
+            logger.debug(
+                "Skipping duplicate Access WS event for %s (already handled)",
+                ulp_id,
+            )
             return
 
         if method == "remote_through_uah":
@@ -316,23 +483,156 @@ async def lifespan(app: FastAPI):
                     eid = lock.get("entity_id")
                     if not eid:
                         continue
-                    await rm.schedule(
-                        entity_id=eid,
-                        duration=lock.get("relock_duration", 30),
-                        lock_id=lock.get("id"),
-                        lock_name=lock.get("name", eid),
-                        source="remote",
-                    )
+                    lock_name = lock.get("name", eid)
+                    try:
+                        relock_intent = await rm.schedule(
+                            entity_id=eid,
+                            duration=lock.get("relock_duration", 30),
+                            lock_id=lock.get("id"),
+                            lock_name=lock_name,
+                            source="remote",
+                        )
+                        # For bidirectionally synced pairs, the Access remote
+                        # unlock must also operate the HA lock. Persisting the
+                        # relock above comes first so a timeout/crash cannot
+                        # strand HA open. The momentary marker prevents the hub
+                        # poller from echoing this temporary HA state back as a
+                        # persistent Access keep-unlock rule.
+                        if lock.get("sync_hub_state"):
+                            duration = float(lock.get("relock_duration", 30))
+                            hub_sync = app.state.hub_sync_manager
+                            if hub_sync is not None:
+                                hub_sync.mark_access_momentary(eid, duration)
+                            accepted = False
+                            confirmed = False
+                            command_ha = None
+                            try:
+                                async with app.state.physical_command_lock:
+                                    current_engine = app.state.auth_engine
+                                    if current_engine and current_engine.lockdown:
+                                        logger.warning(
+                                            "Remote unlock for %s not mirrored to "
+                                            "HA during lockdown",
+                                            lock_name,
+                                        )
+                                    else:
+                                        command_ha = app.state.ha_client
+                                        accepted = bool(
+                                            command_ha
+                                            and await command_ha.unlock(eid)
+                                        )
+                                if accepted and command_ha is not None:
+                                    for attempt in range(3):
+                                        if (
+                                            await command_ha.get_entity_state(eid)
+                                            == "unlocked"
+                                        ):
+                                            confirmed = True
+                                            break
+                                        if attempt < 2:
+                                            await asyncio.sleep(0.25)
+                                if confirmed:
+                                    app.state.lock_states[eid] = "unlocked"
+                                    try:
+                                        await rm.extend_after_success(
+                                            relock_intent, duration
+                                        )
+                                    except Exception:
+                                        logger.exception(
+                                            "Could not extend remote relock for %s; "
+                                            "earlier write-ahead deadline retained",
+                                            lock_name,
+                                        )
+                                else:
+                                    await rm.retain_after_uncertain_unlock(
+                                        relock_intent
+                                    )
+                                    logger.error(
+                                        "Remote Access unlock was not confirmed "
+                                        "on HA lock %s",
+                                        lock_name,
+                                    )
+                            except asyncio.CancelledError:
+                                await rm.retain_after_uncertain_unlock(
+                                    relock_intent
+                                )
+                                raise
+                            except Exception:
+                                logger.exception(
+                                    "Remote Access unlock mirroring raised for %s",
+                                    lock_name,
+                                )
+                                await rm.retain_after_uncertain_unlock(
+                                    relock_intent
+                                )
+                    except BaseException as exc:
+                        # The remote event arrives after the door was already
+                        # opened. If write-ahead persistence fails, immediately
+                        # try the safe direction rather than aborting the loop
+                        # and leaving this/all later locks without protection.
+                        logger.critical(
+                            "Could not persist remote relock for %s; issuing "
+                            "immediate fail-safe lock",
+                            lock_name,
+                            exc_info=True,
+                        )
+                        confirmed = False
+                        try:
+                            async with app.state.physical_command_lock:
+                                ha = app.state.ha_client
+                                accepted = bool(ha and await ha.lock(eid))
+                            if accepted:
+                                ha = app.state.ha_client
+                                confirmed = bool(
+                                    ha
+                                    and await ha.get_entity_state(eid) == "locked"
+                                )
+                        except Exception:
+                            logger.exception(
+                                "Immediate fail-safe lock raised for %s", lock_name
+                            )
+                        try:
+                            await db.log_access(
+                                method="remote_relock",
+                                result="granted" if confirmed else "error",
+                                lock_id=lock.get("id"),
+                                lock_name=lock_name,
+                                reason=(
+                                    "Immediate lock recovered from relock "
+                                    "persistence failure"
+                                    if confirmed
+                                    else f"Relock persistence failed: {type(exc).__name__}"
+                                ),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to audit remote relock persistence error"
+                            )
+                        if not confirmed:
+                            ha = app.state.ha_client
+                            if ha is not None:
+                                try:
+                                    await ha.fire_event(
+                                        "access_control_relock_failed",
+                                        {
+                                            "entity_id": eid,
+                                            "lock_name": lock_name,
+                                            "reason": "persistence_failed",
+                                        },
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Failed to emit remote relock alert for %s",
+                                        lock_name,
+                                    )
+                        if isinstance(exc, asyncio.CancelledError):
+                            raise
 
             task = asyncio.create_task(
                 _schedule_remote_relock(location_id),
                 name=f"remote-relock-{location_id}",
             )
-            task.add_done_callback(_log_task_exception)
-            return
-
-        if _is_duplicate(ulp_id, location_id, event_id=event_id):
-            logger.debug("Skipping duplicate Access WS event for %s (already handled by fast-path)", ulp_id)
+            _track_event_task(task, critical=True)
             return
 
         async def _gated():
@@ -340,11 +640,16 @@ async def lifespan(app: FastAPI):
                 return await auth_engine.process_event(ulp_id=ulp_id, location_id=location_id, method=method)
 
         task = asyncio.create_task(_gated(), name=f"process-event-{ulp_id}")
-        task.add_done_callback(_log_task_exception)
+        _track_event_task(task)
 
     def on_protect_event(message: dict) -> None:
         """Handle ring, NFC, fingerprint, and doorAccess events from Protect."""
         app.state.ws_last_event["protect"] = datetime.now(timezone.utc).isoformat()
+        if not app.state.event_topology_ready:
+            logger.warning(
+                "Dropping Protect event while topology is being refreshed"
+            )
+            return
         event = message.get("event", "")
         camera_id = message.get("camera_id", "")
         if not camera_id:
@@ -372,15 +677,24 @@ async def lifespan(app: FastAPI):
                     return await auth_engine.process_event(ulp_id=ulp_id, location_id=location_id, method="access_device")
 
             task = asyncio.create_task(_gated_protect(), name=f"door-access-{ulp_id}")
-            task.add_done_callback(_log_task_exception)
+            _track_event_task(task)
             return
 
         if event == "ring":
+            async def _gated_ring() -> None:
+                # Logging and HA event emission are non-physical. Keeping them
+                # off the global command barrier prevents repeated rings (or
+                # an offline HA notification timeout) from delaying lockdown
+                # and legitimate door commands.
+                await _handle_doorbell_ring(
+                    db, app.state.ha_client, camera_id
+                )
+
             task = asyncio.create_task(
-                _handle_doorbell_ring(db, app.state.ha_client, camera_id),
+                _gated_ring(),
                 name=f"doorbell-ring-{camera_id}",
             )
-            task.add_done_callback(_log_task_exception)
+            _track_event_task(task)
         elif event in ("nfc", "fingerprint"):
             ulp_id = message.get("ulp_id", "")
             if not ulp_id:
@@ -407,7 +721,7 @@ async def lifespan(app: FastAPI):
                 _gated_protect_cred(),
                 name=f"protect-{event}-{camera_id}",
             )
-            task.add_done_callback(_log_task_exception)
+            _track_event_task(task)
 
     app.state.sync_users = sync_users
     app.state.on_access_event = on_access_event
@@ -424,12 +738,31 @@ async def lifespan(app: FastAPI):
         if not admin_password_hash:
             raise RuntimeError("Config key 'admin_password_hash' is missing from the database.")
 
-        secret_key = await db.get_config("secret_key")
-        if not secret_key:
-            raise RuntimeError("Config key 'secret_key' is missing from the database.")
-
-        if os.environ.get("ACCESS_CONTROL_SECRET_KEY"):
-            secret_key = os.environ["ACCESS_CONTROL_SECRET_KEY"]
+        stored_secret_key = await db.get_config("secret_key")
+        secret_key_source = await db.get_config("secret_key_source")
+        secret_key, normalized_key_source = resolve_secret_key(
+            stored_key=stored_secret_key,
+            source=secret_key_source,
+            stored_fingerprint=await db.get_config("secret_key_fingerprint"),
+            environment_key=os.environ.get("ACCESS_CONTROL_SECRET_KEY"),
+        )
+        if secret_key_source is None:
+            # One-time, backward-compatible migration.  Legacy installations
+            # always encrypted with the database key, even if an env override
+            # was later added (that override was the source of the old
+            # undecryptable-credentials bug).
+            await db.set_config("secret_key_source", normalized_key_source)
+            await db.set_config(
+                "secret_key_fingerprint", secret_key_fingerprint(secret_key)
+            )
+        if (
+            normalized_key_source == SECRET_KEY_SOURCE_DATABASE
+            and os.environ.get("ACCESS_CONTROL_SECRET_KEY")
+        ):
+            logger.warning(
+                "Ignoring ACCESS_CONTROL_SECRET_KEY: this installation was "
+                "initialized with a database-managed key"
+            )
 
         web_auth.SECRET_KEY = secret_key
         enc_key = derive_key(secret_key, salt)
@@ -464,39 +797,113 @@ async def lifespan(app: FastAPI):
             a_user = unvr_username
             a_pass = unvr_password
 
+        access_api_token = os.environ.get(
+            "ACCESS_CONTROL_ACCESS_API_TOKEN"
+        )
+        if not access_api_token:
+            access_api_token_enc = await db.get_config("access_api_token")
+            if access_api_token_enc:
+                access_api_token = decrypt_value(
+                    access_api_token_enc, enc_key
+                )
+        access_api_token = access_api_token or None
+        app.state.access_api_token = access_api_token
+
         # Resolve HA creds via the module-level helper — see
         # _resolve_ha_creds() above for the env-vs-DB precedence rules.
-        ha_url, ha_token, creds_source = _resolve_ha_creds(
-            env_url=os.environ.get("ACCESS_CONTROL_HA_URL"),
-            env_token=os.environ.get("ACCESS_CONTROL_HA_TOKEN"),
-            db_url=await db.get_config("ha_url"),
-            db_token_enc=await db.get_config("ha_token"),
-            decrypt=lambda enc: decrypt_value(enc, enc_key),
-            log=logger,
-        )
-        logger.info("HA credentials resolved from: %s", creds_source)
+        try:
+            ha_url, ha_token, creds_source = _resolve_ha_creds(
+                env_url=os.environ.get("ACCESS_CONTROL_HA_URL"),
+                env_token=os.environ.get("ACCESS_CONTROL_HA_TOKEN"),
+                db_url=await db.get_config("ha_url"),
+                db_token_enc=await db.get_config("ha_token"),
+                decrypt=lambda enc: decrypt_value(enc, enc_key),
+                log=logger,
+            )
+            logger.info("HA credentials resolved from: %s", creds_source)
+        except MissingHACredentialsError:
+            # A default Supervisor install intentionally stores no fallback HA
+            # token. If the operator later disables use_supervisor_api, keep
+            # the authenticated dashboard/Settings available so they can enter
+            # a manual pair instead of crash-looping before the UI loads.
+            logger.exception(
+                "No complete HA credentials; starting degraded so Settings "
+                "can repair the connection"
+            )
+            ha_url = ha_token = creds_source = None
 
         # Stash UNVR creds — the supervisor loops use these to recover
         # if Access or Protect was unreachable at boot.
         app.state.unvr_creds = (unvr_host, unvr_username, unvr_password)
+        app.state.access_creds = (a_host, a_user, a_pass)
 
-        access_client = AccessClient(host=a_host, username=a_user, password=a_pass)
+        expected_access_identity = await db.get_config(
+            "access_console_identity"
+        )
+        app.state.access_console_identity = expected_access_identity
+        access_client = AccessClient(
+            host=a_host,
+            username=a_user,
+            password=a_pass,
+            expected_identity=expected_access_identity,
+            api_token=access_api_token,
+        )
         try:
             await access_client.login()
+            expected_access_identity = await db.get_config(
+                "access_console_identity"
+            )
+            observed_access_identity = await access_client.get_console_identity()
+            if (
+                expected_access_identity
+                and expected_access_identity != observed_access_identity
+            ):
+                raise RuntimeError(
+                    "Access site identity changed; refusing to apply "
+                    "site-scoped user/door IDs"
+                )
+            if not expected_access_identity and observed_access_identity:
+                await db.set_config(
+                    "access_console_identity",
+                    observed_access_identity,
+                )
+                app.state.access_console_identity = observed_access_identity
             logger.info("AccessClient authenticated at %s", a_host)
+            if access_api_token:
+                try:
+                    await access_client.validate_open_api()
+                    app.state.access_open_api_ready = True
+                    app.state.access_open_api_error = None
+                    logger.info(
+                        "Official UniFi Access API validated on port 12445"
+                    )
+                except Exception as exc:
+                    # Keep topology/event intake available, but commands remain
+                    # pinned to the configured official token and therefore fail
+                    # closed instead of silently falling back to the private API.
+                    app.state.access_open_api_ready = False
+                    app.state.access_open_api_error = type(exc).__name__
+                    logger.error(
+                        "Official UniFi Access API validation failed: %s",
+                        type(exc).__name__,
+                    )
         except Exception:
             logger.exception("AccessClient startup failed — proceeding without Access integration")
+            try:
+                await access_client.close()
+            except Exception:
+                logger.exception("Failed to close unsuccessful Access client")
             access_client = None
         app.state.access_client = access_client
 
-        ha_client = HAClient(url=ha_url, token=ha_token)
-        ha_ok = await ha_client.test_connection()
+        ha_client = HAClient(url=ha_url, token=ha_token) if ha_url and ha_token else None
+        ha_ok = bool(ha_client and await ha_client.test_connection())
         if not ha_ok:
             logger.warning(
                 "HA connection test failed — proceeding anyway "
                 "(creds_source=%s). app.state.ha_unhealthy is now True; "
                 "health endpoints and supervisor loops should react.",
-                creds_source,
+                creds_source or "missing",
             )
             app.state.ha_unhealthy = True
         else:
@@ -516,6 +923,7 @@ async def lifespan(app: FastAPI):
             db=db,
             ha_client_getter=lambda: app.state.ha_client,
             on_locked=_mark_locked,
+            command_lock=app.state.physical_command_lock,
         )
 
         # HubSyncManager mirrors opted-in third-party HA lock states onto
@@ -541,7 +949,13 @@ async def lifespan(app: FastAPI):
             # Live camera→location map so locks paired to their door via a
             # Protect doorbell entry device (G6 Entry) resolve their hub.
             camera_map_getter=lambda: app.state.camera_to_location,
+            command_lock=app.state.physical_command_lock,
         )
+
+        async def _enforce_hub_lockdown() -> None:
+            manager = app.state.hub_sync_manager
+            if manager is not None:
+                await manager.enforce_lockdown()
 
         app.state.auth_engine = AuthEngine(
             db=db,
@@ -550,10 +964,14 @@ async def lifespan(app: FastAPI):
             relock_tasks=app.state.relock_tasks,
             enc_key=enc_key,
             relock_manager=app.state.relock_manager,
+            camera_map_getter=lambda: app.state.camera_to_location,
+            command_lock=app.state.physical_command_lock,
+            on_lockdown_enabled=_enforce_hub_lockdown,
         )
 
         # Restore lockdown mode persisted before a restart (incident control
-        # must survive a reboot). Fail-safe: stays disabled if unreadable.
+        # must survive a reboot). An unreadable value is ambiguous and fails
+        # closed as enabled until an operator can explicitly clear it.
         await app.state.auth_engine.load_persisted_lockdown()
 
         # Align schedule evaluation with the site's local timezone. HA's
@@ -569,8 +987,6 @@ async def lifespan(app: FastAPI):
             except Exception:
                 logger.exception("Failed to fetch HA timezone — schedules use %s",
                                  app.state.auth_engine.tz)
-
-        await sync_users()
 
         # Lock-state seeding — also used by the HA recovery loop when HA
         # comes back online after a reboot.
@@ -606,31 +1022,150 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Failed to rehydrate pending relocks")
 
+        async def start_access_client() -> bool:
+            """Bring up Access fully, closing failed candidates before retry."""
+            async with app.state.access_start_lock:
+                candidate = app.state.access_client
+                if (
+                    candidate is not None
+                    and candidate is app.state.access_started_client
+                ):
+                    ws_task = getattr(candidate, "_ws_task", "unobservable")
+                    if ws_task == "unobservable" or (
+                        ws_task is not None and not ws_task.done()
+                    ):
+                        return True
+                if candidate is None:
+                    creds = app.state.access_creds
+                    if not creds:
+                        return False
+                    candidate = AccessClient(
+                        *creds,
+                        expected_identity=app.state.access_console_identity,
+                        api_token=app.state.access_api_token,
+                    )
+                    try:
+                        await candidate.login()
+                        recovered_identity = await candidate.get_console_identity()
+                        if not recovered_identity:
+                            raise RuntimeError(
+                                "Recovered Access client has no site identity"
+                            )
+                        if app.state.access_console_identity is None:
+                            # Persist before publication/event intake. If this
+                            # fails, do not leave a legacy install in TOFU on
+                            # every restart.
+                            await db.set_config(
+                                "access_console_identity", recovered_identity
+                            )
+                            app.state.access_console_identity = recovered_identity
+                        if candidate.open_api_configured:
+                            try:
+                                await candidate.validate_open_api()
+                                app.state.access_open_api_ready = True
+                                app.state.access_open_api_error = None
+                            except Exception as exc:
+                                app.state.access_open_api_ready = False
+                                app.state.access_open_api_error = type(exc).__name__
+                                logger.error(
+                                    "Recovered Access Open API validation "
+                                    "failed: %s",
+                                    type(exc).__name__,
+                                )
+                    except Exception:
+                        logger.exception("Access client bring-up failed")
+                        try:
+                            await candidate.close()
+                        except Exception:
+                            logger.exception("Failed to close unsuccessful Access client")
+                        return False
+                try:
+                    app.state.access_client = candidate
+                    if app.state.auth_engine is not None:
+                        app.state.auth_engine._access_client = candidate
+
+                    # Reset every crash-persisted hold before accepting fresh
+                    # door events. This requires Access only, not HA, and also
+                    # fail-safes all opted-in hubs when lockdown was restored.
+                    manager = app.state.hub_sync_manager
+                    if manager is not None:
+                        try:
+                            await manager.recover()
+                        except Exception:
+                            logger.exception(
+                                "Hub hold recovery failed; durable rows retained"
+                            )
+
+                    try:
+                        await sync_users()
+                    except Exception:
+                        # Keep event intake fail-closed until the periodic sync
+                        # succeeds and marks event_topology_ready.
+                        app.state.event_topology_ready = False
+                        logger.exception(
+                            "Topology refresh failed during Access bring-up"
+                        )
+
+                    candidate.register_callback(on_access_event)
+                    await candidate.start_websocket()
+                except Exception:
+                    logger.exception("Access WebSocket bring-up failed")
+                    try:
+                        await candidate.close()
+                    except Exception:
+                        logger.exception("Failed to close unsuccessful Access client")
+                    if app.state.access_client is candidate:
+                        app.state.access_client = None
+                    return False
+                app.state.access_started_client = candidate
+                logger.info("Access WebSocket listener started")
+                return True
+
+        app.state.start_access_client = start_access_client
         if access_client is not None:
-            access_client.register_callback(on_access_event)
-            await access_client.start_websocket()
-            logger.info("Access WebSocket listener started")
+            await start_access_client()
 
         # Protect cold-start is wrapped so the supervisor loop can keep
         # retrying if UNVR Protect was warming up at boot. If login fails
         # here, app.state.protect_client stays None and the supervisor
         # picks up the next attempt.
         async def start_protect_client() -> bool:
-            creds = app.state.unvr_creds
-            if not creds:
-                return False
-            host, user, pwd = creds
-            try:
+            async with app.state.protect_start_lock:
+                existing = app.state.protect_client
+                if (
+                    existing is not None
+                    and existing is app.state.protect_started_client
+                ):
+                    ws_task = getattr(existing, "_ws_task", "unobservable")
+                    if ws_task == "unobservable" or (
+                        ws_task is not None and not ws_task.done()
+                    ):
+                        return True
+                if existing is not None and getattr(existing, "connected", False):
+                    existing.register_callback(on_protect_event)
+                    await existing.start_websocket()
+                    app.state.protect_started_client = existing
+                    return True
+                creds = app.state.unvr_creds
+                if not creds:
+                    return False
+                host, user, pwd = creds
                 protect_client = ProtectClient(host, user, pwd)
-                await protect_client.login()
-                protect_client.register_callback(on_protect_event)
-                await protect_client.start_websocket()
-            except Exception:
-                logger.exception("Protect client bring-up failed")
-                return False
-            app.state.protect_client = protect_client
-            logger.info("Protect WebSocket listener started")
-            return True
+                try:
+                    await protect_client.login()
+                    protect_client.register_callback(on_protect_event)
+                    await protect_client.start_websocket()
+                except Exception:
+                    logger.exception("Protect client bring-up failed")
+                    try:
+                        await protect_client.close()
+                    except Exception:
+                        logger.exception("Failed to close unsuccessful Protect client")
+                    return False
+                app.state.protect_client = protect_client
+                app.state.protect_started_client = protect_client
+                logger.info("Protect WebSocket listener started")
+                return True
 
         app.state.start_protect_client = start_protect_client
         await start_protect_client()
@@ -661,7 +1196,7 @@ async def lifespan(app: FastAPI):
 
     async def _prune_rate_limiters():
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(300)
             try:
                 await db.prune_runtime_state()
             except Exception:
@@ -674,11 +1209,14 @@ async def lifespan(app: FastAPI):
     prune_task.add_done_callback(_log_task_exception)
 
     visitor_sync_task = None
-    if configured:
+    # Start supervisors even in first-run mode. They are cheap no-ops until
+    # setup populates app.state; this means a successful setup becomes fully
+    # operational without requiring an undocumented restart.
+    if app.state.initialize_configured_state is not None:
         async def _sync_visitors():
             """Periodically sync visitor status from UniFi."""
             while True:
-                await asyncio.sleep(60)
+                await asyncio.sleep(300)
                 try:
                     access_client = app.state.access_client
                     if not access_client:
@@ -687,17 +1225,65 @@ async def lifespan(app: FastAPI):
                     # TLS round-trip to the console — with no visitors
                     # this loop was still making 1,440 UNVR requests/day
                     # forever (e2e review 2026-07-12).
-                    local_visitors = await db.get_all_visitors()
+                    local_visitors = await db.get_active_visitors()
                     if not local_visitors:
                         continue
-                    unvr_visitors = await access_client.list_visitors()
+                    remaining_visitors: list[dict] = []
+                    now_utc = datetime.now(timezone.utc)
+                    for visitor in local_visitors:
+                        try:
+                            end_at = datetime.fromisoformat(visitor["end_time"])
+                            if end_at.tzinfo is None:
+                                engine = app.state.auth_engine
+                                local_zone = (
+                                    engine.tz
+                                    if engine is not None
+                                    else now_utc.astimezone().tzinfo
+                                )
+                                end_at = end_at.replace(tzinfo=local_zone)
+                            if end_at.astimezone(timezone.utc) <= now_utc:
+                                expired = await db.expire_active_visitor(
+                                    visitor["id"], visitor["end_time"]
+                                )
+                                if expired:
+                                    await db.log_access(
+                                        method="system",
+                                        result="info",
+                                        lock_name=visitor.get("location_name"),
+                                        reason=f"Visitor '{visitor['name']}' expired locally",
+                                    )
+                                continue
+                        except (KeyError, TypeError, ValueError):
+                            logger.warning(
+                                "Visitor %s has invalid end_time %r; retaining for "
+                                "upstream reconciliation",
+                                visitor.get("id"),
+                                visitor.get("end_time"),
+                            )
+                        remaining_visitors.append(visitor)
+                    if not remaining_visitors:
+                        continue
+                    async with app.state.access_data_lock:
+                        access_client = app.state.access_client
+                        if access_client is None:
+                            continue
+                        unvr_visitors = await access_client.list_visitors()
                     unvr_map = {v["unique_id"]: v for v in unvr_visitors}
-                    for lv in local_visitors:
+                    for lv in remaining_visitors:
                         uvid = lv["unvr_visitor_id"]
                         uv = unvr_map.get(uvid)
                         if uv and uv.get("status") != lv["status"]:
-                            await db.update_visitor_status(lv["id"], uv["status"])
-                            if uv.get("status") == 4 and lv["status"] != 4:
+                            changed = await db.update_visitor_status_if_snapshot(
+                                lv["id"],
+                                expected_status=lv["status"],
+                                expected_end_time=lv["end_time"],
+                                status=uv["status"],
+                            )
+                            if (
+                                changed
+                                and uv.get("status") == 4
+                                and lv["status"] != 4
+                            ):
                                 await db.log_access(
                                     method="system", result="info",
                                     lock_name=lv.get("location_name"),
@@ -713,12 +1299,12 @@ async def lifespan(app: FastAPI):
         visitor_sync_task.add_done_callback(_log_task_exception)
 
     # ------------------------------------------------------------------
-    # Resilience loops (only run when the app is configured)
+    # Resilience loops (idle cheaply until the app is configured)
     # ------------------------------------------------------------------
 
     resilience_tasks: list[asyncio.Task] = []
 
-    if configured:
+    if app.state.initialize_configured_state is not None:
         # HA health loop — polls test_connection() every 30s. On transition
         # from disconnected → connected, reseed lock_states so post-reboot
         # cached values are fresh.
@@ -787,11 +1373,10 @@ async def lifespan(app: FastAPI):
             name="ha-health",
         ))
 
-        # Hub sync — mirrors opted-in third-party HA lock states onto their
-        # paired Access hubs. Polls the HA REST API (the app has no HA
-        # websocket); the manager acts on locked/unlocked transitions only,
-        # so the cadence just bounds reaction latency. No-op while nothing
-        # has opted in.
+        # Hub sync — bidirectionally reconciles opted-in HA locks and paired
+        # Access doors. Access events wake it early; polling authenticated HA
+        # state plus Access rule/relay readback catches missed events, bounds
+        # drift, and confirms physical convergence.
         async def _hub_sync_loop():
             while True:
                 await asyncio.sleep(HubSyncManager.POLL_INTERVAL)
@@ -808,12 +1393,35 @@ async def lifespan(app: FastAPI):
             name="hub-sync",
         ))
 
+        # Access cold-start supervisor. A console may still be booting when
+        # this add-on starts; retry without leaking the failed aiohttp session.
+        async def _access_init_loop():
+            while True:
+                await asyncio.sleep(60)
+                client = app.state.access_client
+                ws_task = getattr(client, "_ws_task", None)
+                if client is not None and ws_task is not None and not ws_task.done():
+                    continue
+                starter = app.state.start_access_client
+                if starter is None:
+                    continue
+                logger.info("Access client missing — attempting bring-up")
+                if not await starter():
+                    await asyncio.sleep(240)
+
+        resilience_tasks.append(asyncio.create_task(
+            _supervised(_access_init_loop, name="access-init"),
+            name="access-init",
+        ))
+
         # Protect cold-start supervisor — keeps retrying if UNVR Protect
         # wasn't reachable at boot. Stops polling cheaply once connected.
         async def _protect_init_loop():
             while True:
                 await asyncio.sleep(60)
-                if app.state.protect_client is not None:
+                client = app.state.protect_client
+                ws_task = getattr(client, "_ws_task", None)
+                if client is not None and ws_task is not None and not ws_task.done():
                     continue
                 starter = app.state.start_protect_client
                 if starter is None:
@@ -848,42 +1456,6 @@ async def lifespan(app: FastAPI):
             name="topology-resync",
         ))
 
-        # WebSocket zombie watchdog — if last event timestamp is too stale
-        # for an otherwise-healthy client, force a reconnect. UNVR has been
-        # observed to keep TCP open while silently dropping events.
-        async def _ws_watchdog_loop():
-            # Don't trip on quiet doors — only escalate after a long silence
-            stale_threshold = 4 * 3600  # 4 hours
-            while True:
-                await asyncio.sleep(300)  # check every 5 min
-                loop_time = asyncio.get_running_loop().time()
-                for label, client in (
-                    ("access", app.state.access_client),
-                    ("protect", app.state.protect_client),
-                ):
-                    if client is None or not getattr(client, "ws_connected", False):
-                        continue
-                    last = getattr(client, "last_event_at", 0.0)
-                    if last <= 0:
-                        # Haven't seen the first event yet — give it time
-                        continue
-                    silence = loop_time - last
-                    if silence > stale_threshold:
-                        logger.warning(
-                            "WS %s silent for %.1fs (>%ds) — forcing reconnect",
-                            label, silence, stale_threshold,
-                        )
-                        try:
-                            await client.stop_websocket()
-                            await client.start_websocket()
-                        except Exception:
-                            logger.exception("WS %s forced reconnect failed", label)
-
-        resilience_tasks.append(asyncio.create_task(
-            _supervised(_ws_watchdog_loop, name="ws-watchdog"),
-            name="ws-watchdog",
-        ))
-
         # Daily log retention — keep 90 days of access_log and admin_log
         async def _log_retention_loop():
             while True:
@@ -910,7 +1482,6 @@ async def lifespan(app: FastAPI):
         # target hour can't accidentally trigger a second reboot.
         async def _scheduled_reboot_loop():
             from datetime import datetime as _dt
-            import shlex as _shlex
             while True:
                 await asyncio.sleep(60)
                 try:
@@ -967,27 +1538,23 @@ async def lifespan(app: FastAPI):
                         # Don't persist last_fire — retry next minute
                         continue
                     await db.set_config("last_reboot_fire_date", today_key)
-                    await db.log_admin_action(
-                        "scheduler", "scheduled_restart",
-                        target=f"hour={target_hour} day={raw_day}",
-                    )
-                    restart_cmd = os.environ.get(
-                        "RESTART_COMMAND", "systemctl restart access-control"
-                    )
-                    logger.warning(
-                        "Scheduled reboot firing now (%s) — cmd=%s",
-                        now.isoformat(timespec="seconds"), restart_cmd,
-                    )
-                    parts = _shlex.split(restart_cmd)
-                    proc = await asyncio.create_subprocess_exec(
-                        *parts,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    # systemctl restart kills this process — if it returns,
-                    # the restart didn't take, but last_reboot_fire_date is
-                    # set so we won't loop on it today.
-                    await proc.wait()
+                    try:
+                        await db.log_admin_action(
+                            "scheduler", "scheduled_restart",
+                            target=f"hour={target_hour} day={raw_day}",
+                        )
+                        logger.warning(
+                            "Scheduled restart firing now (%s)",
+                            now.isoformat(timespec="seconds"),
+                        )
+                        await request_service_restart()
+                    except Exception:
+                        # Allow a retry next minute when Supervisor rejected or
+                        # was temporarily unavailable. Persist-before-request
+                        # prevents a successful restart from looping again in
+                        # the same target hour if the process dies immediately.
+                        await db.set_config("last_reboot_fire_date", "")
+                        raise
                 except Exception:
                     logger.exception("Scheduled reboot loop iteration failed")
 
@@ -1000,37 +1567,142 @@ async def lifespan(app: FastAPI):
             t.add_done_callback(_log_task_exception)
 
     # --- Hand control to FastAPI ---
-    yield
+    try:
+        yield
+    finally:
+        # --- Shutdown ---
+        background_tasks: list[asyncio.Task] = list(resilience_tasks)
+        if visitor_sync_task is not None:
+            background_tasks.append(visitor_sync_task)
+        background_tasks.append(prune_task)
+        for task in background_tasks:
+            task.cancel()
+        await asyncio.gather(*background_tasks, return_exceptions=True)
 
-    # --- Shutdown ---
-    background_tasks: list[asyncio.Task] = list(resilience_tasks)
-    if visitor_sync_task is not None:
-        background_tasks.append(visitor_sync_task)
-    background_tasks.append(prune_task)
-    for t in background_tasks:
-        t.cancel()
-    for t in background_tasks:
+        # Stop event intake before snapshotting fire-and-forget work. Otherwise
+        # a final WS callback can enqueue a physical command after the gather
+        # and run against clients/SQLite while they are being closed.
+        for label, client in (
+            ("Protect", app.state.protect_client),
+            ("Access", app.state.access_client),
+        ):
+            if client is None:
+                continue
+            stop = getattr(client, "stop_websocket", None)
+            if callable(stop):
+                try:
+                    stop_result = stop()
+                    if inspect.isawaitable(stop_result):
+                        await stop_result
+                except Exception:
+                    logger.exception("%s WebSocket shutdown failed", label)
+
+        # Routine door work is cancelled; critical post-event durability work
+        # (remote relock persistence/fail-safe fallback) is awaited to safety.
+        await _drain_event_tasks()
+
+        # Resolve every app-owned persistent Access rule before shutting down
+        # relock timers or the Access REST session. Non-lockdown shutdown
+        # returns native schedule ownership; lockdown retains keep_lock.
+        hub_manager = app.state.hub_sync_manager
+        hub_shutdown = getattr(hub_manager, "shutdown", None)
+        if callable(hub_shutdown):
+            try:
+                shutdown_result = hub_shutdown()
+                if inspect.isawaitable(shutdown_result):
+                    await shutdown_result
+            except Exception:
+                logger.exception("Hub sync shutdown failed; durable hold rows retained")
+
+        relock_manager = app.state.relock_manager
+        relock_shutdown = getattr(relock_manager, "shutdown", None)
+        if callable(relock_shutdown):
+            try:
+                shutdown_result = relock_shutdown()
+                if inspect.isawaitable(shutdown_result):
+                    await shutdown_result
+            except Exception:
+                logger.exception("Relock manager shutdown failed")
+
+        for label, client in (
+            ("ProtectClient", app.state.protect_client),
+            ("AccessClient", app.state.access_client),
+            ("HAClient", app.state.ha_client),
+        ):
+            if client is None:
+                continue
+            try:
+                close_result = client.close()
+                if inspect.isawaitable(close_result):
+                    await close_result
+                logger.info("%s closed", label)
+            except Exception:
+                logger.exception("%s close failed", label)
+
+        await db.close()
+        app.state.lifecycle_cleanup_complete = True
+        logger.info("Database closed")
+
+
+async def _cleanup_failed_startup(app: FastAPI) -> None:
+    """Best-effort cleanup when startup raises before the inner yield."""
+    drain = getattr(app.state, "drain_event_tasks", None)
+    if callable(drain):
         try:
-            await t
-        except asyncio.CancelledError:
-            pass
+            result = drain()
+            if inspect.isawaitable(result):
+                await result
         except Exception:
-            logger.exception("Background task shutdown raised")
+            logger.exception("Failed to drain event tasks after startup error")
 
-    if app.state.protect_client is not None:
-        await app.state.protect_client.close()
-        logger.info("ProtectClient closed")
+    for manager_name in ("hub_sync_manager", "relock_manager"):
+        manager = getattr(app.state, manager_name, None)
+        shutdown = getattr(manager, "shutdown", None)
+        if callable(shutdown):
+            try:
+                result = shutdown()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception("%s cleanup failed after startup error", manager_name)
 
-    if app.state.access_client is not None:
-        await app.state.access_client.close()
-        logger.info("AccessClient closed")
+    for label, client in (
+        ("ProtectClient", getattr(app.state, "protect_client", None)),
+        ("AccessClient", getattr(app.state, "access_client", None)),
+        ("HAClient", getattr(app.state, "ha_client", None)),
+    ):
+        close = getattr(client, "close", None)
+        if not callable(close):
+            continue
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.exception("%s cleanup failed after startup error", label)
 
-    if app.state.ha_client is not None:
-        await app.state.ha_client.close()
-        logger.info("HAClient closed")
+    db = getattr(app.state, "db", None)
+    close_db = getattr(db, "close", None)
+    if callable(close_db):
+        try:
+            result = close_db()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.exception("Database cleanup failed after startup error")
+    app.state.lifecycle_cleanup_complete = True
 
-    await db.close()
-    logger.info("Database closed")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run startup with cleanup even when failure occurs before app yield."""
+    try:
+        async with _lifespan_inner(app):
+            yield
+    except BaseException:
+        if not getattr(app.state, "lifecycle_cleanup_complete", False):
+            await _cleanup_failed_startup(app)
+        raise
 
 
 async def _handle_doorbell_ring(db, ha_client, camera_id: str) -> None:
@@ -1100,6 +1772,16 @@ async def _handle_protect_access(auth_engine, camera_id: str, ulp_id: str, metho
 app = FastAPI(title="Access Control", lifespan=lifespan)
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_response(request: Request, exc: Exception):
+    """Return a sanitized 500 with the same security headers as normal paths."""
+    logger.exception("Unhandled request error", exc_info=exc)
+    response = PlainTextResponse("Internal Server Error", status_code=500)
+    from .ingress import _finalize_response
+
+    return _finalize_response(request, response)
+
+
 @app.get("/health/live")
 async def health_live():
     """Unauthenticated liveness probe for container/load balancer health checks."""
@@ -1128,29 +1810,8 @@ app.include_router(web_router)
 #
 # DO NOT add new `@app.middleware("http")` decorators after the ingress
 # middleware registration — they would run BEFORE ingress and break the
-# invariant. New middleware goes here, between security_headers and the
-# ingress block at the end of the file.
-
-@app.middleware("http")
-async def security_headers(request: Request, call_next):
-    """Add security headers to all responses.
-
-    Header values depend on whether the request came through HA Ingress
-    (so the addon is iframed by HA at same-origin) vs. direct port (so
-    the addon must refuse all framing). See `security_headers_for()` in
-    ingress.py for the rationale; we just apply its output here.
-
-    The ingress middleware sets `request.state.ingress_active` before
-    this runs (LIFO order — ingress is outermost, security_headers is
-    inner). Reading that flag here is safe.
-    """
-    response = await call_next(request)
-    from .ingress import security_headers_for
-
-    ingress_active = bool(getattr(request.state, "ingress_active", False))
-    for name, value in security_headers_for(ingress_active=ingress_active).items():
-        response.headers[name] = value
-    return response
+# invariant. The ingress boundary also finalizes security/cache headers so
+# even setup redirects and auth rejections receive them.
 
 
 @app.middleware("http")
@@ -1194,7 +1855,54 @@ async def csrf_protection(request: Request, call_next):
     `require_login` returns) so SSO POSTs are still protected.
     Audit 2026-05-24, M1.
     """
-    if request.method == "POST":
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        # Enforce the boundary for every write endpoint, including unauthenticated
+        # /login and /setup and Bearer-authenticated /api routes. Stream until
+        # the cap rather than trusting Content-Length, which also safely handles
+        # chunked requests without buffering an unbounded body.
+        raw_content_length = request.headers.get("content-length")
+        if raw_content_length:
+            try:
+                content_length = int(raw_content_length)
+            except ValueError:
+                from fastapi.responses import HTMLResponse
+
+                return HTMLResponse("<h1>400 Bad Request</h1>", status_code=400)
+            if content_length < 0:
+                from fastapi.responses import HTMLResponse
+
+                return HTMLResponse("<h1>400 Bad Request</h1>", status_code=400)
+            if content_length > _MAX_FORM_BODY:
+                from fastapi.responses import HTMLResponse
+
+                return HTMLResponse(
+                    "<h1>413 Payload Too Large</h1>"
+                    "<p>Request body exceeds the submission size limit.</p>",
+                    status_code=413,
+                )
+
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > _MAX_FORM_BODY:
+                from fastapi.responses import HTMLResponse
+
+                return HTMLResponse(
+                    "<h1>413 Payload Too Large</h1>"
+                    "<p>Request body exceeds the submission size limit.</p>",
+                    status_code=413,
+                )
+            chunks.append(chunk)
+        body = b"".join(chunks)
+        request._body = body
+
+        async def receive_body():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request._receive = receive_body
+
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         path = request.url.path
         exempt = (
             path.startswith("/api/")
@@ -1210,34 +1918,13 @@ async def csrf_protection(request: Request, call_next):
                 f"ha:{ingress_user['name']}" if ingress_user else cookie_user
             )
             if user:
-                # Reject oversize bodies early so reading them doesn't
-                # OOM the container. We also reject chunked Transfer-
-                # Encoding without Content-Length, which would otherwise
-                # bypass the size cap (the body would still be buffered
-                # in full by `await request.body()`). Audit 2026-05-24
-                # (codebase review), CSRF middleware finding.
-                content_length = int(request.headers.get("content-length") or 0)
-                transfer_encoding = request.headers.get("transfer-encoding", "").lower()
-                if "chunked" in transfer_encoding and content_length == 0:
-                    from fastapi.responses import HTMLResponse
-                    return HTMLResponse(
-                        "<h1>411 Length Required</h1>"
-                        "<p>Chunked transfer-encoding is not accepted for form POSTs; "
-                        "include a Content-Length header.</p>",
-                        status_code=411,
-                    )
-                if content_length > _MAX_FORM_BODY:
-                    from fastapi.responses import HTMLResponse
-                    return HTMLResponse(
-                        "<h1>413 Payload Too Large</h1>"
-                        "<p>Request body exceeds the form-submission size limit.</p>",
-                        status_code=413,
-                    )
-
-                # Read body and cache it so downstream handlers can re-read it
-                body = await request.body()
                 from urllib.parse import parse_qs
-                parsed = parse_qs(body.decode(), keep_blank_values=True)
+                try:
+                    parsed = parse_qs(body.decode(), keep_blank_values=True)
+                except UnicodeDecodeError:
+                    from fastapi.responses import HTMLResponse
+
+                    return HTMLResponse("<h1>400 Bad Request</h1>", status_code=400)
                 token = parsed.get("_csrf_token", [""])[0]
                 if not validate_csrf_token(token, user):
                     from fastapi.responses import HTMLResponse
@@ -1246,11 +1933,6 @@ async def csrf_protection(request: Request, call_next):
                         '<a href="javascript:history.back()">Go back</a></p>',
                         status_code=403,
                     )
-                # Cache the body for downstream form parsing
-                async def receive():
-                    return {"type": "http.request", "body": body, "more_body": False}
-                request._receive = receive
-
     response = await call_next(request)
     return response
 

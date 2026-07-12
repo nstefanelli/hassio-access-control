@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -41,7 +43,8 @@ CREATE TABLE IF NOT EXISTS locks (
     buzz_duration       INTEGER NOT NULL DEFAULT 30,
     remote_buzz_enabled INTEGER NOT NULL DEFAULT 0,
     access_location_id  TEXT,
-    sync_hub_state      INTEGER NOT NULL DEFAULT 0
+    sync_hub_state      INTEGER NOT NULL DEFAULT 0,
+    upstream_present    INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS access_rules (
@@ -167,6 +170,28 @@ CREATE TABLE IF NOT EXISTS pending_relocks (
     created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS hub_sync_holds (
+    entity_id       TEXT    NOT NULL,
+    hub_device_id   TEXT    NOT NULL,
+    hub_lock_id     INTEGER,
+    hub_location_id TEXT,
+    hub_name        TEXT    NOT NULL,
+    override_type   TEXT    NOT NULL DEFAULT 'keep_unlock',
+    created_at      REAL    NOT NULL,
+    PRIMARY KEY (entity_id, hub_device_id)
+);
+
+CREATE TABLE IF NOT EXISTS hub_sync_state (
+    entity_id              TEXT PRIMARY KEY,
+    desired_state          TEXT NOT NULL,
+    source                 TEXT NOT NULL,
+    ha_state               TEXT NOT NULL,
+    access_state           TEXT NOT NULL,
+    access_rule_fingerprint TEXT NOT NULL,
+    pairing_signature      TEXT NOT NULL,
+    updated_at             REAL NOT NULL
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_entry_dev_device ON entry_devices(lock_id, type, device_id) WHERE device_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_entry_dev_entity ON entry_devices(lock_id, type, entity_id) WHERE entity_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_access_rules_user   ON access_rules(user_id);
@@ -175,6 +200,7 @@ CREATE INDEX IF NOT EXISTS idx_access_log_timestamp ON access_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_access_log_lock_ts  ON access_log(lock_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_access_log_user_ts  ON access_log(user_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_ui_cache_expires_at ON ui_cache(expires_at);
+CREATE INDEX IF NOT EXISTS idx_visitors_status ON visitors(status);
 """
 
 
@@ -205,6 +231,38 @@ class Database:
     def __init__(self, path: Path = DB_PATH) -> None:
         self._path = path
         self._db: Optional[aiosqlite.Connection] = None
+        # Rate-limit rows are read/modified as small read-modify-write
+        # operations.  Serialising those operations in-process avoids two
+        # coroutines racing the same subject without using BEGIN IMMEDIATE on
+        # the application's shared connection (which also collided with the
+        # topology sync's formerly uncommitted batch).
+        self._rate_limit_lock = asyncio.Lock()
+        # Config values frequently form one logical secret/credential bundle.
+        # Keep all config writers behind the same lock so a multi-key update
+        # cannot be interleaved with a single-key update on the shared
+        # connection.
+        self._config_lock = asyncio.Lock()
+        # Hub hold ownership crosses a physical-command boundary and therefore
+        # needs transaction ownership stronger than the shared connection can
+        # provide. Its writes use isolated connections and serialize here.
+        self._hub_hold_lock = asyncio.Lock()
+        # A pending relock is a write-ahead safety intent for a physical
+        # unlock. Give those transitions isolated transaction ownership so an
+        # unrelated coroutine cannot commit or roll them back on the shared
+        # application connection.
+        self._pending_relock_lock = asyncio.Lock()
+        self._group_locks_write_lock = asyncio.Lock()
+        # Legacy explicit commit=False upserts use a task-owned isolated
+        # connection. The main connection runs in autocommit mode so one
+        # coroutine's commit/rollback can never capture another's write.
+        self._batch_connections: dict[asyncio.Task, aiosqlite.Connection] = {}
+        # UI response caches are deliberately process-local.  Persisting
+        # 15-30 second values to SQLite added two write transactions at every
+        # expiry (delete-on-read + upsert) and retained stale console data
+        # across restarts.  Store the JSON representation so every read still
+        # returns a defensive deep copy and non-JSON values fail exactly as
+        # they did when written to the database.
+        self._ui_cache: dict[str, tuple[str, float]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -212,7 +270,8 @@ class Database:
 
     async def connect(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(self._path)
+        self._ui_cache.clear()
+        self._db = await aiosqlite.connect(self._path, isolation_level=None)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
@@ -397,23 +456,360 @@ class Database:
             )
             await self._db.execute("DROP INDEX IF EXISTS idx_users_ulp_id")
 
+            # Migration 20: durable ownership of persistent Access rules
+            # created by HubSyncManager. These rows are written before the
+            # physical command and removed only after a confirmed replacement,
+            # allowing a fresh process to fail-safe and later release them.
+            await self._db.execute(
+                """CREATE TABLE IF NOT EXISTS hub_sync_holds (
+                    entity_id       TEXT    NOT NULL,
+                    hub_device_id   TEXT    NOT NULL,
+                    hub_lock_id     INTEGER,
+                    hub_location_id TEXT,
+                    hub_name        TEXT    NOT NULL,
+                    override_type   TEXT    NOT NULL DEFAULT 'keep_unlock',
+                    created_at      REAL    NOT NULL,
+                    PRIMARY KEY (entity_id, hub_device_id)
+                )"""
+            )
+            # Migration 23: official Access commands address doors by their
+            # location id, and fail-safe keep_lock is itself a persistent rule
+            # that must be released after an incident.  Preserve both pieces of
+            # app-owned override state across restarts. Existing rows predate
+            # these columns and necessarily represent keep_unlock ownership.
+            async with self._db.execute(
+                "PRAGMA table_info(hub_sync_holds)"
+            ) as cur:
+                hold_cols = {row[1] for row in await cur.fetchall()}
+            if "hub_location_id" not in hold_cols:
+                await self._db.execute(
+                    "ALTER TABLE hub_sync_holds ADD COLUMN hub_location_id TEXT"
+                )
+            if "override_type" not in hold_cols:
+                await self._db.execute(
+                    "ALTER TABLE hub_sync_holds ADD COLUMN override_type "
+                    "TEXT NOT NULL DEFAULT 'keep_unlock'"
+                )
+            await self._db.execute(
+                """UPDATE hub_sync_holds
+                      SET hub_location_id = (
+                              SELECT location_id
+                                FROM locks
+                               WHERE locks.id = hub_sync_holds.hub_lock_id
+                               LIMIT 1
+                          )
+                    WHERE hub_location_id IS NULL
+                      AND hub_lock_id IS NOT NULL"""
+            )
+            await self._db.execute(
+                """UPDATE hub_sync_holds
+                      SET hub_location_id = (
+                              SELECT location_id
+                                FROM locks
+                               WHERE locks.device_id = hub_sync_holds.hub_device_id
+                               LIMIT 1
+                          )
+                    WHERE hub_location_id IS NULL
+                      AND hub_device_id != ''"""
+            )
+
+            # Migration 22: last fully confirmed bidirectional convergence.
+            # This is deliberately separate from hub_sync_holds: a rule that
+            # originated in Access (not this app) is useful reconciliation
+            # history, but it must never be mistaken for an app-owned override
+            # that startup/opt-out is allowed to clear.
+            await self._db.execute(
+                """CREATE TABLE IF NOT EXISTS hub_sync_state (
+                    entity_id               TEXT PRIMARY KEY,
+                    desired_state           TEXT NOT NULL,
+                    source                  TEXT NOT NULL,
+                    ha_state                TEXT NOT NULL,
+                    access_state            TEXT NOT NULL,
+                    access_rule_fingerprint TEXT NOT NULL,
+                    pairing_signature       TEXT NOT NULL,
+                    updated_at              REAL NOT NULL
+                )"""
+            )
+
+            # Migration 21: preserve native lock history while retiring doors
+            # absent from a non-empty authoritative Access snapshot.
+            async with self._db.execute("PRAGMA table_info(locks)") as cur:
+                cols = {row[1] for row in await cur.fetchall()}
+            if "upstream_present" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE locks ADD COLUMN upstream_present "
+                    "INTEGER NOT NULL DEFAULT 1"
+                )
+
             await self._db.commit()
         except Exception:
             await self._db.rollback()
             raise
 
     async def close(self) -> None:
+        self._ui_cache.clear()
+        batches = list(self._batch_connections.values())
+        self._batch_connections.clear()
+        for connection in batches:
+            try:
+                await connection.rollback()
+            finally:
+                await connection.close()
         if self._db is not None:
             await self._db.close()
             self._db = None
 
     async def commit(self) -> None:
-        """Commit a batch started by write methods called with commit=False."""
-        await self._db.commit()
+        """Commit this task's isolated batch started with ``commit=False``."""
+        task = asyncio.current_task()
+        connection = self._batch_connections.pop(task, None)
+        if connection is None:
+            await self._db.commit()
+            return
+        try:
+            await connection.commit()
+        finally:
+            await connection.close()
 
     async def rollback(self) -> None:
-        """Discard an uncommitted batch (e.g. a sync that failed midway)."""
-        await self._db.rollback()
+        """Discard this task's isolated ``commit=False`` batch."""
+        task = asyncio.current_task()
+        connection = self._batch_connections.pop(task, None)
+        if connection is None:
+            await self._db.rollback()
+            return
+        try:
+            await connection.rollback()
+        finally:
+            await connection.close()
+
+    async def _batch_connection(self) -> aiosqlite.Connection:
+        """Return/create the current task's isolated explicit batch."""
+        if str(self._path) == ":memory:":
+            raise RuntimeError("commit=False batches require a file-backed database")
+        task = asyncio.current_task()
+        connection = self._batch_connections.get(task)
+        if connection is not None:
+            return connection
+        connection = await aiosqlite.connect(self._path)
+        connection.row_factory = aiosqlite.Row
+        await connection.execute("PRAGMA foreign_keys=ON")
+        await connection.execute("PRAGMA busy_timeout = 5000")
+        await connection.execute("BEGIN IMMEDIATE")
+        self._batch_connections[task] = connection
+        return connection
+
+    async def sync_topology(
+        self,
+        users: list[dict[str, Any]],
+        locks: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        """Atomically apply a complete Access user/lock topology snapshot.
+
+        The sync runs on a short-lived, dedicated SQLite connection.  A
+        commit or rollback here therefore cannot flush or discard work queued
+        by request handlers on the application's primary connection.  This is
+        important because an ``aiosqlite.Connection`` serialises statements,
+        but it does *not* give concurrent coroutines transaction ownership.
+
+        Unchanged rows are not rewritten.  An empty (or wholly malformed)
+        user snapshot is treated as an upstream failure and never marks every
+        local user deleted; valid lock rows can still be refreshed.
+        """
+        if str(self._path) == ":memory:":
+            raise ValueError("sync_topology requires a file-backed database")
+
+        normalized_users: dict[str, tuple[str, Optional[str], str]] = {}
+        users_skipped = 0
+        users_duplicates = 0
+        for user in users:
+            ulp_id = user.get("ulp_id")
+            if not ulp_id:
+                users_skipped += 1
+                continue
+            ulp_id = str(ulp_id)
+            if ulp_id in normalized_users:
+                users_duplicates += 1
+            normalized_users[ulp_id] = (
+                user.get("name") or "",
+                user.get("email") or None,
+                user.get("status") or "active",
+            )
+
+        normalized_locks: dict[str, tuple[str, str, Optional[str]]] = {}
+        locks_skipped = 0
+        locks_duplicates = 0
+        for lock in locks:
+            device_id = lock.get("device_id")
+            location_id = lock.get("location_id")
+            if not device_id or not location_id:
+                locks_skipped += 1
+                continue
+            location_id = str(location_id)
+            if location_id in normalized_locks:
+                locks_duplicates += 1
+            normalized_locks[location_id] = (
+                str(device_id),
+                lock.get("name") or "",
+                lock.get("door_name") or None,
+            )
+
+        stats: dict[str, int] = {
+            "users_seen": len(normalized_users),
+            "users_inserted": 0,
+            "users_updated": 0,
+            "users_unchanged": 0,
+            "users_marked_deleted": 0,
+            "users_skipped": users_skipped,
+            "users_duplicates": users_duplicates,
+            "empty_user_guard": int(not normalized_users),
+            "locks_seen": len(normalized_locks),
+            "locks_inserted": 0,
+            "locks_updated": 0,
+            "locks_unchanged": 0,
+            "locks_marked_missing": 0,
+            "locks_skipped": locks_skipped,
+            "locks_duplicates": locks_duplicates,
+        }
+
+        if not normalized_users:
+            _LOGGER.warning(
+                "Topology sync received no valid users — refusing to mark all "
+                "local users deleted"
+            )
+
+        isolated: Optional[aiosqlite.Connection] = None
+        try:
+            isolated = await aiosqlite.connect(self._path)
+            isolated.row_factory = aiosqlite.Row
+            await isolated.execute("PRAGMA foreign_keys=ON")
+            await isolated.execute("PRAGMA busy_timeout = 5000")
+            await isolated.execute("BEGIN IMMEDIATE")
+
+            async with isolated.execute(
+                "SELECT ulp_id, name, email, status FROM users"
+            ) as cursor:
+                existing_users = {
+                    row["ulp_id"]: (row["name"], row["email"], row["status"])
+                    for row in await cursor.fetchall()
+                }
+
+            user_inserts: list[tuple[str, str, Optional[str], str, str]] = []
+            user_updates: list[tuple[str, Optional[str], str, str, str]] = []
+            synced_at = _utc_now_sqlite()
+            for ulp_id, values in normalized_users.items():
+                existing = existing_users.get(ulp_id)
+                if existing is None:
+                    name, email, status = values
+                    user_inserts.append((ulp_id, name, email, status, synced_at))
+                elif existing != values:
+                    name, email, status = values
+                    user_updates.append((name, email, status, synced_at, ulp_id))
+                else:
+                    stats["users_unchanged"] += 1
+
+            if user_inserts:
+                await isolated.executemany(
+                    """INSERT INTO users (ulp_id, name, email, status, synced_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    user_inserts,
+                )
+                stats["users_inserted"] = len(user_inserts)
+            if user_updates:
+                await isolated.executemany(
+                    """UPDATE users
+                       SET name = ?, email = ?, status = ?, synced_at = ?
+                       WHERE ulp_id = ?""",
+                    user_updates,
+                )
+                stats["users_updated"] = len(user_updates)
+
+            if normalized_users:
+                deleted_user_ids = [
+                    (ulp_id,)
+                    for ulp_id, (_, _, status) in existing_users.items()
+                    if ulp_id not in normalized_users
+                    and status != "deleted_upstream"
+                ]
+                if deleted_user_ids:
+                    # executemany avoids a giant NOT IN placeholder list and
+                    # emits no UPDATE at all for the steady-state no-op sync.
+                    await isolated.executemany(
+                        """UPDATE users SET status = 'deleted_upstream'
+                           WHERE ulp_id = ?""",
+                        deleted_user_ids,
+                    )
+                    stats["users_marked_deleted"] = len(deleted_user_ids)
+
+            async with isolated.execute(
+                """SELECT location_id, device_id, name, door_name,
+                          upstream_present
+                   FROM locks
+                   WHERE type = 'access_native' AND location_id IS NOT NULL"""
+            ) as cursor:
+                existing_locks = {
+                    row["location_id"]: (
+                        row["device_id"], row["name"], row["door_name"],
+                        row["upstream_present"]
+                    )
+                    for row in await cursor.fetchall()
+                }
+
+            lock_inserts: list[tuple[str, str, str, Optional[str]]] = []
+            lock_updates: list[tuple[str, str, Optional[str], str]] = []
+            for location_id, values in normalized_locks.items():
+                existing = existing_locks.get(location_id)
+                if existing is None:
+                    device_id, name, door_name = values
+                    lock_inserts.append((device_id, location_id, name, door_name))
+                elif existing != (*values, 1):
+                    device_id, name, door_name = values
+                    lock_updates.append((device_id, name, door_name, location_id))
+                else:
+                    stats["locks_unchanged"] += 1
+
+            if lock_inserts:
+                await isolated.executemany(
+                    """INSERT INTO locks
+                           (type, device_id, location_id, name, door_name)
+                       VALUES ('access_native', ?, ?, ?, ?)""",
+                    lock_inserts,
+                )
+                stats["locks_inserted"] = len(lock_inserts)
+            if lock_updates:
+                await isolated.executemany(
+                    """UPDATE locks
+                       SET device_id = ?, name = ?, door_name = ?,
+                           upstream_present = 1
+                       WHERE location_id = ?""",
+                    lock_updates,
+                )
+                stats["locks_updated"] = len(lock_updates)
+
+            if normalized_locks:
+                missing_locations = [
+                    (location_id,)
+                    for location_id, values in existing_locks.items()
+                    if location_id not in normalized_locks and values[3] != 0
+                ]
+                if missing_locations:
+                    await isolated.executemany(
+                        """UPDATE locks SET upstream_present = 0
+                           WHERE type = 'access_native' AND location_id = ?""",
+                        missing_locations,
+                    )
+                    stats["locks_marked_missing"] = len(missing_locations)
+
+            await isolated.commit()
+        except Exception:
+            if isolated is not None:
+                await isolated.rollback()
+            raise
+        finally:
+            if isolated is not None:
+                await isolated.close()
+
+        return stats
 
     # ------------------------------------------------------------------
     # Config
@@ -427,12 +823,61 @@ class Database:
             return row["value"] if row else None
 
     async def set_config(self, key: str, value: str) -> None:
-        await self._db.execute(
-            "INSERT INTO config (key, value) VALUES (?, ?)"
-            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
-        )
-        await self._db.commit()
+        async with self._config_lock:
+            try:
+                await self._db.execute(
+                    "INSERT INTO config (key, value) VALUES (?, ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+                await self._db.commit()
+            except BaseException:
+                await self._db.rollback()
+                raise
+
+    async def set_configs(self, values: dict[str, str]) -> None:
+        """Atomically upsert a logical bundle of config values.
+
+        Credential and encryption metadata must never be observable as a
+        partly-written bundle. File-backed databases use an isolated
+        transaction so an unrelated coroutine on the application's shared
+        connection cannot commit or roll back the bundle. The config lock also
+        serializes this with :meth:`set_config`.
+        """
+        if not values:
+            return
+        async with self._config_lock:
+            if str(self._path) == ":memory:":
+                try:
+                    await self._db.executemany(
+                        "INSERT INTO config (key, value) VALUES (?, ?)"
+                        " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        list(values.items()),
+                    )
+                    await self._db.commit()
+                except BaseException:
+                    await self._db.rollback()
+                    raise
+                return
+
+            isolated: Optional[aiosqlite.Connection] = None
+            try:
+                isolated = await aiosqlite.connect(self._path)
+                await isolated.execute("PRAGMA busy_timeout = 5000")
+                await isolated.execute("BEGIN IMMEDIATE")
+                await isolated.executemany(
+                    "INSERT INTO config (key, value) VALUES (?, ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    list(values.items()),
+                )
+                await isolated.commit()
+            except BaseException:
+                if isolated is not None:
+                    await isolated.rollback()
+                raise
+            finally:
+                if isolated is not None:
+                    await isolated.close()
 
     # ------------------------------------------------------------------
     # Users
@@ -501,7 +946,8 @@ class Database:
         "last sync tick". Pass commit=False to batch several upserts
         into one transaction; the caller then owns commit()/rollback().
         """
-        async with self._db.execute(
+        connection = self._db if commit else await self._batch_connection()
+        async with connection.execute(
             "SELECT id, name, email, status FROM users WHERE ulp_id = ?", (ulp_id,)
         ) as cursor:
             existing = await cursor.fetchone()
@@ -515,7 +961,7 @@ class Database:
 
         if synced_at is None:
             synced_at = _utc_now_sqlite()
-        await self._db.execute(
+        await connection.execute(
             """
             INSERT INTO users (ulp_id, name, email, status, synced_at)
             VALUES (?, ?, ?, ?, ?)
@@ -528,10 +974,10 @@ class Database:
             (ulp_id, name, email, status, synced_at),
         )
         if commit:
-            await self._db.commit()
+            await connection.commit()
         if existing is not None:
             return existing["id"]
-        async with self._db.execute(
+        async with connection.execute(
             "SELECT id FROM users WHERE ulp_id = ?", (ulp_id,)
         ) as cursor:
             row = await cursor.fetchone()
@@ -570,7 +1016,10 @@ class Database:
     # ------------------------------------------------------------------
 
     async def get_lock_count(self) -> int:
-        async with self._db.execute("SELECT COUNT(*) FROM locks") as cur:
+        async with self._db.execute(
+            "SELECT COUNT(*) FROM locks "
+            "WHERE type != 'access_native' OR upstream_present = 1"
+        ) as cur:
             row = await cur.fetchone()
             return row[0] if row else 0
 
@@ -578,7 +1027,11 @@ class Database:
         if include_hidden:
             sql = "SELECT * FROM locks ORDER BY name"
         else:
-            sql = "SELECT * FROM locks WHERE hidden = 0 ORDER BY name"
+            sql = (
+                "SELECT * FROM locks WHERE hidden = 0 "
+                "AND (type != 'access_native' OR upstream_present = 1) "
+                "ORDER BY name"
+            )
         async with self._db.execute(sql) as cursor:
             rows = await cursor.fetchall()
             return [_row_to_dict(r) for r in rows]
@@ -591,14 +1044,18 @@ class Database:
 
     async def get_lock(self, lock_id: int) -> Optional[dict[str, Any]]:
         async with self._db.execute(
-            "SELECT * FROM locks WHERE id = ?", (lock_id,)
+            "SELECT * FROM locks WHERE id = ? "
+            "AND (type != 'access_native' OR upstream_present = 1)",
+            (lock_id,),
         ) as cursor:
             row = await cursor.fetchone()
             return _row_to_dict(row) if row else None
 
     async def get_lock_by_location(self, location_id: str) -> Optional[dict[str, Any]]:
         async with self._db.execute(
-            "SELECT * FROM locks WHERE location_id = ?", (location_id,)
+            "SELECT * FROM locks WHERE location_id = ? "
+            "AND (type != 'access_native' OR upstream_present = 1)",
+            (location_id,),
         ) as cursor:
             row = await cursor.fetchone()
             return _row_to_dict(row) if row else None
@@ -616,19 +1073,21 @@ class Database:
         Pass commit=False to batch into the caller's transaction (the
         topology resync batches all lock+user upserts into one commit).
         """
-        cursor = await self._db.execute(
+        connection = self._db if commit else await self._batch_connection()
+        cursor = await connection.execute(
             """INSERT INTO locks (type, device_id, location_id, name, door_name)
                VALUES ('access_native', ?, ?, ?, ?)
                ON CONFLICT(location_id) WHERE location_id IS NOT NULL DO UPDATE SET
                    device_id  = excluded.device_id,
                    name       = excluded.name,
-                   door_name  = excluded.door_name
+                   door_name  = excluded.door_name,
+                   upstream_present = 1
                RETURNING id""",
             (device_id, location_id, name, door_name),
         )
         row = await cursor.fetchone()
         if commit:
-            await self._db.commit()
+            await connection.commit()
         return row[0]
 
     async def add_external_lock(
@@ -703,6 +1162,7 @@ class Database:
         break hub-state mirroring (field report 2026-07-12).
         """
         sql = "SELECT * FROM locks WHERE (location_id = ? OR access_location_id = ?)"
+        sql += " AND (type != 'access_native' OR upstream_present = 1)"
         if not include_hidden:
             sql += " AND hidden = 0"
         async with self._db.execute(sql, (location_id, location_id)) as cursor:
@@ -1038,17 +1498,32 @@ class Database:
             return [_row_to_dict(r) for r in await cursor.fetchall()]
 
     async def set_group_locks(self, group_id: int, lock_ids: list[int]) -> None:
-        try:
-            await self._db.execute("DELETE FROM group_locks WHERE group_id = ?", (group_id,))
-            for lid in lock_ids:
-                await self._db.execute(
-                    "INSERT INTO group_locks (group_id, lock_id) VALUES (?, ?)",
-                    (group_id, lid),
+        async with self._group_locks_write_lock:
+            if str(self._path) == ":memory:":
+                connection = self._db
+                close_after = False
+            else:
+                connection = await aiosqlite.connect(self._path)
+                await connection.execute("PRAGMA foreign_keys=ON")
+                await connection.execute("PRAGMA busy_timeout = 5000")
+                close_after = True
+            try:
+                await connection.execute("BEGIN IMMEDIATE")
+                await connection.execute(
+                    "DELETE FROM group_locks WHERE group_id = ?", (group_id,)
                 )
-            await self._db.commit()
-        except Exception:
-            await self._db.rollback()
-            raise
+                if lock_ids:
+                    await connection.executemany(
+                        "INSERT INTO group_locks (group_id, lock_id) VALUES (?, ?)",
+                        [(group_id, lid) for lid in lock_ids],
+                    )
+                await connection.commit()
+            except BaseException:
+                await connection.rollback()
+                raise
+            finally:
+                if close_after:
+                    await connection.close()
 
     async def get_all_user_group_names(self) -> dict[int, list[str]]:
         """Return a mapping of user_id → list of group names for all users."""
@@ -1138,13 +1613,29 @@ class Database:
         await self._db.execute("DELETE FROM entry_devices WHERE id = ?", (device_id,))
         await self._db.commit()
 
-    async def get_locks_by_entry_device(self, device_type: str, device_id: str | None = None, entity_id: str | None = None) -> list[dict[str, Any]]:
-        """Find locks linked to a specific entry device."""
+    async def get_locks_by_entry_device(
+        self,
+        device_type: str,
+        device_id: str | None = None,
+        entity_id: str | None = None,
+        *,
+        include_hidden: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Find locks linked to an entry device, excluding hidden locks by default."""
+        hidden_clause = " AND (l.type != 'access_native' OR l.upstream_present = 1)"
+        if not include_hidden:
+            hidden_clause += " AND l.hidden = 0"
         if device_id:
-            query = "SELECT l.* FROM locks l JOIN entry_devices ed ON ed.lock_id = l.id WHERE ed.type = ? AND ed.device_id = ?"
+            query = (
+                "SELECT l.* FROM locks l JOIN entry_devices ed ON ed.lock_id = l.id "
+                "WHERE ed.type = ? AND ed.device_id = ?" + hidden_clause
+            )
             params = (device_type, device_id)
         elif entity_id:
-            query = "SELECT l.* FROM locks l JOIN entry_devices ed ON ed.lock_id = l.id WHERE ed.type = ? AND ed.entity_id = ?"
+            query = (
+                "SELECT l.* FROM locks l JOIN entry_devices ed ON ed.lock_id = l.id "
+                "WHERE ed.type = ? AND ed.entity_id = ?" + hidden_clause
+            )
             params = (device_type, entity_id)
         else:
             return []
@@ -1238,6 +1729,14 @@ class Database:
             rows = await cursor.fetchall()
             return [_row_to_dict(r) for r in rows]
 
+    async def get_active_visitors(self) -> list[dict[str, Any]]:
+        """Return visitors that still require upstream status polling."""
+        async with self._db.execute(
+            "SELECT * FROM visitors WHERE status = 1 ORDER BY created_at DESC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [_row_to_dict(r) for r in rows]
+
     async def get_visitor(self, visitor_id: int) -> dict[str, Any] | None:
         async with self._db.execute(
             "SELECT * FROM visitors WHERE id = ?", (visitor_id,)
@@ -1251,11 +1750,56 @@ class Database:
         )
         await self._db.commit()
 
+    async def update_visitor_status_if_snapshot(
+        self,
+        visitor_id: int,
+        *,
+        expected_status: int,
+        expected_end_time: str,
+        status: int,
+    ) -> bool:
+        """Apply an upstream status only if the local visitor is unchanged."""
+        cursor = await self._db.execute(
+            "UPDATE visitors SET status = ? "
+            "WHERE id = ? AND status = ? AND end_time = ?",
+            (status, visitor_id, expected_status, expected_end_time),
+        )
+        await self._db.commit()
+        return cursor.rowcount == 1
+
     async def update_visitor_end_time(self, visitor_id: int, end_time: str) -> None:
         await self._db.execute(
             "UPDATE visitors SET end_time = ? WHERE id = ?", (end_time, visitor_id)
         )
         await self._db.commit()
+
+    async def update_active_visitor_end_time(
+        self,
+        visitor_id: int,
+        end_time: str,
+        *,
+        expected_end_time: str,
+    ) -> bool:
+        """Update an active visitor only; return False if it expired concurrently."""
+        cursor = await self._db.execute(
+            "UPDATE visitors SET end_time = ? "
+            "WHERE id = ? AND status = 1 AND end_time = ?",
+            (end_time, visitor_id, expected_end_time),
+        )
+        await self._db.commit()
+        return cursor.rowcount == 1
+
+    async def expire_active_visitor(
+        self, visitor_id: int, expected_end_time: str
+    ) -> bool:
+        """Expire only the unchanged active snapshot used by the sync loop."""
+        cursor = await self._db.execute(
+            "UPDATE visitors SET status = 4 "
+            "WHERE id = ? AND status = 1 AND end_time = ?",
+            (visitor_id, expected_end_time),
+        )
+        await self._db.commit()
+        return cursor.rowcount == 1
 
     async def delete_visitor(self, visitor_id: int) -> None:
         await self._db.execute("DELETE FROM visitors WHERE id = ?", (visitor_id,))
@@ -1272,31 +1816,29 @@ class Database:
     # ------------------------------------------------------------------
 
     async def is_rate_limited(self, scope: str, subject: str, now: float | None = None) -> bool:
-        now = now if now is not None else __import__("time").time()
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
-            async with self._db.execute(
-                "SELECT lockout_until FROM rate_limits WHERE scope = ? AND subject = ?",
-                (scope, subject),
-            ) as cur:
-                row = await cur.fetchone()
-            if not row:
-                await self._db.commit()
-                return False
-            lockout_until = row["lockout_until"] or 0
-            if now < lockout_until:
-                await self._db.commit()
-                return True
-            if lockout_until:
-                await self._db.execute(
-                    "DELETE FROM rate_limits WHERE scope = ? AND subject = ?",
+        now = now if now is not None else time.time()
+        async with self._rate_limit_lock:
+            try:
+                async with self._db.execute(
+                    "SELECT lockout_until FROM rate_limits WHERE scope = ? AND subject = ?",
                     (scope, subject),
-                )
-            await self._db.commit()
-            return False
-        except Exception:
-            await self._db.rollback()
-            raise
+                ) as cur:
+                    row = await cur.fetchone()
+                if not row:
+                    return False
+                lockout_until = row["lockout_until"] or 0
+                if now < lockout_until:
+                    return True
+                if lockout_until:
+                    await self._db.execute(
+                        "DELETE FROM rate_limits WHERE scope = ? AND subject = ?",
+                        (scope, subject),
+                    )
+                    await self._db.commit()
+                return False
+            except Exception:
+                await self._db.rollback()
+                raise
 
     async def record_rate_limit_failure(
         self,
@@ -1309,44 +1851,59 @@ class Database:
         now: float | None = None,
     ) -> bool:
         """Record a failed attempt. Returns True if the subject is now locked."""
-        import time
-
         now = now if now is not None else time.time()
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
-            async with self._db.execute(
-                "SELECT attempts_json, lockout_until FROM rate_limits WHERE scope = ? AND subject = ?",
-                (scope, subject),
-            ) as cur:
-                row = await cur.fetchone()
+        async with self._rate_limit_lock:
+            try:
+                async with self._db.execute(
+                    "SELECT attempts_json, lockout_until FROM rate_limits WHERE scope = ? AND subject = ?",
+                    (scope, subject),
+                ) as cur:
+                    row = await cur.fetchone()
 
-            attempts = json.loads(row["attempts_json"]) if row and row["attempts_json"] else []
-            attempts = [t for t in attempts if t > now - window]
-            attempts.append(now)
-            lockout_until = now + lockout if len(attempts) >= max_attempts else 0
-            stored_attempts = [] if lockout_until else attempts
-            await self._db.execute(
-                """
-                INSERT INTO rate_limits (scope, subject, attempts_json, lockout_until)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(scope, subject) DO UPDATE SET
-                    attempts_json = excluded.attempts_json,
-                    lockout_until = excluded.lockout_until
-                """,
-                (scope, subject, json.dumps(stored_attempts), lockout_until),
-            )
-            await self._db.commit()
-            return bool(lockout_until)
-        except Exception:
-            await self._db.rollback()
-            raise
+                existing_lockout = row["lockout_until"] if row else 0
+                if existing_lockout and now < existing_lockout:
+                    return True
+                attempts = json.loads(row["attempts_json"]) if row and row["attempts_json"] else []
+                attempts = [t for t in attempts if t > now - window]
+                attempts.append(now)
+                lockout_until = now + lockout if len(attempts) >= max_attempts else 0
+                stored_attempts = [] if lockout_until else attempts
+                await self._db.execute(
+                    """
+                    INSERT INTO rate_limits (scope, subject, attempts_json, lockout_until)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(scope, subject) DO UPDATE SET
+                        attempts_json = excluded.attempts_json,
+                        lockout_until = excluded.lockout_until
+                    """,
+                    (scope, subject, json.dumps(stored_attempts), lockout_until),
+                )
+                await self._db.commit()
+                return bool(lockout_until)
+            except Exception:
+                await self._db.rollback()
+                raise
 
     async def clear_rate_limit(self, scope: str, subject: str) -> None:
-        await self._db.execute(
-            "DELETE FROM rate_limits WHERE scope = ? AND subject = ?",
-            (scope, subject),
-        )
-        await self._db.commit()
+        async with self._rate_limit_lock:
+            try:
+                # Successful authenticated requests are the hot path.  Avoid
+                # opening a SQLite write transaction when this subject has no
+                # failure row to clear (normally the case).
+                async with self._db.execute(
+                    "SELECT 1 FROM rate_limits WHERE scope = ? AND subject = ?",
+                    (scope, subject),
+                ) as cur:
+                    if await cur.fetchone() is None:
+                        return
+                await self._db.execute(
+                    "DELETE FROM rate_limits WHERE scope = ? AND subject = ?",
+                    (scope, subject),
+                )
+                await self._db.commit()
+            except Exception:
+                await self._db.rollback()
+                raise
 
     async def consume_rate_limit(
         self,
@@ -1359,102 +1916,292 @@ class Database:
         now: float | None = None,
     ) -> bool:
         """Record an action attempt. Returns True if allowed, False if locked."""
-        import time
-
         now = now if now is not None else time.time()
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
-            async with self._db.execute(
-                "SELECT attempts_json, lockout_until FROM rate_limits WHERE scope = ? AND subject = ?",
-                (scope, subject),
-            ) as cur:
-                row = await cur.fetchone()
+        async with self._rate_limit_lock:
+            try:
+                async with self._db.execute(
+                    "SELECT attempts_json, lockout_until FROM rate_limits WHERE scope = ? AND subject = ?",
+                    (scope, subject),
+                ) as cur:
+                    row = await cur.fetchone()
 
-            lockout_until = row["lockout_until"] if row else 0
-            if lockout_until and now < lockout_until:
-                await self._db.commit()
-                return False
+                lockout_until = row["lockout_until"] if row else 0
+                if lockout_until and now < lockout_until:
+                    return False
 
-            attempts = json.loads(row["attempts_json"]) if row and row["attempts_json"] else []
-            attempts = [t for t in attempts if t > now - window]
-            if len(attempts) >= max_attempts:
+                attempts = json.loads(row["attempts_json"]) if row and row["attempts_json"] else []
+                attempts = [t for t in attempts if t > now - window]
+                if len(attempts) >= max_attempts:
+                    await self._db.execute(
+                        """
+                        INSERT INTO rate_limits (scope, subject, attempts_json, lockout_until)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(scope, subject) DO UPDATE SET
+                            attempts_json = excluded.attempts_json,
+                            lockout_until = excluded.lockout_until
+                        """,
+                        (scope, subject, json.dumps([]), now + lockout),
+                    )
+                    await self._db.commit()
+                    return False
+
+                attempts.append(now)
                 await self._db.execute(
                     """
                     INSERT INTO rate_limits (scope, subject, attempts_json, lockout_until)
-                    VALUES (?, ?, ?, ?)
+                    VALUES (?, ?, ?, 0)
                     ON CONFLICT(scope, subject) DO UPDATE SET
                         attempts_json = excluded.attempts_json,
-                        lockout_until = excluded.lockout_until
+                        lockout_until = 0
                     """,
-                    (scope, subject, json.dumps([]), now + lockout),
+                    (scope, subject, json.dumps(attempts)),
                 )
                 await self._db.commit()
-                return False
-
-            attempts.append(now)
-            await self._db.execute(
-                """
-                INSERT INTO rate_limits (scope, subject, attempts_json, lockout_until)
-                VALUES (?, ?, ?, 0)
-                ON CONFLICT(scope, subject) DO UPDATE SET
-                    attempts_json = excluded.attempts_json,
-                    lockout_until = 0
-                """,
-                (scope, subject, json.dumps(attempts)),
-            )
-            await self._db.commit()
-            return True
-        except Exception:
-            await self._db.rollback()
-            raise
+                return True
+            except Exception:
+                await self._db.rollback()
+                raise
 
     async def get_ui_cache(self, key: str, now: float | None = None) -> Any | None:
-        import time
-
         now = now if now is not None else time.time()
-        async with self._db.execute(
-            "SELECT value_json, expires_at FROM ui_cache WHERE key = ?",
-            (key,),
-        ) as cur:
-            row = await cur.fetchone()
-        if not row:
+        cached = self._ui_cache.get(key)
+        if cached is None:
             return None
-        if row["expires_at"] <= now:
-            await self._db.execute("DELETE FROM ui_cache WHERE key = ?", (key,))
-            await self._db.commit()
+        value_json, expires_at = cached
+        if expires_at <= now:
+            self._ui_cache.pop(key, None)
             return None
-        return json.loads(row["value_json"])
+        return json.loads(value_json)
 
     async def set_ui_cache(self, key: str, value: Any, ttl: int, now: float | None = None) -> None:
-        import time
-
         now = now if now is not None else time.time()
-        await self._db.execute(
-            """
-            INSERT INTO ui_cache (key, value_json, expires_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value_json = excluded.value_json,
-                expires_at = excluded.expires_at
-            """,
-            (key, json.dumps(value), now + ttl),
-        )
-        await self._db.commit()
+        self._ui_cache[key] = (json.dumps(value), now + ttl)
 
     async def prune_runtime_state(self, now: float | None = None) -> None:
-        import time
-
         now = now if now is not None else time.time()
-        await self._db.execute("DELETE FROM ui_cache WHERE expires_at <= ?", (now,))
-        await self._db.execute(
-            "DELETE FROM rate_limits WHERE lockout_until != 0 AND lockout_until <= ? AND attempts_json = '[]'",
-            (now,),
+        expired_cache_keys = [
+            key for key, (_, expires_at) in self._ui_cache.items()
+            if expires_at <= now
+        ]
+        for key in expired_cache_keys:
+            self._ui_cache.pop(key, None)
+
+        async with self._rate_limit_lock:
+            async with self._db.execute(
+                """SELECT 1 FROM rate_limits
+                   WHERE lockout_until != 0 AND lockout_until <= ?
+                     AND attempts_json = '[]'
+                   LIMIT 1""",
+                (now,),
+            ) as cur:
+                has_expired_rows = await cur.fetchone() is not None
+            if not has_expired_rows:
+                return
+            await self._db.execute(
+                """DELETE FROM rate_limits
+                   WHERE lockout_until != 0 AND lockout_until <= ?
+                     AND attempts_json = '[]'""",
+                (now,),
+            )
+            await self._db.commit()
+
+    # ------------------------------------------------------------------
+    # Durable hub-sync holds (survive crashes/restarts)
+    # ------------------------------------------------------------------
+
+    async def _write_hub_sync_hold(
+        self, sql: str, params: tuple[Any, ...]
+    ) -> None:
+        """Execute one ownership transition in an isolated transaction."""
+        async with self._hub_hold_lock:
+            if str(self._path) == ":memory:":
+                try:
+                    await self._db.execute(sql, params)
+                    await self._db.commit()
+                except BaseException:
+                    await self._db.rollback()
+                    raise
+                return
+
+            isolated: Optional[aiosqlite.Connection] = None
+            try:
+                isolated = await aiosqlite.connect(self._path)
+                await isolated.execute("PRAGMA busy_timeout = 5000")
+                await isolated.execute("BEGIN IMMEDIATE")
+                await isolated.execute(sql, params)
+                await isolated.commit()
+            except BaseException:
+                if isolated is not None:
+                    await isolated.rollback()
+                raise
+            finally:
+                if isolated is not None:
+                    await isolated.close()
+
+    async def record_hub_sync_hold(
+        self,
+        entity_id: str,
+        hub_device_id: str,
+        hub_lock_id: Optional[int],
+        hub_name: str,
+        *,
+        hub_location_id: str | None = None,
+        override_type: str = "keep_unlock",
+        now: float | None = None,
+    ) -> None:
+        """Persist ownership of an app-managed persistent Access rule.
+
+        HubSyncManager records this *before* issuing ``keep_unlock`` or
+        ``keep_lock``. A stale row causes only a harmless idempotent safety
+        command; omitting it during the command's uncertain/crash window could
+        strand a door open or leave its native schedule suppressed.
+        """
+        if override_type not in {"keep_unlock", "keep_lock"}:
+            raise ValueError("override_type must be 'keep_unlock' or 'keep_lock'")
+        now = now if now is not None else time.time()
+        await self._write_hub_sync_hold(
+            """INSERT INTO hub_sync_holds
+                   (entity_id, hub_device_id, hub_lock_id, hub_location_id,
+                    hub_name, override_type, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(entity_id, hub_device_id) DO UPDATE SET
+                   hub_lock_id     = excluded.hub_lock_id,
+                   hub_location_id = excluded.hub_location_id,
+                   hub_name        = excluded.hub_name,
+                   override_type   = excluded.override_type""",
+            (
+                entity_id,
+                hub_device_id,
+                hub_lock_id,
+                hub_location_id,
+                hub_name,
+                override_type,
+                now,
+            ),
         )
-        await self._db.commit()
+
+    async def clear_hub_sync_hold(
+        self, entity_id: str, hub_device_id: str
+    ) -> None:
+        """Forget a hold only after its hub was confirmed reset."""
+        await self._write_hub_sync_hold(
+            """DELETE FROM hub_sync_holds
+               WHERE entity_id = ? AND hub_device_id = ?""",
+            (entity_id, hub_device_id),
+        )
+
+    async def get_hub_sync_holds(self) -> list[dict[str, Any]]:
+        """Return every hub hold that a new manager must fail-safe."""
+        async with self._db.execute(
+            """SELECT entity_id, hub_device_id, hub_lock_id, hub_location_id,
+                      hub_name, override_type, created_at
+               FROM hub_sync_holds
+               ORDER BY entity_id, hub_device_id"""
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [_row_to_dict(row) for row in rows]
+
+    async def set_hub_sync_state(
+        self,
+        *,
+        entity_id: str,
+        desired_state: str,
+        source: str,
+        ha_state: str,
+        access_state: str,
+        access_rule_fingerprint: str,
+        pairing_signature: str,
+        now: float | None = None,
+    ) -> None:
+        """Persist a fully confirmed HA/Access convergence snapshot.
+
+        The snapshot is origin metadata, not physical-command ownership.  It
+        therefore shares the isolated hub-sync writer but lives outside
+        ``hub_sync_holds`` so an Access-origin schedule is never reset merely
+        because the app restarted.
+        """
+        if desired_state not in {"locked", "unlocked"}:
+            raise ValueError("desired_state must be 'locked' or 'unlocked'")
+        if ha_state not in {"locked", "unlocked"}:
+            raise ValueError("ha_state must be 'locked' or 'unlocked'")
+        if access_state not in {"locked", "unlocked"}:
+            raise ValueError("access_state must be 'locked' or 'unlocked'")
+        await self._write_hub_sync_hold(
+            """INSERT INTO hub_sync_state
+                   (entity_id, desired_state, source, ha_state, access_state,
+                    access_rule_fingerprint, pairing_signature, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(entity_id) DO UPDATE SET
+                   desired_state           = excluded.desired_state,
+                   source                  = excluded.source,
+                   ha_state                = excluded.ha_state,
+                   access_state            = excluded.access_state,
+                   access_rule_fingerprint = excluded.access_rule_fingerprint,
+                   pairing_signature       = excluded.pairing_signature,
+                   updated_at              = excluded.updated_at""",
+            (
+                entity_id,
+                desired_state,
+                source,
+                ha_state,
+                access_state,
+                access_rule_fingerprint,
+                pairing_signature,
+                now if now is not None else time.time(),
+            ),
+        )
+
+    async def clear_hub_sync_state(self, entity_id: str) -> None:
+        """Forget reconciliation history after an entity leaves sync."""
+        await self._write_hub_sync_hold(
+            "DELETE FROM hub_sync_state WHERE entity_id = ?",
+            (entity_id,),
+        )
+
+    async def get_hub_sync_states(self) -> list[dict[str, Any]]:
+        """Return confirmed reconciliation snapshots for restart recovery."""
+        async with self._db.execute(
+            """SELECT entity_id, desired_state, source, ha_state, access_state,
+                      access_rule_fingerprint, pairing_signature, updated_at
+                 FROM hub_sync_state
+                 ORDER BY entity_id"""
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [_row_to_dict(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Pending relocks (survive restarts)
     # ------------------------------------------------------------------
+
+    async def _write_pending_relock(
+        self, sql: str, params: tuple[Any, ...]
+    ) -> int:
+        """Execute one relock ownership transition atomically."""
+        async with self._pending_relock_lock:
+            if str(self._path) == ":memory:":
+                try:
+                    cursor = await self._db.execute(sql, params)
+                    await self._db.commit()
+                    return cursor.rowcount or 0
+                except BaseException:
+                    await self._db.rollback()
+                    raise
+
+            isolated: Optional[aiosqlite.Connection] = None
+            try:
+                isolated = await aiosqlite.connect(self._path)
+                await isolated.execute("PRAGMA busy_timeout = 5000")
+                await isolated.execute("BEGIN IMMEDIATE")
+                cursor = await isolated.execute(sql, params)
+                await isolated.commit()
+                return cursor.rowcount or 0
+            except BaseException:
+                if isolated is not None:
+                    await isolated.rollback()
+                raise
+            finally:
+                if isolated is not None:
+                    await isolated.close()
 
     async def add_pending_relock(
         self,
@@ -1468,7 +2215,7 @@ class Database:
         """Upsert a pending relock — survives service restart and rehydrates on startup."""
         import time
         now = now if now is not None else time.time()
-        await self._db.execute(
+        await self._write_pending_relock(
             """INSERT INTO pending_relocks (entity_id, lock_id, lock_name, source, deadline, created_at)
                VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(entity_id) DO UPDATE SET
@@ -1479,11 +2226,11 @@ class Database:
                    created_at = excluded.created_at""",
             (entity_id, lock_id, lock_name, source, deadline, now),
         )
-        await self._db.commit()
 
     async def remove_pending_relock(self, entity_id: str) -> None:
-        await self._db.execute("DELETE FROM pending_relocks WHERE entity_id = ?", (entity_id,))
-        await self._db.commit()
+        await self._write_pending_relock(
+            "DELETE FROM pending_relocks WHERE entity_id = ?", (entity_id,)
+        )
 
     async def remove_pending_relock_at_deadline(
         self, entity_id: str, deadline: float
@@ -1495,13 +2242,21 @@ class Database:
         concurrent schedule() may have added with a newer deadline while
         the HA lock call was in flight. Returns rowcount.
         """
-        async with self._db.execute(
+        return await self._write_pending_relock(
             "DELETE FROM pending_relocks WHERE entity_id = ? AND deadline = ?",
             (entity_id, deadline),
-        ) as cur:
-            count = cur.rowcount or 0
-        await self._db.commit()
-        return count
+        )
+
+    async def replace_pending_relock_deadline(
+        self, entity_id: str, expected_deadline: float, deadline: float
+    ) -> bool:
+        """CAS a relock deadline without ever deleting the earlier fallback."""
+        changed = await self._write_pending_relock(
+            "UPDATE pending_relocks SET deadline = ? "
+            "WHERE entity_id = ? AND deadline = ?",
+            (deadline, entity_id, expected_deadline),
+        )
+        return changed == 1
 
     async def get_pending_relocks(self) -> list[dict[str, Any]]:
         async with self._db.execute(
@@ -1509,6 +2264,14 @@ class Database:
         ) as cursor:
             rows = await cursor.fetchall()
             return [_row_to_dict(r) for r in rows]
+
+    async def get_pending_relock(self, entity_id: str) -> Optional[dict[str, Any]]:
+        """Return one persisted relock by entity id, if it still exists."""
+        async with self._db.execute(
+            "SELECT * FROM pending_relocks WHERE entity_id = ?", (entity_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_dict(row) if row else None
 
     # ------------------------------------------------------------------
     # Log retention

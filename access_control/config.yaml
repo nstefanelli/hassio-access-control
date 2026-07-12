@@ -15,12 +15,13 @@ init: false
 startup: services
 boot: auto
 hassio_role: default
-hassio_api: false
+hassio_api: true
 homeassistant_api: true
 auth_api: true
 host_network: false
 ingress: true
 ingress_port: 8080
+watchdog: http://[HOST]:[PORT:8080]/health/live
 panel_icon: mdi:door-closed-lock
 panel_title: Access Control
 panel_admin: true
