@@ -4,6 +4,48 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] - 2026-07-12
+
+### Performance (idle I/O + hot-path latency)
+
+Quick wins from the 2026-07-12 end-to-end review. On a 24/7 SD-card
+host these cut idle write transactions by roughly 90% and shave
+hundreds of ms off the heavier page renders:
+
+- **Topology resync no longer rewrites unchanged rows.** `upsert_user`
+  skips the write (and the `synced_at` bump) when upstream data is
+  identical, and the whole user+lock sync batches into a single
+  committed transaction instead of one per row — previously ~10k
+  fsync'd write transactions/day at complete idle. `synced_at` now
+  means "last time upstream data changed".
+- **`/locks` and `/settings` no longer download HA's entire
+  `/api/states` per render.** The filtered lock/alarm entity lists are
+  cached for 30s alongside the existing Access/Protect caches (was
+  1–5 MB of JSON parsed per page view).
+- **Home-page alarm cache TTL raised 5s → 15s** so the 10s dashboard
+  auto-refresh actually hits the cache instead of missing it by
+  construction (an HA call + a cache write every poll, per open tab).
+- **Visitor sync checks the local table before calling the console.**
+  With zero visitors it previously made 1,440 TLS requests/day to the
+  UNVR forever.
+- **`access_log` indexes for history views.** Per-lock and per-user
+  history were table scans over 90 days of events; added
+  `(lock_id, timestamp)` and `(user_id, timestamp)` indexes and
+  dropped the redundant `idx_users_ulp_id` (duplicate of the UNIQUE
+  constraint's implicit index).
+- **Login/setup password hashing moved off the event loop.** PBKDF2 at
+  480k iterations is ~hundreds of ms of pure CPU; it now runs in a
+  worker thread so a login attempt can't stall WS door-event dispatch
+  or relock timers.
+
+### Fixed
+
+- **`log_level: notice` or `fatal` no longer crash-loops the add-on.**
+  Both are valid schema values but not uvicorn log levels; run.sh now
+  maps them (notice→info, fatal→critical). The app's own loggers also
+  honor the option now (exported as `APP_LOG_LEVEL`) — previously the
+  app was pinned to INFO, so `debug` never enabled app debug logs.
+
 ## [1.5.0] - 2026-07-12
 
 ### Added

@@ -167,12 +167,13 @@ CREATE TABLE IF NOT EXISTS pending_relocks (
     created_at REAL NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_users_ulp_id          ON users(ulp_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_entry_dev_device ON entry_devices(lock_id, type, device_id) WHERE device_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_entry_dev_entity ON entry_devices(lock_id, type, entity_id) WHERE entity_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_access_rules_user   ON access_rules(user_id);
 CREATE INDEX IF NOT EXISTS idx_access_rules_lock   ON access_rules(lock_id);
 CREATE INDEX IF NOT EXISTS idx_access_log_timestamp ON access_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_access_log_lock_ts  ON access_log(lock_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_access_log_user_ts  ON access_log(user_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_ui_cache_expires_at ON ui_cache(expires_at);
 """
 
@@ -383,6 +384,19 @@ class Database:
                     "ALTER TABLE locks ADD COLUMN sync_hub_state INTEGER NOT NULL DEFAULT 0"
                 )
 
+            # Migration 19: access_log indexes for the per-lock/per-user
+            # history views — with 90 days of events these were table
+            # scans (e2e review 2026-07-12). Also drop idx_users_ulp_id:
+            # it duplicates the implicit index from the UNIQUE constraint
+            # on users.ulp_id, costing write amplification on every sync.
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_access_log_lock_ts ON access_log(lock_id, timestamp)"
+            )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_access_log_user_ts ON access_log(user_id, timestamp)"
+            )
+            await self._db.execute("DROP INDEX IF EXISTS idx_users_ulp_id")
+
             await self._db.commit()
         except Exception:
             await self._db.rollback()
@@ -392,6 +406,14 @@ class Database:
         if self._db is not None:
             await self._db.close()
             self._db = None
+
+    async def commit(self) -> None:
+        """Commit a batch started by write methods called with commit=False."""
+        await self._db.commit()
+
+    async def rollback(self) -> None:
+        """Discard an uncommitted batch (e.g. a sync that failed midway)."""
+        await self._db.rollback()
 
     # ------------------------------------------------------------------
     # Config
@@ -466,8 +488,31 @@ class Database:
         email: Optional[str],
         status: str,
         synced_at: Optional[str] = None,
+        commit: bool = True,
     ) -> int:
-        """Insert or update a user by ulp_id. Returns the row id."""
+        """Insert or update a user by ulp_id. Returns the row id.
+
+        No-ops (no write, no synced_at bump) when the incoming values
+        match the stored row — the topology resync calls this for every
+        user every 15 minutes, and unconditionally rewriting rows in
+        per-row transactions was ~10k fsync'd write transactions/day at
+        complete idle on an SD-card host (e2e review 2026-07-12).
+        synced_at therefore means "last time upstream data changed", not
+        "last sync tick". Pass commit=False to batch several upserts
+        into one transaction; the caller then owns commit()/rollback().
+        """
+        async with self._db.execute(
+            "SELECT id, name, email, status FROM users WHERE ulp_id = ?", (ulp_id,)
+        ) as cursor:
+            existing = await cursor.fetchone()
+        if (
+            existing is not None
+            and existing["name"] == name
+            and existing["email"] == email
+            and existing["status"] == status
+        ):
+            return existing["id"]
+
         if synced_at is None:
             synced_at = _utc_now_sqlite()
         await self._db.execute(
@@ -482,7 +527,10 @@ class Database:
             """,
             (ulp_id, name, email, status, synced_at),
         )
-        await self._db.commit()
+        if commit:
+            await self._db.commit()
+        if existing is not None:
+            return existing["id"]
         async with self._db.execute(
             "SELECT id FROM users WHERE ulp_id = ?", (ulp_id,)
         ) as cursor:
@@ -561,8 +609,13 @@ class Database:
         location_id: str,
         name: str,
         door_name: Optional[str] = None,
+        commit: bool = True,
     ) -> int:
-        """Upsert an ACCESS_NATIVE lock by location_id. Returns row id."""
+        """Upsert an ACCESS_NATIVE lock by location_id. Returns row id.
+
+        Pass commit=False to batch into the caller's transaction (the
+        topology resync batches all lock+user upserts into one commit).
+        """
         cursor = await self._db.execute(
             """INSERT INTO locks (type, device_id, location_id, name, door_name)
                VALUES ('access_native', ?, ?, ?, ?)
@@ -574,7 +627,8 @@ class Database:
             (device_id, location_id, name, door_name),
         )
         row = await cursor.fetchone()
-        await self._db.commit()
+        if commit:
+            await self._db.commit()
         return row[0]
 
     async def add_external_lock(
