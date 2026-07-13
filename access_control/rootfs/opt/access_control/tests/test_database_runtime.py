@@ -466,6 +466,41 @@ class DatabaseRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 pairing_signature="[]",
             )
 
+    async def _index_exists(self, name: str) -> bool:
+        async with self.db._db.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name=?", (name,)
+        ) as cur:
+            return (await cur.fetchone()) is not None
+
+    async def test_admin_log_and_visitors_indexes_exist_on_fresh_init(self) -> None:
+        self.assertTrue(await self._index_exists("idx_admin_log_timestamp"))
+        self.assertTrue(await self._index_exists("idx_visitors_created_at"))
+
+    async def test_admin_log_and_visitors_indexes_are_added_by_migration(
+        self,
+    ) -> None:
+        await self.db.close()
+
+        # Recreate admin_log and visitors exactly as they existed before
+        # Migration 24 added the timestamp/created_at indexes, to prove an
+        # upgrade from an older install backfills them too.
+        with sqlite3.connect(self.path) as legacy:
+            legacy.execute("DROP INDEX IF EXISTS idx_admin_log_timestamp")
+            legacy.execute("DROP INDEX IF EXISTS idx_visitors_created_at")
+
+        with sqlite3.connect(self.path) as legacy:
+            rows = legacy.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name IN ('idx_admin_log_timestamp', 'idx_visitors_created_at')"
+            ).fetchall()
+        self.assertEqual(rows, [])
+
+        self.db = Database(path=self.path)
+        await self.db.connect()
+
+        self.assertTrue(await self._index_exists("idx_admin_log_timestamp"))
+        self.assertTrue(await self._index_exists("idx_visitors_created_at"))
+
 
 if __name__ == "__main__":
     unittest.main()

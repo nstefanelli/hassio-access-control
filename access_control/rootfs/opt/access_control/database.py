@@ -201,6 +201,8 @@ CREATE INDEX IF NOT EXISTS idx_access_log_lock_ts  ON access_log(lock_id, timest
 CREATE INDEX IF NOT EXISTS idx_access_log_user_ts  ON access_log(user_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_ui_cache_expires_at ON ui_cache(expires_at);
 CREATE INDEX IF NOT EXISTS idx_visitors_status ON visitors(status);
+CREATE INDEX IF NOT EXISTS idx_admin_log_timestamp ON admin_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_visitors_created_at ON visitors(created_at);
 """
 
 
@@ -540,6 +542,18 @@ class Database:
                     "ALTER TABLE locks ADD COLUMN upstream_present "
                     "INTEGER NOT NULL DEFAULT 1"
                 )
+
+            # Migration 24: admin_log and visitors indexes. get_admin_log's
+            # `ORDER BY timestamp DESC LIMIT 50` (settings page, every load)
+            # and prune_logs' timestamp scan of admin_log were full-table
+            # scans, as was get_all_visitors' unbounded `ORDER BY created_at
+            # DESC` (e2e review 2026-07-12).
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_admin_log_timestamp ON admin_log(timestamp)"
+            )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_visitors_created_at ON visitors(created_at)"
+            )
 
             await self._db.commit()
         except Exception:
