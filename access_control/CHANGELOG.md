@@ -25,6 +25,12 @@ No unreleased changes.
   the Access client's behavior.
 - Signing out is now a CSRF-protected POST; previously a third-party page
   could force-logout a signed-in admin with a bare `GET /logout` image tag.
+- The stylesheet and script are now linked with content-hash version
+  queries, and failed static responses are no longer cacheable. Previously
+  a browser could keep a stale — or transiently failed — cached `app.css`
+  for up to an hour after an add-on update, rendering the dashboard with
+  no styles. If you hit this, one hard refresh (Cmd/Ctrl+Shift+R) clears
+  the stale entry; it cannot recur after this version.
 
 ### Changed
 

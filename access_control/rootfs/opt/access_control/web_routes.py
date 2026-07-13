@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import os
@@ -95,8 +96,30 @@ def _credential_label(value: str | None) -> str:
     return str(value).replace("_", " ").strip().title()
 
 
+def _asset_version(name: str) -> str:
+    """Short content hash of a bundled static asset, for cache busting.
+
+    Browsers apply heuristic freshness to responses without Cache-Control,
+    so after an add-on update a cached stale app.css could be served against
+    new templates — rendering the dashboard with no utility styles at all.
+    Versioned URLs make every asset change a new URL. Computed once at
+    import; the bundle only changes when the container image does.
+    """
+    try:
+        data = (Path(__file__).parent / "static" / name).read_bytes()
+    except OSError:
+        return "0"
+    return hashlib.sha256(data).hexdigest()[:12]
+
+
+ASSET_VERSIONS = {
+    "app.css": _asset_version("app.css"),
+    "app.js": _asset_version("app.js"),
+}
+
 try:
     templates.env.filters["credential_label"] = _credential_label
+    templates.env.globals["asset_v"] = ASSET_VERSIONS
 except AttributeError:
     # Test suites that stub fastapi.templating with a minimal class won't
     # have an `env` attribute. Production Jinja2Templates always does.
