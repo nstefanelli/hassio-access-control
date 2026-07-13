@@ -38,6 +38,9 @@ _load_package()
 hs_module = importlib.import_module("access_control.hub_sync")
 HubSyncManager = hs_module.HubSyncManager
 Database = importlib.import_module("access_control.database").Database
+_client_module = importlib.import_module("access_control.access_client")
+AccessClientError = _client_module.AccessClientError
+AccessLegacyEndpointGoneError = _client_module.AccessLegacyEndpointGoneError
 
 
 HUB = {
@@ -1631,6 +1634,179 @@ class TestBidirectionalDamping(unittest.TestCase):
                 "dev-hub-1", location_id="loc-1"
             )
             self.assertEqual(access_states["dev-hub-1"], "locked")
+        _run(go())
+
+
+class TestLockedDirectionHardRejectionBackoff(unittest.TestCase):
+    """A repeatedly hard-rejected locked drive (e.g. a UNVR Access update
+    removing the legacy per-device lock_rule endpoint) must be spaced onto a
+    bounded backoff — never stopped, never blocking lockdown, and only for a
+    genuine permanent rejection (not a transient fault)."""
+
+    def _fixture(self, error, *, ha_state="locked"):
+        """Bidirectional pair whose readback and locked drive both raise
+        ``error`` while ``broken['on']`` is True."""
+        broken = {"on": True}
+        ha_states = {"lock.front": ha_state}
+        access_rules = {"dev-hub-1": {"type": "keep_lock"}}
+        access_states = {"dev-hub-1": "locked"}
+        db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+        ha = _make_bidirectional_ha(ha_states)
+        access = _make_bidirectional_access(access_rules, access_states)
+
+        async def get_rule(device_id, location_id=None):
+            if broken["on"]:
+                raise error
+            return dict(access_rules[device_id])
+
+        async def get_state(device_id, location_id=None):
+            if broken["on"]:
+                raise error
+            return access_states[device_id]
+
+        async def hold_locked(device_id, location_id=None):
+            if broken["on"]:
+                raise error
+            access_rules[device_id] = {"type": "keep_lock"}
+            access_states[device_id] = "locked"
+            return {"type": "keep_lock", "state": "locked"}
+
+        access.get_lock_rule = AsyncMock(side_effect=get_rule)
+        access.get_door_state = AsyncMock(side_effect=get_state)
+        access.hold_locked = AsyncMock(side_effect=hold_locked)
+        mgr = _make_mgr(db, ha, access)
+        return mgr, ha, access, broken
+
+    def test_repeated_hard_rejection_backs_off_then_resumes(self) -> None:
+        async def go():
+            mgr, _ha, access, _broken = self._fixture(
+                AccessLegacyEndpointGoneError("legacy gone")
+            )
+            threshold = hs_module._HARD_REJECT_BACKOFF_THRESHOLD
+            retries = hs_module._APPLY_RETRIES
+            old_delay = hs_module._APPLY_RETRY_DELAY
+            hs_module._APPLY_RETRY_DELAY = 0.0
+            try:
+                # Full cadence until the consecutive hard-rejection threshold.
+                for _ in range(threshold):
+                    self.assertEqual(await mgr.poll_once(), 0)
+                at_threshold = access.hold_locked.await_count
+                self.assertEqual(at_threshold, threshold * retries)
+                self.assertGreater(
+                    mgr._backoff_until.get("lock.front", 0.0), _time.monotonic()
+                )
+
+                # Inside the backoff window the locked drive is SKIPPED — but
+                # the durable safe intent is retained, not abandoned.
+                self.assertEqual(await mgr.poll_once(), 0)
+                self.assertEqual(access.hold_locked.await_count, at_threshold)
+                self.assertIn("lock.front", mgr._fail_safe_reset_eids)
+
+                # After the deadline passes the drive RESUMES — forever, spaced.
+                mgr._backoff_until.clear()
+                self.assertEqual(await mgr.poll_once(), 0)
+                self.assertGreater(
+                    access.hold_locked.await_count, at_threshold
+                )
+            finally:
+                hs_module._APPLY_RETRY_DELAY = old_delay
+        _run(go())
+
+    def test_transient_error_never_backs_off_locked_direction(self) -> None:
+        async def go():
+            # A 5xx is transient: it must keep retrying at full cadence and
+            # never engage the hard-rejection backoff.
+            mgr, _ha, access, _broken = self._fixture(
+                AccessClientError("HTTP 503 from PUT /…/lock_rule", status=503)
+            )
+            retries = hs_module._APPLY_RETRIES
+            polls = hs_module._HARD_REJECT_BACKOFF_THRESHOLD + 3
+            old_delay = hs_module._APPLY_RETRY_DELAY
+            hs_module._APPLY_RETRY_DELAY = 0.0
+            try:
+                for _ in range(polls):
+                    self.assertEqual(await mgr.poll_once(), 0)
+                # Every poll drove both attempts — no skip ever happened.
+                self.assertEqual(
+                    access.hold_locked.await_count, polls * retries
+                )
+                self.assertNotIn("lock.front", mgr._backoff_until)
+                self.assertNotIn("lock.front", mgr._hard_reject_state)
+            finally:
+                hs_module._APPLY_RETRY_DELAY = old_delay
+        _run(go())
+
+    def test_lockdown_drives_at_full_cadence_during_hard_rejection_backoff(
+        self,
+    ) -> None:
+        """Safety invariant: an entity parked in hard-rejection backoff is
+        still force-closed immediately under lockdown, because lockdown never
+        reaches _reconcile_bidirectional (mirrors the flap-suspension test)."""
+        async def go():
+            ha_states = {"lock.front": "unlocked"}
+            access_rules = {"dev-hub-1": {"type": "keep_unlock"}}
+            access_states = {"dev-hub-1": "unlocked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            ha = _make_bidirectional_ha(ha_states)
+            access = _make_bidirectional_access(access_rules, access_states)
+            mgr = _make_mgr(db, ha, access)
+
+            # Park the entity in a fully-engaged hard-rejection backoff.
+            future = _time.monotonic() + hs_module._FAILURE_BACKOFF
+            mgr._backoff_until["lock.front"] = future
+            mgr._hard_reject_state["lock.front"] = (
+                "legacy_endpoint_gone",
+                hs_module._HARD_REJECT_BACKOFF_THRESHOLD + 2,
+            )
+            mgr._lockdown_getter = lambda: True
+
+            self.assertEqual(await mgr.poll_once(), 1)
+            access.hold_locked.assert_awaited_once_with(
+                "dev-hub-1", location_id="loc-1"
+            )
+            self.assertEqual(access_states["dev-hub-1"], "locked")
+        _run(go())
+
+    def test_drive_failure_logs_once_then_debug_and_rearms(self) -> None:
+        async def go():
+            mgr, _ha, _access, broken = self._fixture(
+                AccessLegacyEndpointGoneError("legacy gone; configure token")
+            )
+            old_delay = hs_module._APPLY_RETRY_DELAY
+            hs_module._APPLY_RETRY_DELAY = 0.0
+            logger = MagicMock()
+
+            def drive_exception_calls():
+                return [
+                    c for c in logger.exception.call_args_list
+                    if "Hub sync attempt" in c.args[0]
+                ]
+
+            try:
+                with patch.object(hs_module, "_LOGGER", logger):
+                    # First failing poll: attempt 1 logs loudly (ERROR via
+                    # _LOGGER.exception), attempt 2 (same signature) is debug.
+                    await mgr.poll_once()
+                    self.assertEqual(len(drive_exception_calls()), 1)
+                    # The actionable message rides along on that first log.
+                    self.assertIn(
+                        "configure token",
+                        str(drive_exception_calls()[0].args[-1]),
+                    )
+
+                    # A second failing poll adds no new loud log (debug only).
+                    await mgr.poll_once()
+                    self.assertEqual(len(drive_exception_calls()), 1)
+
+                    # Convergence clears the signature and re-arms loud logging;
+                    # a fresh incident then logs at ERROR again.
+                    broken["on"] = False
+                    await mgr.poll_once()  # converges (release to locked)
+                    broken["on"] = True
+                    await mgr.poll_once()  # new incident
+                    self.assertEqual(len(drive_exception_calls()), 2)
+            finally:
+                hs_module._APPLY_RETRY_DELAY = old_delay
         _run(go())
 
 
