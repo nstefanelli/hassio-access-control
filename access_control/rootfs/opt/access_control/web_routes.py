@@ -517,9 +517,16 @@ async def login_post(
     return resp
 
 
-@router.get("/logout")
-async def logout(request: Request):
-    """Delete session cookie and redirect to /login."""
+@router.post("/logout")
+async def logout(request: Request, user: str = Depends(require_csrf)):
+    """Delete session cookie and redirect to /login.
+
+    State-changing (clears the session), so it is a POST guarded by
+    require_csrf like every other mutating route — a bare GET would let a
+    third-party page force-logout a signed-in admin via an <img>/<link>
+    tag. There is intentionally no GET fallback: without a form-embedded
+    CSRF token, GET /logout now 405s. Hardening review 2026-07-12.
+    """
     return _redirect(request, "/login", delete_cookie=True)
 
 

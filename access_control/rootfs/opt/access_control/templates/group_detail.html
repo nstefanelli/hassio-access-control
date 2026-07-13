@@ -18,15 +18,15 @@
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
       </svg>
     </a>
-    <h1 class="text-xl font-bold text-gray-100">{{ group.name }}</h1>
+    <h1 class="page-title">{{ group.name }}</h1>
     {% if group.all_locks %}
-    <span class="text-xs bg-blue-900/40 text-blue-300 px-2 py-0.5 rounded-full">All Locks</span>
+    <span class="chip-feature bg-blue-900/40 text-blue-300">All Locks</span>
     {% endif %}
   </div>
 
   <!-- Group settings -->
   <div class="card space-y-3">
-    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Settings</h2>
+    <h2 class="card-heading">Settings</h2>
     <form method="post" action="groups/{{ group.id }}/update" class="space-y-3">
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
@@ -107,7 +107,7 @@
   <!-- Specific locks (only if not all_locks) -->
   {% if not group.all_locks %}
   <div class="card space-y-3">
-    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Locks</h2>
+    <h2 class="card-heading">Locks</h2>
     <form method="post" action="groups/{{ group.id }}/locks" class="space-y-3">
       {% if all_locks %}
       <div class="space-y-2">
@@ -131,7 +131,7 @@
 
   <!-- Members -->
   <div class="card space-y-3">
-    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">
+    <h2 class="card-heading">
       Members ({{ members|length }})
     </h2>
 
@@ -145,7 +145,8 @@
           <span class="text-xs text-gray-500 ml-2">{{ m.email }}</span>
           {% endif %}
         </div>
-        <form method="post" action="groups/{{ group.id }}/remove-member/{{ m.id }}">
+        <form method="post" action="groups/{{ group.id }}/remove-member/{{ m.id }}"
+          data-name="{{ m.name|e }}" onsubmit="return confirm('Remove ' + this.dataset.name + ' from {{ group.name|e }}?')">
           <button type="submit" class="text-xs text-gray-600 hover:text-red-400" title="Remove">
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
@@ -155,6 +156,8 @@
       </div>
       {% endfor %}
     </div>
+    {% else %}
+    <div class="empty-state-inline">No members in this group yet.</div>
     {% endif %}
 
     <!-- Add member -->

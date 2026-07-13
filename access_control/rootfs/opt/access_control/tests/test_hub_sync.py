@@ -1522,6 +1522,118 @@ class TestBidirectionalConvergence(unittest.TestCase):
         _run(go())
 
 
+class TestBidirectionalDamping(unittest.TestCase):
+    """Flap/backoff damping must also bound command volume on the
+    bidirectional reconcile path — not only the legacy _poll_once path."""
+
+    def _fixture(self, *, ha_state="locked", rule="reset", door_state="locked"):
+        ha_states = {"lock.front": ha_state}
+        access_rules = {"dev-hub-1": {"type": rule}}
+        access_states = {"dev-hub-1": door_state}
+        db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+        ha = _make_bidirectional_ha(ha_states)
+        access = _make_bidirectional_access(access_rules, access_states)
+        mgr = _make_mgr(db, ha, access)
+        return mgr, ha, access, ha_states, access_rules, access_states
+
+    def test_apply_times_stays_bounded_across_many_bidirectional_drives(self) -> None:
+        """Bug 1: the flap-timestamp list is pruned at append time, so it
+        cannot grow unbounded for the install's lifetime in bidirectional
+        mode (where the legacy lazy prune never runs)."""
+        async def go():
+            mgr, _ha, _access, states, _rules, _access_states = self._fixture()
+            clock = {"t": 1000.0}
+            with patch(
+                "access_control.hub_sync.time.monotonic",
+                side_effect=lambda: clock["t"],
+            ):
+                await mgr.poll_once()  # confirmed locked baseline
+                # Alternate the lock every poll, stepping well past the flap
+                # window so each real actuation prunes every older timestamp.
+                for i in range(60):
+                    clock["t"] += hs_module._FLAP_WINDOW + 5
+                    states["lock.front"] = "unlocked" if i % 2 == 0 else "locked"
+                    await mgr.poll_once()
+                # Without append-time pruning this would retain ~60 entries.
+                self.assertLessEqual(
+                    len(mgr._apply_times.get("lock.front", [])), 2
+                )
+        _run(go())
+
+    def test_bidirectional_hold_open_respects_min_apply_interval(self) -> None:
+        """Bug 2: a hold-open drive within the min-apply interval is
+        deferred (never lost) — locking is never delayed by this."""
+        async def go():
+            mgr, ha, _access, _states, rules, access_states = self._fixture()
+            await mgr.poll_once()  # confirmed locked baseline
+
+            # A very recent prior actuation makes the min-apply clock hot.
+            mgr._last_applied_at["lock.front"] = _time.monotonic()
+            # An Access schedule opens the door (missed event caught by poll).
+            rules["dev-hub-1"] = {"type": "keep_unlock"}
+            access_states["dev-hub-1"] = "unlocked"
+
+            self.assertEqual(await mgr.poll_once(), 0)
+            ha.unlock.assert_not_awaited()
+
+            # After the interval elapses the deferred hold-open applies.
+            _clear_damping(mgr)
+            self.assertEqual(await mgr.poll_once(), 1)
+            ha.unlock.assert_awaited_once_with("lock.front")
+        _run(go())
+
+    def test_sustained_bidirectional_flapping_suspends_and_fails_safe(self) -> None:
+        """Bug 2: enough recent hold-open drives inside the flap window
+        suspends the entity before issuing yet another hold-open."""
+        async def go():
+            mgr, ha, access, states, _rules, _access_states = self._fixture()
+            await mgr.poll_once()  # confirmed locked baseline
+
+            now = _time.monotonic()
+            mgr._apply_times["lock.front"] = [
+                now - i for i in range(hs_module._FLAP_THRESHOLD)
+            ]
+
+            states["lock.front"] = "unlocked"
+            self.assertEqual(await mgr.poll_once(), 0)
+            self.assertGreater(
+                mgr._suspended_until.get("lock.front", 0), _time.monotonic()
+            )
+            access.hold_unlocked.assert_not_awaited()
+            ha.unlock.assert_not_awaited()
+            ha.fire_event.assert_awaited_once_with(
+                "access_control_hub_sync_failed",
+                {"entity_id": "lock.front", "lock_name": "Front Deadbolt",
+                 "reason": "flapping"},
+            )
+
+            # While suspended the hold-open is not followed at all.
+            self.assertEqual(await mgr.poll_once(), 0)
+            access.hold_unlocked.assert_not_awaited()
+        _run(go())
+
+    def test_lockdown_enforcement_is_not_damped_by_flap_suspension(self) -> None:
+        """Bug 2 safety invariant: locking during lockdown bypasses every
+        damping gate. Even a fully suspended/backed-off entity is still
+        closed immediately (lockdown never reaches _reconcile_bidirectional)."""
+        async def go():
+            mgr, _ha, access, _states, _rules, access_states = self._fixture(
+                ha_state="unlocked", rule="keep_unlock", door_state="unlocked"
+            )
+            future = _time.monotonic() + hs_module._FLAP_SUSPEND
+            mgr._suspended_until["lock.front"] = future
+            mgr._backoff_until["lock.front"] = future
+            mgr._last_applied_at["lock.front"] = _time.monotonic()
+            mgr._lockdown_getter = lambda: True
+
+            self.assertEqual(await mgr.poll_once(), 1)
+            access.hold_locked.assert_awaited_once_with(
+                "dev-hub-1", location_id="loc-1"
+            )
+            self.assertEqual(access_states["dev-hub-1"], "locked")
+        _run(go())
+
+
 class TestPersistentOverrideLifecycleRegressions(unittest.TestCase):
     def test_lockdown_rechecks_and_relocks_later_external_unlocks(self) -> None:
         async def go():

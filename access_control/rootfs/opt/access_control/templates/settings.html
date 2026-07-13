@@ -5,7 +5,7 @@
 {% block content %}
 <div class="p-4 sm:p-6 space-y-6">
 
-  <h1 class="text-xl font-bold text-gray-100">Settings</h1>
+  <h1 class="page-title">Settings</h1>
 
   <!-- Result message -->
   {% if save_result %}
@@ -66,7 +66,7 @@
 
   <!-- UniFi Console (primary — used for Protect and Access by default) -->
   <div class="card space-y-3">
-    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">UniFi Console</h2>
+    <h2 class="card-heading">UniFi Console</h2>
     <p class="text-xs text-gray-600">Primary console for Protect and Access. If Access runs on a separate console, configure it below.</p>
     <form method="post" action="settings/unvr" class="space-y-3">
       <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -86,13 +86,13 @@
                  class="input w-full" placeholder="Enter password" />
         </div>
       </div>
-      <button type="submit" class="btn-primary text-sm">Test &amp; Save Console</button>
+      <button type="submit" class="btn-primary text-sm" data-pending-text="Testing…">Test &amp; Save Console</button>
     </form>
   </div>
 
   <!-- Separate Access Console (optional — falls back to primary console if empty) -->
   <details class="card" {% if access_host %}open{% endif %}>
-    <summary class="text-sm font-semibold text-gray-300 uppercase tracking-wider cursor-pointer hover:text-gray-100">
+    <summary class="card-heading cursor-pointer hover:text-gray-100">
       Access on Separate Console
       {% if access_host %}
       <span class="text-xs font-normal text-gray-500 ml-2">{{ access_host }}</span>
@@ -121,7 +121,7 @@
           </div>
         </div>
         <div class="flex gap-2">
-          <button type="submit" class="btn-primary text-sm">Test &amp; Save Access Console</button>
+          <button type="submit" class="btn-primary text-sm" data-pending-text="Testing…">Test &amp; Save Access Console</button>
           {% if access_host %}
           <button type="submit" name="clear" value="1" class="btn-secondary text-sm">Clear (Use Primary Console)</button>
           {% endif %}
@@ -133,7 +133,7 @@
   <!-- Official Access Open API token -->
   <div class="card space-y-3">
     <div class="flex items-center justify-between gap-3">
-      <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Access API Token</h2>
+      <h2 class="card-heading">Access API Token</h2>
       <span class="text-xs {{ 'text-green-400' if access_api_token_configured else 'text-yellow-400' }}">
         {{ 'Configured' if access_api_token_configured else 'Compatibility mode' }}
       </span>
@@ -158,7 +158,7 @@
 
   <!-- HA Connection -->
   <div class="card space-y-3">
-    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Home Assistant</h2>
+    <h2 class="card-heading">Home Assistant</h2>
     <form method="post" action="settings/ha" class="space-y-3">
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
@@ -172,13 +172,13 @@
                  class="input w-full" placeholder="Enter token" />
         </div>
       </div>
-      <button type="submit" class="btn-primary text-sm">Test &amp; Save HA</button>
+      <button type="submit" class="btn-primary text-sm" data-pending-text="Testing…">Test &amp; Save HA</button>
     </form>
   </div>
 
   <!-- API Keys -->
   <div class="card space-y-4">
-    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">API Keys</h2>
+    <h2 class="card-heading">API Keys</h2>
 
     <!-- Key list -->
     {% if api_keys %}
@@ -210,7 +210,7 @@
       {% endfor %}
     </div>
     {% else %}
-    <p class="text-sm text-gray-500">No API keys configured.</p>
+    <p class="empty-note">No API keys configured.</p>
     {% endif %}
 
     <!-- Create new key -->
@@ -243,7 +243,7 @@
 
   <!-- Service Control -->
   <div class="card space-y-4">
-    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Service Control</h2>
+    <h2 class="card-heading">Service Control</h2>
     {% if ingress_active %}
     <p class="text-sm text-gray-500">
       Restarts are managed by Home Assistant. Use the <strong>Restart</strong> button on
@@ -255,7 +255,7 @@
         <p class="text-sm text-gray-400">Restart the Access Control service. The page will reload automatically.</p>
       </div>
       <form method="post" action="settings/restart" onsubmit="return confirm('Restart the Access Control service?')">
-        <button type="submit" class="btn-danger text-sm whitespace-nowrap">
+        <button type="submit" class="btn-danger text-sm whitespace-nowrap" data-pending-text="Restarting…">
           <svg class="w-4 h-4 inline -mt-0.5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
               d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
@@ -326,7 +326,7 @@
 
   <!-- Alarm Panels -->
   <div class="card space-y-4">
-    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Alarm Panels</h2>
+    <h2 class="card-heading">Alarm Panels</h2>
 
     {% if alarm_panels %}
     <div class="divide-y divide-gray-800 -mx-4 px-4">
@@ -350,7 +350,7 @@
       {% endfor %}
     </div>
     {% else %}
-    <p class="text-sm text-gray-500">No alarm panels configured.</p>
+    <p class="empty-note">No alarm panels configured.</p>
     {% endif %}
 
     {% if ha_alarms %}
@@ -372,7 +372,7 @@
 
   <!-- Admin Audit Log -->
   <div class="card space-y-3">
-    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Admin Audit Log</h2>
+    <h2 class="card-heading">Admin Audit Log</h2>
     {% if admin_log %}
     <div class="overflow-x-auto -mx-4 px-4">
       <table class="w-full text-sm">
@@ -399,7 +399,7 @@
       </table>
     </div>
     {% else %}
-    <p class="text-sm text-gray-500">No admin actions logged yet.</p>
+    <p class="empty-note">No admin actions logged yet.</p>
     {% endif %}
   </div>
 

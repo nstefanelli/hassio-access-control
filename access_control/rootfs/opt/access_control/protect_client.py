@@ -82,6 +82,14 @@ class ProtectClient:
     async def login(self) -> None:
         """Authenticate to the UNVR console (shared with Access)."""
         async with self._login_lock:
+            # Concurrent-login short-circuit (mirrors AccessClient.login). Two
+            # callers can both find ``connected`` false and queue on the lock;
+            # the second must not re-POST credentials once the first has
+            # established a full session. ``connected`` tracks the CSRF token;
+            # require the paired auth cookie too so a half-populated state still
+            # re-authenticates.
+            if self.connected and self._auth_cookie is not None:
+                return
             url = self._base_url() + "/api/auth/login"
             session = self._get_session()
             async with session.post(

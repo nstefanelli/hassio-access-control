@@ -1337,6 +1337,38 @@ class HubSyncManager:
             desired = "locked"
             fail_safe = True
 
+        # Flap damping — bound the command volume of a pathologically cycling
+        # lock. This mirrors the legacy _poll_once contract exactly: it gates
+        # ONLY the unsafe hold-open direction and only when a real drive toward
+        # unlocked is pending. Locking is the fail-safe direction and is never
+        # delayed; lockdown enforcement never reaches this method (it returns
+        # from the dedicated ``lockdown_active`` branch in _poll_once), so
+        # incident closing can never be suspended or backed off by this code.
+        if desired == "unlocked" and (
+            ha_state != desired or access_state != desired
+        ):
+            if self._suspended_until.get(eid, 0.0) > now:
+                return 0
+            if self._backoff_until.get(eid, 0.0) > now:
+                return 0
+            last_applied_at = self._last_applied_at.get(eid)
+            if (
+                last_applied_at is not None
+                and now - last_applied_at < _MIN_APPLY_INTERVAL
+            ):
+                _LOGGER.debug(
+                    "Hub sync: hold-open for %s deferred (min interval)", eid
+                )
+                return 0
+            recent = [
+                t for t in self._apply_times.get(eid, ())
+                if now - t <= _FLAP_WINDOW
+            ]
+            self._apply_times[eid] = recent
+            if len(recent) >= _FLAP_THRESHOLD:
+                await self._suspend_flapping(lock)
+                return 0
+
         changed = False
         if ha_state != desired:
             if not await self._drive_ha_state(
@@ -1349,6 +1381,12 @@ class HubSyncManager:
                     access_state if valid_access else "locked"
                 )
                 self._last_access_rule[eid] = access_rule
+                # Back off retries of the unsafe direction only; a failed lock
+                # must keep retrying every poll (fail-closed).
+                if desired == "unlocked":
+                    self._backoff_until[eid] = (
+                        time.monotonic() + _FAILURE_BACKOFF
+                    )
                 return 0
             ha_state = desired
             changed = True
@@ -1382,6 +1420,12 @@ class HubSyncManager:
                     access_state if valid_access else "locked"
                 )
                 self._last_access_rule[eid] = access_rule
+                # Back off retries of the unsafe direction only; a failed lock
+                # must keep retrying every poll (fail-closed).
+                if desired == "unlocked":
+                    self._backoff_until[eid] = (
+                        time.monotonic() + _FAILURE_BACKOFF
+                    )
                 return 0
             access_state = desired
             access_rule = f"command:{desired}"
@@ -1411,6 +1455,9 @@ class HubSyncManager:
         self._paired_hubs[eid] = [dict(hub) for hub in hubs]
         if desired == "locked":
             self._fail_safe_reset_eids.discard(eid)
+        # A confirmed convergence clears any prior unsafe-direction backoff so
+        # the next genuine change is not needlessly deferred (legacy parity).
+        self._backoff_until.pop(eid, None)
         self._failure_notified.discard(eid)
         return 1 if changed else 0
 
@@ -1614,10 +1661,19 @@ class HubSyncManager:
 
         if drove_any:
             # Damping bookkeeping counts only real hub actuations — a
-            # no-hub misconfiguration must not trip the flap breaker.
+            # no-hub misconfiguration must not trip the flap breaker. Prune
+            # to the flap window at append time so the list stays bounded for
+            # the install's lifetime. The legacy _poll_once path pruned lazily
+            # on read; the bidirectional reconcile never read it, so an
+            # unpruned list grew without bound (one entry per hub drive).
             now = time.monotonic()
             self._last_applied_at[eid] = now
-            self._apply_times.setdefault(eid, []).append(now)
+            recent = [
+                t for t in self._apply_times.get(eid, ())
+                if now - t <= _FLAP_WINDOW
+            ]
+            recent.append(now)
+            self._apply_times[eid] = recent
 
         if (
             not ok_all

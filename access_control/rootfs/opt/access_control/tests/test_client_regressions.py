@@ -585,5 +585,76 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await no_token.validate_open_api())
 
 
+class _ProtectLoginResponse:
+    status = 200
+    headers = {
+        "X-CSRF-Token": "csrf",
+        "Set-Cookie": "TOKEN=cookie; Path=/; Secure",
+    }
+
+    async def __aenter__(self):
+        # Yield control so a racing login() reliably queues on _login_lock,
+        # exercising the true concurrent path rather than a serial one.
+        await asyncio.sleep(0)
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def text(self):
+        return ""
+
+
+class ProtectClientLoginTests(unittest.IsolatedAsyncioTestCase):
+    """Bug 3: ProtectClient.login must short-circuit like AccessClient so
+    two racers do not both POST credentials."""
+
+    @staticmethod
+    def _client_with_counting_session():
+        from access_control.protect_client import ProtectClient
+
+        client = ProtectClient("unvr.local", "service", "secret")
+        state = {"posts": 0}
+
+        class _Session:
+            closed = False
+
+            def post(self_inner, *_args, **_kwargs):
+                state["posts"] += 1
+                return _ProtectLoginResponse()
+
+        client._get_session = lambda: _Session()
+        return client, state
+
+    async def test_concurrent_login_posts_credentials_once(self) -> None:
+        client, state = self._client_with_counting_session()
+
+        await asyncio.gather(client.login(), client.login())
+
+        self.assertEqual(state["posts"], 1)
+        self.assertTrue(client.connected)
+        self.assertEqual(client._auth_cookie, "cookie")
+
+    async def test_login_short_circuits_when_already_authenticated(self) -> None:
+        from access_control.protect_client import ProtectClient
+
+        client = ProtectClient("unvr.local", "service", "secret")
+        client._csrf_token = "existing-csrf"
+        client._auth_cookie = "existing-cookie"
+
+        class _Session:
+            closed = False
+
+            def post(self_inner, *_args, **_kwargs):
+                raise AssertionError(
+                    "login must not POST while already authenticated"
+                )
+
+        client._get_session = lambda: _Session()
+
+        await client.login()  # returns without touching the session
+        self.assertEqual(client._csrf_token, "existing-csrf")
+
+
 if __name__ == "__main__":
     unittest.main()

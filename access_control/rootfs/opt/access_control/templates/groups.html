@@ -5,7 +5,7 @@
 {% block content %}
 <div class="p-4 sm:p-6 space-y-6">
 
-  <h1 class="text-xl font-bold text-gray-100">Groups</h1>
+  <h1 class="page-title">Groups</h1>
 
   {% if error %}
   <div class="card border border-red-900/50 bg-red-950/30 text-red-200 text-sm">
@@ -27,19 +27,19 @@
         </div>
         <div class="flex flex-wrap gap-1">
           {% if g.all_locks %}
-          <span class="text-xs bg-blue-900/40 text-blue-300 px-2 py-0.5 rounded-full">All Locks</span>
+          <span class="chip-feature bg-blue-900/40 text-blue-300">All Locks</span>
           {% endif %}
           {% if g.can_disarm %}
-          <span class="text-xs bg-green-900/40 text-green-300 px-2 py-0.5 rounded-full">Disarm</span>
+          <span class="chip-feature bg-green-900/40 text-green-300">Disarm</span>
           {% endif %}
           {% if g.blocked_when_armed_away %}
-          <span class="text-xs bg-red-900/40 text-red-300 px-2 py-0.5 rounded-full">Block Away</span>
+          <span class="chip-feature bg-red-900/40 text-red-300">Block Away</span>
           {% endif %}
           {% if g.blocked_when_armed_home %}
-          <span class="text-xs bg-yellow-900/40 text-yellow-300 px-2 py-0.5 rounded-full">Block Home</span>
+          <span class="chip-feature bg-yellow-900/40 text-yellow-300">Block Home</span>
           {% endif %}
           {% if g.schedule_enabled %}
-          <span class="text-xs bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded-full">Scheduled</span>
+          <span class="chip-feature bg-purple-900/40 text-purple-300">Scheduled</span>
           {% endif %}
         </div>
       </div>
@@ -48,20 +48,20 @@
     {% endfor %}
   </div>
   {% else %}
-  <div class="card text-center text-gray-500 text-sm py-8">No groups yet.</div>
+  <div class="card empty-state">No groups yet.</div>
   {% endif %}
 
   <!-- Create group -->
   <details class="card">
-    <summary class="text-sm font-semibold text-gray-300 uppercase tracking-wider cursor-pointer hover:text-gray-100">Create Group</summary>
+    <summary class="card-heading cursor-pointer hover:text-gray-100">Create Group</summary>
     <form method="post" action="groups/create" class="space-y-3 mt-3">
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
-          <label class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Name</label>
+          <label class="field-label">Name</label>
           <input name="name" type="text" required class="input w-full" placeholder="e.g. Family" />
         </div>
         <div>
-          <label class="block text-xs text-gray-500 uppercase tracking-wider mb-1">Description</label>
+          <label class="field-label">Description</label>
           <input name="description" type="text" class="input w-full" placeholder="Optional" />
         </div>
       </div>
@@ -74,7 +74,7 @@
           <input type="checkbox" name="can_disarm" value="1" checked class="rounded bg-gray-800 border-gray-700" />
           Can disarm alarm on unlock
         </label>
-        <div class="text-xs text-gray-500 uppercase tracking-wider mt-2 mb-1">Block access when alarm is:</div>
+        <div class="field-label mt-2">Block access when alarm is:</div>
         <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
           <input type="checkbox" name="blocked_when_armed_away" value="1" class="rounded bg-gray-800 border-gray-700" />
           Armed Away

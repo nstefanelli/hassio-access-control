@@ -87,6 +87,21 @@
       transition: border-color 0.15s;
     }
     .card:hover { border-color: var(--border-default); }
+    /* This block loads after the compiled Tailwind sheet, so .card's padding
+       would silently defeat the p-0 utility on flush-table cards (log,
+       activity, history). Re-assert it here. */
+    .card.p-0 { padding: 0; }
+    /* Compact card — same navy surface as .card, tighter padding. Defined here
+       (not app.css) so it composes with the CSS-variable card rule that wins on
+       load order; no Tailwind rebuild needed. */
+    .card-compact {
+      background: var(--bg-surface);
+      border-radius: 0.75rem;
+      border: 1px solid var(--border-subtle);
+      padding: 0.875rem;
+      transition: border-color 0.15s;
+    }
+    .card-compact:hover { border-color: var(--border-default); }
 
     /* Buttons */
     .btn {
@@ -157,6 +172,12 @@
       background: var(--danger);
       box-shadow: 0 0 4px rgba(239, 100, 97, 0.3);
     }
+    /* Lock-state dot modifiers (locks.html). Canonical additions defined
+       against the navy tokens — NOT palette-bridge shims. */
+    .status-dot.locked   { background: var(--success); }
+    .status-dot.unlocked { background: var(--warning); }
+    .status-dot.jammed   { background: var(--danger); }
+    .status-dot.unknown  { background: var(--text-muted); }
     @keyframes pulse-green {
       0%, 100% { box-shadow: 0 0 4px rgba(45, 212, 160, 0.4); }
       50% { box-shadow: 0 0 10px rgba(45, 212, 160, 0.7); }
@@ -217,6 +238,9 @@
        shim: as templates are rewritten to use the tokens directly, the matching
        rows here can be removed. Do NOT add utilities here that aren't already
        used in a template — that would desync the committed Tailwind bundle.
+       NOTE: the .status-dot lock-state modifiers (.locked/.unlocked/.jammed/
+       .unknown) above are canonical navy-token additions, NOT bridge entries —
+       they don't map a legacy utility and stay even once the shim is gone.
        ───────────────────────────────────────────────────────────────────── */
     /* Text — map the gray scale onto the 3 navy text tiers (matches home.html) */
     .text-gray-100, .text-gray-200 { color: var(--text-primary); }
@@ -303,7 +327,9 @@
     <div style="padding:0.875rem 1rem; border-top:1px solid var(--border-subtle);">
       <div style="font-size:0.6875rem; color:var(--text-muted); margin-bottom:0.375rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:500;">{{ user }}</div>
       {% if not ingress_active %}
-      <a href="logout" style="font-size:0.6875rem; color:var(--text-muted); text-decoration:none; font-weight:500; transition:color 0.15s;" onmouseover="this.style.color='var(--text-secondary)'" onmouseout="this.style.color='var(--text-muted)'">Sign out</a>
+      <form method="post" action="logout" style="margin:0; padding:0;">
+        <button type="submit" style="background:none; border:none; margin:0; padding:0; text-align:left; cursor:pointer; font:inherit; font-size:0.6875rem; color:var(--text-muted); text-decoration:none; font-weight:500; transition:color 0.15s;" onmouseover="this.style.color='var(--text-secondary)'" onmouseout="this.style.color='var(--text-muted)'">Sign out</button>
+      </form>
       {% else %}
       <div style="font-size:0.6875rem; color:var(--text-muted); font-weight:500;" title="Signed in via Home Assistant; manage from HA user settings">via HA SSO</div>
       {% endif %}

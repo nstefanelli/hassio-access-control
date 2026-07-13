@@ -34,6 +34,27 @@
 
   injectCsrf();
 
+  // Global submit-disable: once a form is really submitting, disable its submit
+  // button, dim it, and swap its label so a double-tap can't fire the action
+  // twice. The document-level bubble listener runs AFTER any inline onsubmit, so
+  // event.defaultPrevented being set means a confirm() dialog said "no" and we
+  // leave the button alone. CSRF hidden inputs are injected at load, unaffected.
+  document.addEventListener("submit", (event) => {
+    if (event.defaultPrevented) return;
+    const button = event.target.querySelector(
+      'button[type="submit"], button:not([type]), input[type="submit"]',
+    );
+    if (!button || button.disabled) return;
+    button.disabled = true;
+    button.style.opacity = "0.6";
+    const pending = button.dataset.pendingText || "Working…";
+    if (button.tagName === "INPUT") {
+      button.value = pending;
+    } else {
+      button.textContent = pending;
+    }
+  });
+
   const refreshHook = document.querySelector("[data-background-refresh]");
   if (!refreshHook) return;
 

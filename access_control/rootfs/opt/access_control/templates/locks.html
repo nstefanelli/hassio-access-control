@@ -6,7 +6,7 @@
 <div class="p-4 sm:p-6 space-y-6">
 
   <div class="flex items-center justify-between">
-    <h1 class="text-xl font-bold text-gray-100">Locks</h1>
+    <h1 class="page-title">Locks</h1>
     <form method="post" action="sync-users">
       <input type="hidden" name="redirect" value="/locks">
       <button type="submit" class="text-xs px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 transition-colors">Re-sync from UniFi</button>
@@ -36,29 +36,29 @@
         <div class="shrink-0">
           {% if lock.state == 'locked' %}
           <span class="inline-flex items-center gap-1 text-xs font-medium text-green-400">
-            <span class="w-2 h-2 rounded-full bg-green-400"></span> Locked
+            <span class="status-dot locked"></span> Locked
           </span>
           {% elif lock.state == 'unlocked' %}
           <span class="inline-flex items-center gap-1 text-xs font-medium text-yellow-400">
-            <span class="w-2 h-2 rounded-full bg-yellow-400"></span> Unlocked
+            <span class="status-dot unlocked"></span> Unlocked
           </span>
           {% elif lock.state == 'jammed' %}
           <span class="inline-flex items-center gap-1 text-xs font-medium text-red-400">
-            <span class="w-2 h-2 rounded-full bg-red-400"></span> Jammed
+            <span class="status-dot jammed"></span> Jammed
           </span>
           {% else %}
           <span class="inline-flex items-center gap-1 text-xs font-medium text-gray-600">
-            <span class="w-2 h-2 rounded-full bg-gray-600"></span> {{ lock.state|capitalize }}
+            <span class="status-dot unknown"></span> {{ lock.state|capitalize }}
           </span>
           {% endif %}
         </div>
       </div>
 
-      <!-- Actions -->
+      <!-- Actions: primary row -->
       <div class="flex items-center gap-2 pt-1 border-t border-gray-800 flex-wrap">
         <!-- Lock -->
         <form method="post" action="locks/{{ lock.id }}/lock" class="flex-1 min-w-[4rem]">
-          <button type="submit" class="btn-secondary w-full justify-center text-xs">
+          <button type="submit" class="btn-secondary btn-sm w-full justify-center">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                 d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
@@ -67,9 +67,12 @@
           </button>
         </form>
 
-        <!-- Unlock -->
-        <form method="post" action="locks/{{ lock.id }}/unlock" class="flex-1 min-w-[4rem]">
-          <button type="submit" class="btn-secondary w-full justify-center text-xs">
+        <!-- Unlock (holds unlocked until re-locked → confirm + danger tint) -->
+        <form method="post" action="locks/{{ lock.id }}/unlock" class="flex-1 min-w-[4rem]"
+              data-lock-name="{{ lock.name|e }}"
+              onsubmit="return confirm('Unlock ' + this.dataset.lockName + '? It will stay unlocked until locked again.')">
+          <button type="submit" class="btn-secondary btn-sm w-full justify-center"
+                  style="border-color: rgba(239,100,97,0.4); color: var(--danger);">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                 d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z"/>
@@ -81,7 +84,7 @@
         {% if lock.type == 'access_native' %}
         <!-- Relinquish an app override and resume the native Access schedule. -->
         <form method="post" action="locks/{{ lock.id }}/follow-schedule" class="flex-1 min-w-[6rem]">
-          <button type="submit" class="btn-secondary w-full justify-center text-xs"
+          <button type="submit" class="btn-secondary btn-sm w-full justify-center"
                   title="Clear this app's override and resume the door's UniFi Access schedule">
             Follow Schedule
           </button>
@@ -91,7 +94,7 @@
         <!-- Buzz (if enabled) -->
         {% if lock.buzz_enabled %}
         <form method="post" action="locks/{{ lock.id }}/buzz" class="flex-1 min-w-[4rem]">
-          <button type="submit" class="btn-primary w-full justify-center text-xs" title="Unlock for {{ lock.relock_duration }}s then re-lock">
+          <button type="submit" class="btn-primary btn-sm w-full justify-center" title="Unlock for {{ lock.relock_duration }}s then re-lock">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                 d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/>
@@ -102,16 +105,19 @@
         {% endif %}
 
         <!-- History -->
-        <a href="locks/{{ lock.id }}/history" class="btn-secondary text-xs flex items-center gap-1">
+        <a href="locks/{{ lock.id }}/history" class="btn-secondary btn-sm flex items-center gap-1">
           <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
           </svg>
           History
         </a>
+      </div>
 
+      <!-- Actions: secondary row — hide (left) / delete (right) -->
+      <div class="flex items-center justify-between gap-2">
         <!-- Hide -->
         <form method="post" action="locks/{{ lock.id }}/hide">
-          <button type="submit" class="btn-secondary text-xs px-2.5 py-1.5" title="Hide from list">
+          <button type="submit" class="btn-secondary btn-sm btn-icon" title="Hide from list">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                 d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.878 9.878L6.11 6.11m3.768 3.768l4.242 4.242m0 0l3.768 3.768M6.11 6.11L3 3m3.11 3.11l4.242 4.242"/>
@@ -123,7 +129,7 @@
         {% if lock.type == 'ha_external' %}
         <form method="post" action="locks/{{ lock.id }}/delete"
           data-lock-name="{{ lock.name|e }}" onsubmit="return confirm('Delete lock ' + this.dataset.lockName + '? This will remove all associated rules.')">
-          <button type="submit" class="btn-danger text-xs px-2.5 py-1.5" title="Delete">
+          <button type="submit" class="btn-danger btn-sm btn-icon" title="Delete">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                 d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
@@ -178,7 +184,9 @@
               <span class="text-gray-400">
                 <span class="text-gray-600">{{ ed.type }}:</span> {{ ed.name }}
               </span>
-              <form method="post" action="locks/{{ lock.id }}/entry-devices/{{ ed.id }}/delete" class="inline">
+              <form method="post" action="locks/{{ lock.id }}/entry-devices/{{ ed.id }}/delete" class="inline"
+                    data-device-name="{{ ed.name|e }}"
+                    onsubmit="return confirm('Remove entry device ' + this.dataset.deviceName + '?')">
                 <button type="submit" class="text-gray-600 hover:text-red-400">&times;</button>
               </form>
             </div>
