@@ -8,6 +8,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 No unreleased changes.
 
+## [1.5.9] - 2026-07-13
+
+### Fixed
+
+- Dashboard CSS, JavaScript, and fonts now load under HA Ingress. The
+  Supervisor strips the ingress prefix from forwarded paths while the app
+  sets `root_path` for URL generation; the FastAPI 0.139 / Starlette 1.3
+  dependency bump changed static-mount path arithmetic so that mismatch made
+  every `/static/*` asset 404 through Ingress (pages rendered with inline
+  styles only, in every browser). Static files are now resolved from the raw
+  request path, immune to the root-path mismatch, with an end-to-end
+  regression test covering direct and Ingress modes.
+- Self-hosted fonts are served with the correct `font/woff2` content type
+  (Alpine's mimetypes table has no woff2 entry).
+
 ## [1.5.8] - 2026-07-13
 
 ### Fixed

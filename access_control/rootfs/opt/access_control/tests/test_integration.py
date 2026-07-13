@@ -110,6 +110,39 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(response.headers["x-content-type-options"], "nosniff")
         self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
 
+    def test_static_assets_serve_in_direct_and_ingress_modes(self) -> None:
+        # Regression: Supervisor strips the ingress prefix from the path while
+        # the ingress middleware sets root_path to it — an ASGI-spec mismatch
+        # that made Starlette's Mount (fastapi 0.139 / starlette 1.3) resolve
+        # static files as static/app.css inside the static directory. Every
+        # dashboard asset (CSS/JS/fonts) 404'd under HA Ingress while plain
+        # routes kept working, rendering the UI with inline styles only.
+        app_module = self.modules["access_control.main"]
+        ingress_headers = {
+            "X-Ingress-Path": "/api/hassio_ingress/testtoken",
+            "X-Remote-User-Id": "test-user-id",
+            "X-Remote-User-Name": "Test Admin",
+            "X-Remote-User-Is-Admin": "true",
+        }
+
+        with TestClient(app_module.app) as client:
+            direct = client.get("/static/app.css")
+            ingress = client.get("/static/app.css", headers=ingress_headers)
+            ingress_font = client.get(
+                "/static/fonts/archivo.woff2", headers=ingress_headers
+            )
+            missing = client.get("/static/nope.css", headers=ingress_headers)
+
+        self.assertEqual(direct.status_code, 200)
+        self.assertEqual(ingress.status_code, 200)
+        self.assertIn("text/css", ingress.headers["content-type"])
+        self.assertEqual(ingress.headers["cache-control"], "public, max-age=3600")
+        self.assertEqual(ingress.content, direct.content)
+        self.assertEqual(ingress_font.status_code, 200)
+        self.assertEqual(ingress_font.headers["content-type"], "font/woff2")
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.headers["cache-control"], "no-store")
+
     def test_body_cap_covers_unauthenticated_login(self) -> None:
         app_module = self.modules["access_control.main"]
         oversized = b"x" * (app_module._MAX_FORM_BODY + 1)
