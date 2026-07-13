@@ -588,6 +588,60 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
         no_token = AccessClient("unvr.local", "service", "secret")
         self.assertFalse(await no_token.validate_open_api())
 
+    async def test_official_idle_door_empty_rule_type_normalizes_to_reset(
+        self,
+    ) -> None:
+        """A door with no active override answers the Open API rule read with
+        {"type": "", "ended_time": 0} (observed live, Access firmware 2026-07).
+        That idle response must parse as the native-behavior "reset" rule —
+        it previously raised "unknown lock rule type", which failed token
+        validation against any console whose first door was idle and would
+        have failed every hub-sync readback of an idle door."""
+        client, _session = self._official_client(
+            _Response(
+                payload={
+                    "code": "SUCCESS",
+                    "data": {"type": "", "ended_time": 0},
+                }
+            ),
+        )
+
+        rule = await client.get_lock_rule("hub-1", location_id="door-1")
+
+        self.assertEqual(rule, {"type": "reset", "ended_time": 0})
+
+    async def test_validate_open_api_accepts_idle_first_door(self) -> None:
+        client, _session = self._official_client(
+            _Response(
+                payload={
+                    "code": "SUCCESS",
+                    "data": [{"id": "door-1", "name": "Back Door"}],
+                }
+            ),
+            _Response(
+                payload={
+                    "code": "SUCCESS",
+                    "data": {"type": "", "ended_time": 0},
+                }
+            ),
+        )
+
+        self.assertTrue(await client.validate_open_api())
+
+    async def test_legacy_empty_rule_type_stays_rejected(self) -> None:
+        """The empty-type normalization is Open-API-only: legacy envelopes
+        always echo a concrete type, so an empty one there is still malformed
+        (fail-closed)."""
+        client = AccessClient("unvr.local", "service", "secret")
+        client._request = AsyncMock(
+            return_value=_Response(
+                payload={"code": "SUCCESS", "data": {"lock_rule": {"type": ""}}}
+            )
+        )
+
+        with self.assertRaisesRegex(AccessClientError, "lock.rule"):
+            await client.get_lock_rule("hub-1")
+
     async def test_legacy_get_404_raises_typed_endpoint_gone(self) -> None:
         """A UNVR update removed the legacy per-device lock_rule route. A 404
         on the legacy GET must surface the typed, actionable error."""

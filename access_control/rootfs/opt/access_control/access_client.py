@@ -922,8 +922,21 @@ class AccessClient:
             raise AccessClientError(
                 "UniFi Access Open API returned an invalid lock rule"
             )
+        rule_type = data.get("type")
+        if rule_type is None or (
+            isinstance(rule_type, str) and not rule_type.strip()
+        ):
+            # A door with no active override answers the Open API rule read
+            # with an empty type ({"type": "", "ended_time": 0}) — observed
+            # live on Access firmware 2026-07. That is the documented idle
+            # response, not a malformed envelope: it means "no rule; native
+            # behavior", i.e. exactly what "reset" already means downstream
+            # (state must come from the relay readback, never inferred).
+            # Only this official path normalizes it; legacy parsing stays
+            # strict because legacy envelopes always echo a concrete type.
+            rule_type = "reset"
         return cls._normalized_lock_rule(
-            data.get("type"),
+            rule_type,
             ended_time=data.get("ended_time"),
         )
 
