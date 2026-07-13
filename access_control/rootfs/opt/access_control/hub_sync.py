@@ -45,6 +45,7 @@ import logging
 import time
 from typing import Any, Awaitable, Callable, Optional
 
+from .access_client import AccessClientError, AccessLegacyEndpointGoneError
 from .database import Database
 
 _LOGGER = logging.getLogger(__name__)
@@ -57,6 +58,19 @@ _APPLY_RETRY_DELAY = 1.5
 # the applied state is NOT advanced on failure, so the change is retried
 # until the hub converges (desired-state semantics, like sweep_overdue).
 _FAILURE_BACKOFF = 30.0
+
+# Consecutive identical hard-rejection failures before the locked direction is
+# placed on _FAILURE_BACKOFF spacing. The retry NEVER stops — it is only spaced
+# so a permanently removed endpoint cannot spam a drive+log every poll.
+_HARD_REJECT_BACKOFF_THRESHOLD = 3
+
+# Exact AccessClientError messages that denote a permanent, operator-actionable
+# rejection of a legacy lock write. Kept as a tiny exact-match allowlist so
+# ordinary transient faults (timeouts, 5xx, connection resets) never engage the
+# hard-rejection backoff — they keep retrying at full cadence.
+_HARD_REJECTION_MARKERS = frozenset(
+    {"UniFi Access rejected the legacy lock rule"}
+)
 
 # Flap damping: minimum spacing between hub drives per entity. A
 # deferred change is not lost — it applies on the first poll after the
@@ -149,6 +163,18 @@ class HubSyncManager:
         # entities whose current failing change already fired the
         # failure event (avoid re-notifying every backoff cycle)
         self._failure_notified: set[str] = set()
+        # Hard-rejection tracking for the locked direction. ``_last_drive_hard``
+        # carries the classification of the most recent _drive_hub failure for
+        # an eid (reset before each bidirectional drive); ``_hard_reject_state``
+        # holds (signature, consecutive_count) so a *repeated* permanent
+        # rejection can be spaced onto _FAILURE_BACKOFF without ever stopping.
+        self._last_drive_hard: dict[str, str] = {}
+        self._hard_reject_state: dict[str, tuple[str, int]] = {}
+        # eid → last logged failure signature so a persistent fault logs once at
+        # its natural level (exception/warning) then drops to debug until a
+        # convergence re-arms it. Keeps a removed endpoint from flooding logs.
+        self._drive_log_signature: dict[str, str] = {}
+        self._observe_log_signature: dict[str, str] = {}
         # Flap damping state: last drive time and the recent drive
         # timestamps within the flap window.
         self._last_applied_at: dict[str, float] = {}
@@ -523,6 +549,7 @@ class HubSyncManager:
                     self._applied[eid] = "unlocked"
                     self._backoff_until.pop(eid, None)
                     self._failure_notified.discard(eid)
+                    self._clear_incident_signatures(eid)
                     applied_count += 1
             self._lockdown_unresolved = (
                 current_eids.difference(self._lockdown_reset)
@@ -969,6 +996,7 @@ class HubSyncManager:
                 device_id,
                 "locked",
                 hub_name,
+                eid=next(iter(hub_owners), None),
                 location_id=hub.get("location_id"),
                 enforcing_lockdown=enforcing_lockdown,
                 fail_safe=ownership_recorded,
@@ -1145,11 +1173,26 @@ class HubSyncManager:
                         "error": type(result).__name__,
                     }
                 )
-                _LOGGER.warning(
-                    "Hub sync: Access readback failed for %s: %s",
-                    hub.get("name", hub.get("device_id")),
-                    result,
-                )
+                # Log once per distinct readback failure signature (which, for a
+                # removed endpoint, carries the actionable message), then drop to
+                # debug so a persistent 404 does not warn on every 5s poll. The
+                # signature is re-armed on convergence. This is observe-side
+                # noise control only — the drive-gate backoff is what actually
+                # spaces retries; invalid state still latches fail-safe locked.
+                signature = f"{type(result).__name__}:{result}"
+                if self._observe_log_signature.get(entity_id) == signature:
+                    _LOGGER.debug(
+                        "Hub sync: Access readback failed for %s: %s",
+                        hub.get("name", hub.get("device_id")),
+                        result,
+                    )
+                else:
+                    self._observe_log_signature[entity_id] = signature
+                    _LOGGER.warning(
+                        "Hub sync: Access readback failed for %s: %s",
+                        hub.get("name", hub.get("device_id")),
+                        result,
+                    )
                 continue
             state, rule, schedule_active = result
             rule_type = str(rule.get("type") or "")
@@ -1337,6 +1380,22 @@ class HubSyncManager:
             desired = "locked"
             fail_safe = True
 
+        # Bounded backoff for a repeatedly hard-rejected locked drive. Once a
+        # definitive rejection (legacy endpoint removed, or an explicit legacy
+        # rule rejection) has recurred past the threshold, retry on a spaced
+        # cadence instead of every poll. This NEVER stops: the durable locked
+        # intent recorded above (_fail_safe_reset_eids / desired="locked") is
+        # retained and the drive resumes the instant the deadline passes.
+        # Lockdown enforcement returns from the dedicated branch in _poll_once
+        # and never reaches this method, so incident closing is never delayed.
+        if (
+            desired == "locked"
+            and self._hard_reject_state.get(eid, ("", 0))[1]
+            >= _HARD_REJECT_BACKOFF_THRESHOLD
+            and self._backoff_until.get(eid, 0.0) > now
+        ):
+            return 0
+
         # Flap damping — bound the command volume of a pathologically cycling
         # lock. This mirrors the legacy _poll_once contract exactly: it gates
         # ONLY the unsafe hold-open direction and only when a real drive toward
@@ -1369,6 +1428,11 @@ class HubSyncManager:
                 await self._suspend_flapping(lock)
                 return 0
 
+        # Clear any hard-rejection marker from a previous pass so a failed
+        # drive below is judged only on this pass's own outcome. _drive_hub
+        # sets it again if (and only if) this drive is permanently rejected.
+        self._last_drive_hard.pop(eid, None)
+
         changed = False
         if ha_state != desired:
             if not await self._drive_ha_state(
@@ -1382,11 +1446,14 @@ class HubSyncManager:
                 )
                 self._last_access_rule[eid] = access_rule
                 # Back off retries of the unsafe direction only; a failed lock
-                # must keep retrying every poll (fail-closed).
+                # must keep retrying every poll (fail-closed) — unless it is a
+                # repeated hard rejection, which is spaced but never stopped.
                 if desired == "unlocked":
                     self._backoff_until[eid] = (
                         time.monotonic() + _FAILURE_BACKOFF
                     )
+                else:
+                    self._note_locked_drive_failure(eid)
                 return 0
             ha_state = desired
             changed = True
@@ -1421,11 +1488,14 @@ class HubSyncManager:
                 )
                 self._last_access_rule[eid] = access_rule
                 # Back off retries of the unsafe direction only; a failed lock
-                # must keep retrying every poll (fail-closed).
+                # must keep retrying every poll (fail-closed) — unless it is a
+                # repeated hard rejection, which is spaced but never stopped.
                 if desired == "unlocked":
                     self._backoff_until[eid] = (
                         time.monotonic() + _FAILURE_BACKOFF
                     )
+                else:
+                    self._note_locked_drive_failure(eid)
                 return 0
             access_state = desired
             access_rule = f"command:{desired}"
@@ -1456,9 +1526,11 @@ class HubSyncManager:
         if desired == "locked":
             self._fail_safe_reset_eids.discard(eid)
         # A confirmed convergence clears any prior unsafe-direction backoff so
-        # the next genuine change is not needlessly deferred (legacy parity).
+        # the next genuine change is not needlessly deferred (legacy parity),
+        # and re-arms hard-rejection tracking + loud logging for a new incident.
         self._backoff_until.pop(eid, None)
         self._failure_notified.discard(eid)
+        self._clear_incident_signatures(eid)
         return 1 if changed else 0
 
     async def _apply_state(
@@ -1610,6 +1682,7 @@ class HubSyncManager:
                 device_id,
                 state,
                 hub_name,
+                eid=eid,
                 location_id=hub.get("location_id"),
                 enforcing_lockdown=enforcing_lockdown,
                 fail_safe=fail_safe,
@@ -1998,6 +2071,7 @@ class HubSyncManager:
                     device_id,
                     "locked",
                     hub_name,
+                    eid=eid,
                     location_id=hub.get("location_id"),
                     enforcing_lockdown=enforcing_lockdown,
                     fail_safe=persistent_lock and ownership_recorded,
@@ -2075,6 +2149,55 @@ class HubSyncManager:
         self._last_access_rule.pop(eid, None)
         self._last_converged.pop(eid, None)
         self._access_momentary_until.pop(eid, None)
+        self._clear_incident_signatures(eid)
+
+    def _clear_incident_signatures(self, eid: str) -> None:
+        """Drop hard-rejection state and re-arm loud logging for ``eid``.
+
+        Called on convergence (and when tracking is dropped) so the NEXT
+        distinct incident logs at full volume and starts a fresh backoff.
+        """
+        self._hard_reject_state.pop(eid, None)
+        self._last_drive_hard.pop(eid, None)
+        self._drive_log_signature.pop(eid, None)
+        self._observe_log_signature.pop(eid, None)
+
+    @staticmethod
+    def _hard_rejection_signature(exc: BaseException) -> str | None:
+        """Return a stable bucket when ``exc`` is a permanent hard rejection.
+
+        A hard rejection is the typed legacy-endpoint-gone error or an explicit
+        legacy rule rejection (matched against a tiny exact-message allowlist).
+        Transient faults (timeouts, 5xx, resets) return None so they keep
+        retrying at full cadence and never trip the hard-rejection backoff.
+        """
+        if isinstance(exc, AccessLegacyEndpointGoneError):
+            return "legacy_endpoint_gone"
+        if (
+            isinstance(exc, AccessClientError)
+            and str(exc) in _HARD_REJECTION_MARKERS
+        ):
+            return "legacy_rule_rejected"
+        return None
+
+    def _note_locked_drive_failure(self, eid: str) -> None:
+        """Track consecutive hard-rejected locked drives; engage bounded backoff.
+
+        Only a permanent hard rejection (surfaced by _drive_hub into
+        ``_last_drive_hard``) counts. Transient/other failures reset the counter
+        so they keep retrying every poll. Once the same signature recurs past
+        the threshold the locked drive is spaced by _FAILURE_BACKOFF — retried
+        forever, only spaced, never stopped.
+        """
+        signature = self._last_drive_hard.get(eid)
+        if signature is None:
+            self._hard_reject_state.pop(eid, None)
+            return
+        prev_signature, count = self._hard_reject_state.get(eid, (None, 0))
+        count = count + 1 if prev_signature == signature else 1
+        self._hard_reject_state[eid] = (signature, count)
+        if count >= _HARD_REJECT_BACKOFF_THRESHOLD:
+            self._backoff_until[eid] = time.monotonic() + _FAILURE_BACKOFF
 
     # ------------------------------------------------------------------
     # Internal — resolution / actuation / alerting
@@ -2152,6 +2275,7 @@ class HubSyncManager:
         state: str,
         hub_name: str,
         *,
+        eid: str | None = None,
         location_id: str | None = None,
         enforcing_lockdown: bool = False,
         fail_safe: bool = False,
@@ -2270,11 +2394,27 @@ class HubSyncManager:
                             if confirmed_state in {"locked", "unlocked"}:
                                 return str(confirmed_state)
                         return state
-            except Exception:
-                _LOGGER.exception(
-                    "Hub sync attempt %d/%d failed for %s (→ %s)",
-                    attempt, max_attempts, hub_name, state,
-                )
+            except Exception as exc:
+                # Record whether this failure is a permanent hard rejection so
+                # the bidirectional reconcile can space (never stop) the locked
+                # retry. Log once at the natural level per distinct signature,
+                # then drop to debug so a removed endpoint cannot flood logs.
+                hard = self._hard_rejection_signature(exc)
+                if eid is not None and hard is not None:
+                    self._last_drive_hard[eid] = hard
+                signature = f"{type(exc).__name__}:{exc}"
+                if eid is not None and self._drive_log_signature.get(eid) == signature:
+                    _LOGGER.debug(
+                        "Hub sync attempt %d/%d failed for %s (→ %s): %s",
+                        attempt, max_attempts, hub_name, state, exc,
+                    )
+                else:
+                    if eid is not None:
+                        self._drive_log_signature[eid] = signature
+                    _LOGGER.exception(
+                        "Hub sync attempt %d/%d failed for %s (→ %s): %s",
+                        attempt, max_attempts, hub_name, state, exc,
+                    )
             if attempt < max_attempts:
                 if enforcing_lockdown:
                     await asyncio.sleep(_APPLY_RETRY_DELAY)

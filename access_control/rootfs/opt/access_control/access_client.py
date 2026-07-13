@@ -72,7 +72,36 @@ WS_RECONNECT_DELAY = 5  # seconds
 
 
 class AccessClientError(Exception):
-    """Raised for errors communicating with the UniFi Access API."""
+    """Raised for errors communicating with the UniFi Access API.
+
+    ``status`` carries the HTTP status code when the error originates from a
+    non-2xx REST response, so callers can react structurally (e.g. detect a
+    removed endpoint) instead of parsing the human-readable message.
+    """
+
+    def __init__(self, *args: object, status: int | None = None) -> None:
+        super().__init__(*args)
+        self.status = status
+
+
+class AccessLegacyEndpointGoneError(AccessClientError):
+    """Raised when a legacy per-device lock_rule endpoint returns HTTP 404.
+
+    A UNVR Access app update removed the private
+    ``/proxy/access/api/v2/device/{id}/lock_rule`` route. Deployments without
+    an Open API token are pinned to that path, so every legacy read/write now
+    404s. This typed error lets the sync layer recognise the condition as a
+    permanent, operator-actionable misconfiguration rather than a transient
+    fault.
+    """
+
+
+# Actionable guidance surfaced whenever a legacy lock_rule endpoint 404s.
+_LEGACY_ENDPOINT_GONE_MESSAGE = (
+    "legacy Access API endpoint not found — the console's Access app likely "
+    "removed it; configure a UniFi Access Open API token in Settings to switch "
+    "to the supported API"
+)
 
 
 class AccessClient:
@@ -548,7 +577,8 @@ class AccessClient:
             if resp.status >= 400:
                 await resp.text()
                 raise AccessClientError(
-                    f"HTTP {resp.status} from {method} {path}"
+                    f"HTTP {resp.status} from {method} {path}",
+                    status=resp.status,
                 )
 
             return resp
@@ -1006,7 +1036,14 @@ class AccessClient:
                 "Legacy UniFi Access lock control requires a device_id"
             )
         path = API_DEVICE_LOCK_RULE.format(device_id=device_id)
-        payload = await self._legacy_json_request("GET", path)
+        try:
+            payload = await self._legacy_json_request("GET", path)
+        except AccessClientError as exc:
+            if getattr(exc, "status", None) == 404:
+                raise AccessLegacyEndpointGoneError(
+                    _LEGACY_ENDPOINT_GONE_MESSAGE
+                ) from exc
+            raise
         return self._parse_legacy_lock_rule(payload)
 
     async def get_door_state(
@@ -1129,11 +1166,18 @@ class AccessClient:
                     "Legacy UniFi Access lock control requires a device_id"
                 )
             path = API_DEVICE_LOCK_RULE.format(device_id=device_id)
-            payload = await self._legacy_json_request(
-                "PUT",
-                path,
-                json_body={"lock_rule": rule_type},
-            )
+            try:
+                payload = await self._legacy_json_request(
+                    "PUT",
+                    path,
+                    json_body={"lock_rule": rule_type},
+                )
+            except AccessClientError as exc:
+                if getattr(exc, "status", None) == 404:
+                    raise AccessLegacyEndpointGoneError(
+                        _LEGACY_ENDPOINT_GONE_MESSAGE
+                    ) from exc
+                raise
             self._validate_legacy_rule_write(payload, rule_type)
 
         return await self._confirm_rule_command(

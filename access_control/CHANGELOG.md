@@ -8,6 +8,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 No unreleased changes.
 
+## [1.5.8] - 2026-07-13
+
+### Fixed
+
+- Hub sync now recognises when the console's Access app has removed the
+  legacy per-device `lock_rule` API (HTTP 404) and surfaces an actionable
+  error — "configure a UniFi Access Open API token in Settings to switch to
+  the supported API" — instead of a generic traceback. Deployments without
+  an Open API token are pinned to the legacy endpoint; recent UniFi Access
+  updates have dropped it.
+- Repeated permanent rejections of a locked-direction hub drive (removed
+  endpoint or explicit legacy-rule rejection) are now retried on a spaced
+  30-second cadence after three consecutive failures instead of hammering
+  the dead API twice every 5-second poll. Retries never stop — the safe
+  locked intent is retained and enforcement resumes the moment the spacing
+  expires — and lockdown enforcement is never spaced or delayed. Transient
+  faults (timeouts, 5xx) keep full-cadence retry.
+- Persistent hub-sync failures now log once at full volume per distinct
+  failure (drive errors and Access readback failures), with repeats demoted
+  to debug until the lock converges again; previously an unreachable
+  endpoint produced two error tracebacks and a warning every five seconds
+  indefinitely.
+
 ## [1.5.7] - 2026-07-13
 
 ### Fixed

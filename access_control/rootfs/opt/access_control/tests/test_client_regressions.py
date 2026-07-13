@@ -5,7 +5,11 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from access_control.access_client import AccessClient, AccessClientError
+from access_control.access_client import (
+    AccessClient,
+    AccessClientError,
+    AccessLegacyEndpointGoneError,
+)
 
 
 class _Response:
@@ -583,6 +587,72 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
 
         no_token = AccessClient("unvr.local", "service", "secret")
         self.assertFalse(await no_token.validate_open_api())
+
+    async def test_legacy_get_404_raises_typed_endpoint_gone(self) -> None:
+        """A UNVR update removed the legacy per-device lock_rule route. A 404
+        on the legacy GET must surface the typed, actionable error."""
+        client = AccessClient("unvr.local", "service", "secret")
+        client._request = AsyncMock(
+            side_effect=AccessClientError(
+                "HTTP 404 from GET /proxy/access/api/v2/device/hub-1/lock_rule",
+                status=404,
+            )
+        )
+
+        with self.assertRaises(AccessLegacyEndpointGoneError) as ctx:
+            await client.get_lock_rule("hub-1")
+
+        message = str(ctx.exception)
+        self.assertIn("legacy Access API endpoint not found", message)
+        self.assertIn(
+            "configure a UniFi Access Open API token", message
+        )
+
+    async def test_legacy_put_404_raises_typed_endpoint_gone(self) -> None:
+        """The legacy PUT (hold_locked → _write_rule_and_confirm) must also
+        raise the typed error on a 404 so the sync layer can recognise it."""
+        client = AccessClient("unvr.local", "service", "secret")
+        client._request = AsyncMock(
+            side_effect=AccessClientError(
+                "HTTP 404 from PUT /proxy/access/api/v2/device/hub-1/lock_rule",
+                status=404,
+            )
+        )
+
+        with self.assertRaises(AccessLegacyEndpointGoneError) as ctx:
+            await client.hold_locked("hub-1")
+
+        self.assertIn(
+            "configure a UniFi Access Open API token", str(ctx.exception)
+        )
+        # The write failed before any readback confirmation was attempted.
+        self.assertEqual(client._request.await_count, 1)
+
+    async def test_legacy_non_404_error_is_not_reclassified(self) -> None:
+        """A 5xx / transient legacy failure stays a plain AccessClientError so
+        the sync layer keeps retrying it at full cadence."""
+        client = AccessClient("unvr.local", "service", "secret")
+        client._request = AsyncMock(
+            side_effect=AccessClientError(
+                "HTTP 500 from GET /proxy/access/api/v2/device/hub-1/lock_rule",
+                status=500,
+            )
+        )
+
+        with self.assertRaises(AccessClientError) as ctx:
+            await client.get_lock_rule("hub-1")
+
+        self.assertNotIsInstance(ctx.exception, AccessLegacyEndpointGoneError)
+
+    async def test_open_api_404_is_not_reclassified_as_legacy_gone(self) -> None:
+        """The modern Open-API branch must be unaffected: a 404 there is a
+        plain AccessClientError, never the legacy-endpoint-gone signal."""
+        client, _session = self._official_client(_Response(status=404))
+
+        with self.assertRaises(AccessClientError) as ctx:
+            await client.get_lock_rule("hub-1", location_id="door-1")
+
+        self.assertNotIsInstance(ctx.exception, AccessLegacyEndpointGoneError)
 
 
 class _ProtectLoginResponse:
