@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import mimetypes
 import os
 import sys
 import time
@@ -1788,8 +1789,37 @@ async def health_live():
     return {"status": "ok"}
 
 
-# Static files
-app.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
+class _IngressStaticFiles(StaticFiles):
+    """StaticFiles that resolves files from the raw /static request path.
+
+    Supervisor's ingress proxy strips the ``/api/hassio_ingress/<token>``
+    prefix from the forwarded path while the ingress middleware still sets
+    ``scope["root_path"]`` to that prefix so redirects and the template
+    ``<base href>`` generate Ingress-safe URLs. That breaks the ASGI
+    expectation that ``root_path`` is a prefix of ``path``: Starlette's
+    Mount then computes a child ``root_path`` of ``<ingress>/static`` which
+    strips nothing from ``/static/app.css``, so upstream ``get_path``
+    resolved files as ``static/app.css`` *inside* the static directory and
+    404'd every asset under Ingress (fastapi 0.139 / starlette 1.3
+    exposed this; plain routes tolerate the mismatch). Compute the file
+    path from the mount-relative portion of the raw path instead —
+    identical to upstream normalization, immune to root_path arithmetic.
+    """
+
+    def get_path(self, scope) -> str:
+        route_path = scope["path"]
+        if route_path.startswith("/static"):
+            route_path = route_path[len("/static"):] or "/"
+        return os.path.normpath(os.path.join(*route_path.split("/")))
+
+
+# Static files. Alpine's mimetypes table has no woff2 entry, so register it
+# before the mount guesses content types — fonts otherwise serve as
+# application/octet-stream.
+mimetypes.add_type("font/woff2", ".woff2")
+app.mount(
+    "/static", _IngressStaticFiles(directory=str(_HERE / "static")), name="static"
+)
 
 # Routers
 app.include_router(api_router)
