@@ -7,9 +7,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
 from zoneinfo import ZoneInfo
 
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+from fastapi.testclient import TestClient
 
-from access_control import web_routes
+from access_control import web_auth, web_routes
 
 
 def _request(
@@ -309,6 +311,58 @@ class RenderAndValidationTests(unittest.IsolatedAsyncioTestCase):
         render_error.assert_awaited_once()
         generate.assert_not_called()
         db.add_api_key.assert_not_awaited()
+
+
+class LogoutHardeningTests(unittest.TestCase):
+    """GET /logout used to clear the session cookie with no CSRF check, so a
+    third-party page could force-logout a signed-in admin with a bare
+    ``<img src="/logout">``. Logout is now POST, guarded by require_csrf
+    like every other state-changing route, and the GET route is removed
+    outright (405) rather than kept as a silent no-op. Hardening review
+    2026-07-12.
+    """
+
+    @staticmethod
+    def _client() -> TestClient:
+        web_auth.SECRET_KEY = "test-secret"
+        app = FastAPI()
+        app.include_router(web_routes.router)
+        # require_csrf itself Depends(require_login); overriding require_login
+        # simulates an authenticated "admin" session without needing a real
+        # signed cookie, while leaving the real require_csrf CSRF check in
+        # place so these tests exercise the actual dependency the route uses.
+        app.dependency_overrides[web_routes.require_login] = lambda: "admin"
+        return TestClient(app)
+
+    def test_post_logout_with_valid_csrf_clears_session(self) -> None:
+        client = self._client()  # sets web_auth.SECRET_KEY as a side effect
+        token = web_routes.generate_csrf_token("admin")
+        with client:
+            response = client.post(
+                "/logout",
+                data={"_csrf_token": token},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/login")
+        set_cookie = response.headers.get("set-cookie", "")
+        self.assertIn("session=", set_cookie)
+        self.assertIn("Max-Age=0", set_cookie)
+
+    def test_post_logout_without_csrf_is_rejected(self) -> None:
+        with self._client() as client:
+            response = client.post("/logout", data={}, follow_redirects=False)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertNotIn("set-cookie", response.headers)
+
+    def test_get_logout_no_longer_clears_session_cookie(self) -> None:
+        with self._client() as client:
+            response = client.get("/logout", follow_redirects=False)
+
+        self.assertEqual(response.status_code, 405)
+        self.assertNotIn("set-cookie", response.headers)
 
 
 if __name__ == "__main__":
