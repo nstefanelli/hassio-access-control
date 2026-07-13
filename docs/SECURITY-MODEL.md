@@ -71,7 +71,9 @@ not refresh the cookie indefinitely.
 All state-changing dashboard routes require a signed CSRF token tied to the
 authenticated identity. First-run setup is the exception because no session
 exists yet; it is available only before configuration, is rate limited, and
-cannot be replayed after `admin_username` exists.
+cannot be replayed after `admin_username` exists. Sign-out is one of those
+CSRF-protected `POST` routes: `GET /logout` was removed so a cross-site
+`<img src>`-style request can no longer force a session logout.
 
 In an unsupported/direct-port deployment, that unauthenticated first-run POST
 creates the initial administrator. Complete setup while the port is bound to
@@ -81,8 +83,14 @@ Ingress keeps the port unexposed and relies on the HA-admin gate.
 
 Request-body limits are enforced before form parsing, including requests that
 use chunked transfer encoding. Dynamic/authenticated responses are marked
-non-cacheable, and static assets use an explicit cache policy. Security headers
-apply to ordinary and early middleware responses.
+non-cacheable, and static assets use an explicit cache policy: asset URLs
+carry a content-hash version query so a bundle change is always a new URL,
+only a successful (`200`/`206`/`304`) static response receives the bounded
+public cache, and every error response is `no-store`. Static files are
+resolved from the raw request path rather than through root-path arithmetic,
+so a Home Assistant Ingress session's stripped-prefix `root_path` cannot 404
+the static mount; self-hosted `woff2` fonts are served as `font/woff2`.
+Security headers apply to ordinary and early middleware responses.
 
 ## External API authentication
 

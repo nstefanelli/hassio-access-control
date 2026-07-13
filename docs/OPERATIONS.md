@@ -273,7 +273,11 @@ unconfirmed operation into a false success. Explicitly clearing the token
 enables compatibility mode, but that is a capability reduction, not a repair.
 Some Access firmware cannot expose an unambiguous rule/relay state after
 `reset` through the private API, so Follow Schedule or reverse synchronization
-may remain unconfirmed without a token.
+may remain unconfirmed without a token. On the official Open API, a door with
+no active override reports an empty rule type, which the client normalizes to
+`reset`; this is native behavior, and state is always confirmed through relay
+readback rather than inferred from the rule. Legacy (private-API) rule parsing
+stays strict and does not accept an empty type.
 
 `ACCESS_CONTROL_ACCESS_API_TOKEN`, when non-empty in a custom deployment,
 overrides the encrypted database value. If replacing the Settings token appears
@@ -410,6 +414,32 @@ reusing the old policy.
   are locked/suppressed until the mapping is one-to-one.
 - Check for `reason=no_paired_hub`, `shared_hub_conflict`, backoff, or flapping
   in logs and the `access_control_hub_sync_failed` event.
+
+### A bidirectionally synced lock re-locks itself immediately
+
+Symptoms: repeated `Hub sync … failed` errors mentioning "legacy Access API
+endpoint not found", HTTP 404 on the legacy `lock_rule` readback
+(`/proxy/access/api/v2/device/{id}/lock_rule`), and — most visibly — a
+bidirectionally synced lock that re-locks itself seconds after every physical
+or HA-side unlock. The Access side cannot be read, so the locked-wins
+fail-safe latches the hub closed until both sides confirm locked.
+
+Cause: recent UniFi Access firmware removed the private per-device
+`lock_rule` API. A deployment without a configured Access API token is pinned
+to that legacy path (token presence is the only API selector), so every
+legacy read/write on that door now 404s.
+
+Fix: create a token **inside the Access application** — not a UniFi OS
+Control-Plane/Network/Site-Manager key — with `view:space` and `edit:space`
+permissions, then save it under this app's **Settings → Access API Token**.
+As a temporary mitigation, "Sync this lock & Access door bidirectionally" can
+be disabled per lock until the token is in place.
+
+Behavior while unresolved: after 3 consecutive identical hard rejections, the
+locked-direction hub drive is spaced onto a ~30 second retry cadence — it
+never stops retrying, only slows down; lockdown enforcement is never spaced
+and always drives at full cadence. The failure logs once at full volume, then
+at debug level until the condition clears.
 
 ### Rate limit responses appear
 
