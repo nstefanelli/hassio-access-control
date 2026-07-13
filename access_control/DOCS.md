@@ -120,8 +120,12 @@ and catches dropped events, firmware without those events, and external drift.
 Normal opening uses `keep_unlock`; a normal lock uses `lock_now`. Fail-safe
 directions such as lockdown, unreadable state, or an origin conflict use
 `keep_lock` so restoring a native schedule cannot reopen the door during the
-incident. Removing the opt-in or explicitly choosing **Follow Schedule** uses
-`reset` only to return control to Access, never as proof of a lock.
+incident. Outside lockdown, removing the opt-in restores the native Access rule
+when sync owns a persistent override or had applied an unlocked baseline; a
+normally locked `lock_now` pair simply drops tracking. Explicit **Follow
+Schedule** uses `reset`, but is rejected during lockdown. After an incident, an
+existing synced pair replaces its app-owned `keep_lock` with confirmed
+`lock_now`; it does not use `reset` as proof of a lock.
 
 The last fully confirmed HA/Access observation is persisted so a restart can
 distinguish a new change from stale disagreement. On first observation, a
@@ -131,13 +135,21 @@ on Access, an Access-only change wins on HA, equal simultaneous changes are
 accepted, and opposing/simultaneous or unreadable changes resolve locked.
 Every commanded side is read back before convergence is persisted.
 
-Before sending `keep_unlock`, the app durably records which hub it may own.
-Startup, shutdown, HA loss, and lockdown drive the safe locked direction; an
-unconfirmed result remains queued and observable rather than being treated as
-converged. Pairing changes close removed hubs before opening replacements. If
-independent HA entities resolve to one physical hub, every involved pairing is
-locked and suppressed with `reason=shared_hub_conflict` until the mapping is
-one-to-one. Backoff and flap damping bound repeated commands.
+For bidirectional sync, the app normally records the persistent override type
+and hub/door/location identity before sending `keep_unlock` or `keep_lock`. A
+failed write blocks `keep_unlock`; during active lockdown, the app still
+attempts the safer `keep_lock`, leaves enforcement unresolved, and retries the
+ownership write. After an uncertain restart, either recorded override is first
+replaced with confirmed `keep_lock`; once the incident is over and both sides
+are confirmed locked, `lock_now` replaces it so future native schedules remain
+eligible. An unconfirmed replacement stays queued and observable. On clean
+non-lockdown shutdown, owned overrides and applicable unlocked baselines return
+to native Access ownership; during lockdown, managed ownership remains
+`keep_lock`. Pairing changes close removed hubs before opening replacements. If
+independent HA entities resolve to one physical hub, every
+involved pairing is locked and suppressed with `reason=shared_hub_conflict`
+until the mapping is one-to-one. Backoff and flap damping bound repeated
+commands.
 
 Complete bidirectional behavior should be operated with the official Access
 API token. Tokenless compatibility mode can parse known private rule shapes,

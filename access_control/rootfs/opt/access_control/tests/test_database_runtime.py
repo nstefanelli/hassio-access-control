@@ -121,6 +121,32 @@ class DatabaseRuntimeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await restarted.close()
 
+    async def test_peek_ui_cache_serves_stale_without_evicting(self) -> None:
+        # Missing key: no value, not fresh.
+        self.assertEqual(
+            await self.db.peek_ui_cache("missing", now=100.0), (None, False)
+        )
+
+        await self.db.set_ui_cache("swr", {"n": 1}, ttl=10, now=100.0)
+        # Within TTL → fresh.
+        self.assertEqual(
+            await self.db.peek_ui_cache("swr", now=105.0), ({"n": 1}, True)
+        )
+        # Past TTL → the value is still served (stale) and, crucially, NOT
+        # evicted: the stale-while-revalidate path reuses it while a background
+        # refresh runs. Repeated stale peeks keep returning it.
+        self.assertEqual(
+            await self.db.peek_ui_cache("swr", now=200.0), ({"n": 1}, False)
+        )
+        self.assertEqual(
+            await self.db.peek_ui_cache("swr", now=200.0), ({"n": 1}, False)
+        )
+        # get_ui_cache keeps its original contract: expiry evicts and returns None.
+        self.assertIsNone(await self.db.get_ui_cache("swr", now=200.0))
+        self.assertEqual(
+            await self.db.peek_ui_cache("swr", now=200.0), (None, False)
+        )
+
     async def test_prune_cache_does_not_touch_sqlite_ui_cache(self) -> None:
         await self.db.set_ui_cache("expired", {"x": 1}, ttl=1, now=10.0)
         statements: list[str] = []

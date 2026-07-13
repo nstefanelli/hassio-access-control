@@ -8,6 +8,50 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 No unreleased changes.
 
+## [1.5.5] - 2026-07-12
+
+### Added
+
+- Self-hosted the dashboard's three typefaces (Plus Jakarta Sans, Archivo, and
+  IBM Plex Mono) as bundled Latin `woff2` files with `@font-face`. They were
+  referenced in CSS but never loaded, so the UI silently fell back to system
+  fonts; they now render as designed and load with no external CDN, keeping the
+  interface CSP-safe under HA Ingress.
+
+### Changed
+
+- Unified the dashboard theme. Pages still using the legacy Tailwind gray
+  palette (Locks, Settings, Users, Groups, Activity, and the detail pages) now
+  render in the same navy design tokens as the rest of the app via a palette
+  bridge in the base template, and dim secondary labels were lifted for
+  legibility. The compiled Tailwind bundle is unchanged.
+
+### Fixed
+
+- Removed the tab-switch stall on the Locks and Visitors pages. Their per-page
+  device pickers (HA lock entities, Access door locations, Protect cameras)
+  blocked the page render on live upstream calls whenever the 30-second cache
+  expired — HA's `/api/states` payload alone is 1–5 MB. These caches now use
+  stale-while-revalidate: a render serves cached data immediately and refreshes
+  in the background, so it never waits on an upstream fetch. Live lock state is
+  unchanged, as it still comes from the in-memory WebSocket cache.
+
+## [1.5.4] - 2026-07-12
+
+### Documentation
+
+- Corrected the lockdown API contract to describe persistent `keep_lock`
+  enforcement and confirmed locked state rather than `reset`, which is reserved
+  for Follow Schedule.
+- Documented crash-safe bidirectional-sync ownership of both `keep_unlock` and
+  fail-safe `keep_lock`, including door/location metadata, restart recovery,
+  and confirmed replacement before ownership is cleared.
+- Corrected the Access API-token Settings workflow: a blank token submission is
+  rejected; operators must enter a replacement or explicitly choose **Clear
+  Token**.
+- Updated released changelog references and removed stale “Unreleased” wording
+  from the `1.5.3` release notes.
+
 ## [1.5.3] - 2026-07-12
 
 End-to-end reliability, performance, security, packaging, and documentation
@@ -70,11 +114,13 @@ review.
   `reason=no_paired_hub`, backs off, and retries so a later pairing converges;
   it no longer records a false success.
 - **Hub persistent-rule ownership survives crashes.** Door/location identity
-  plus `keep_unlock` or fail-safe `keep_lock` ownership is persisted before the
-  physical command and cleared only after readback proves the rule was
-  replaced. Startup, lockdown, opt-out, and best-effort shutdown recovery close
-  uncertain doors without stranding them open or silently suppressing future
-  schedules.
+  plus bidirectional-sync `keep_unlock` or fail-safe `keep_lock` ownership is
+  normally persisted before the physical command and cleared only after
+  readback proves the rule was replaced. A persistence failure blocks opening;
+  active lockdown still attempts `keep_lock`, reports enforcement unresolved,
+  and retries the ownership write. Startup, lockdown, opt-out, and best-effort
+  shutdown recovery close uncertain doors without stranding them open or
+  silently suppressing future schedules.
 - **Untrustworthy HA state and ambiguous hub ownership now lock fail-safe.** A
   disconnect, state-read exception, or value other than exactly
   `locked`/`unlocked` closes any app-owned hold. Pairing changes close removed
@@ -213,23 +259,24 @@ review.
 - The v1.5.1 topology item correctly records the reduction in row rewrites and
   commits at that release, but a later concurrency review found that batching
   on the shared `aiosqlite` connection did not provide transaction ownership.
-  This Unreleased change moves the refresh to a dedicated atomic connection.
+  The 1.5.3 change moves the refresh to a dedicated atomic connection.
 - The v1.5.0/v1.5.2 hub-sync notes describe the intended lockdown behavior at
   those releases. A held-open hub whose HA state had not changed could still
-  skip reset through the unchanged-state fast path; the Unreleased fix above
+  skip reset through the unchanged-state fast path; the 1.5.3 fix above
   closes that specific gap. Historical release text is preserved rather than
   rewritten.
 - The v1.5.0 hub-sync entry says unknown/unavailable/jammed HA states are
   ignored. That was the behavior at that release. Current sync never opens on
-  an untrustworthy state and actively resets any hold the app owns, including
-  after an HA disconnect or state-read exception.
+  an untrustworthy state and replaces any app-owned unsafe override with
+  confirmed fail-safe `keep_lock`, including after an HA disconnect or
+  state-read exception.
 - The v1.1.0 ingress entry called `X-Ingress-Path` “Supervisor-signed” and said
   another app on the bridge could not forge it. The app validates only the
   header's shape; it cannot verify the opaque ingress token. Co-resident apps
   remain inside the documented HA-host trust boundary. The current security
   model corrects that terminology.
 - v1.1.0 removed the manifest watchdog and later restart UI was intentionally
-  ineffective in the packaged container. This Unreleased change restores an
+  ineffective in the packaged container. The 1.5.3 change restores an
   explicit `/health/live` watchdog and uses Supervisor's authenticated
   self-restart endpoint for scheduled restarts.
 

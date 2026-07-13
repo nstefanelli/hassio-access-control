@@ -17,8 +17,9 @@ The application protects or handles:
   optional remote HA token;
 - API keys, dashboard sessions, CSRF tokens, alarm PINs, and visitor PINs;
 - household identities, schedules, door topology, and access/admin history;
-- persistent lockdown, pending re-lock state, hub hold-open ownership, and
-  confirmed bidirectional-sync origin snapshots.
+- persistent lockdown, pending re-lock state, app-owned persistent
+  bidirectional-sync hub rules (`keep_unlock` and `keep_lock`), and confirmed
+  sync-origin snapshots.
 
 The SQLite database and a usable encryption key together are equivalent to the
 application keychain. A full HA backup containing the app should receive the
@@ -211,8 +212,12 @@ boundaries:
   hold-open and force the bidirectional pair toward locked;
 - a hub-sync lockdown-state read exception behaves as enabled rather than
   allowing hold-open;
-- hub-sync ownership is stored before `keep_unlock`, cleared only after a
-  confirmed safe transition, and fail-safed from durable state after restart;
+- hub-sync ownership, including door/location identity and override type, is
+  normally stored before either persistent `keep_unlock` or `keep_lock`;
+  failure blocks opening, while active lockdown still attempts the safer
+  `keep_lock`, reports unresolved enforcement, and retries persistence;
+- restart treats durable hub-sync ownership as uncertain and first confirms
+  the safe `keep_lock` direction;
 - Access rule events are wake-up hints only; authenticated polling/readback is
   authoritative and repairs dropped events or drift;
 - an unbaselined mismatch, unreadable side, multi-hub disagreement, or opposing
@@ -220,6 +225,9 @@ boundaries:
   schedule with an unlocked relay can establish an unlocked startup baseline;
 - lockdown uses `keep_lock` to close a hub previously held open by sync rather
   than `reset`, which could reactivate a schedule;
+- after an incident, durable `keep_lock` ownership is cleared only after a
+  distinct `lock_now` replacement and locked rule/relay confirmation, so a
+  crash cannot silently suppress future schedules;
 - unresolved lockdown hub locks keep lockdown enabled, return `503` to the
   API caller, and remain visible in `lockdown_enforcement_pending` health;
 - pairing changes make removed hubs safe before opening replacement pairings,
@@ -255,7 +263,8 @@ responsibility.
 - the encrypted Access Open API token when configured in the dashboard;
 - user names/emails, door associations, schedules, and visitor notes;
 - access and administrative history;
-- rate-limit, lockdown, pending re-lock, and hub hold-ownership state.
+- rate-limit, lockdown, pending re-lock, and hub persistent-rule ownership
+  state.
 
 The shared SQLite connection uses autocommit for ordinary statements. Logical
 multi-statement safety/configuration transitions use isolated, task-owned

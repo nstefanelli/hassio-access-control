@@ -86,6 +86,14 @@ If a recent event causes a skip, the loop retries within the same hour. For a
 standalone container without Supervisor integration, `RESTART_COMMAND` is the
 trusted deployment fallback.
 
+Hub-rule recovery depends on how the process stopped. On clean non-lockdown
+shutdown, owned persistent overrides and applicable unlocked baselines return
+to native Access rules; during lockdown, managed ownership remains `keep_lock`.
+After an unclean restart, either durable `keep_unlock` or `keep_lock` ownership
+is treated as uncertain and first driven to confirmed `keep_lock`. Failed
+confirmation remains durable and retries rather than being reported as
+converged.
+
 ## Updates
 
 Before a significant update:
@@ -388,9 +396,15 @@ reusing the old policy.
 - During lockdown, an unlocked value on either side cannot hold the hub open;
   fail-safe control uses `keep_lock`, not `reset`, so an active native schedule
   cannot reopen it.
-- Hold ownership is written before `keep_unlock`. On startup, any recorded hold
-  is driven safe before live convergence; an unconfirmed result remains durable
-  and retries.
+- Bidirectional-sync ownership of persistent `keep_unlock` and `keep_lock`,
+  including the hub/door/location identity, is normally written before the
+  command. Failure blocks opening; during active lockdown, the app still
+  attempts `keep_lock`, reports enforcement unresolved, and retries persistence.
+  On startup, either recorded override is driven to confirmed `keep_lock`
+  before live convergence; an unconfirmed result remains durable and retries.
+- After lockdown or another fail-safe incident, reconciliation first confirms
+  both sides locked, then replaces app-owned `keep_lock` with confirmed
+  `lock_now` so future native schedules remain eligible.
 - A pairing change makes removed hubs safe before applying hold-open to a new hub.
   If multiple HA entities resolve to one physical hub, all involved pairings
   are locked/suppressed until the mapping is one-to-one.
