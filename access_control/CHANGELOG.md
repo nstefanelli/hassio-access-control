@@ -8,6 +8,43 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 No unreleased changes.
 
+## [1.5.6] - 2026-07-13
+
+### Fixed
+
+- Hub sync now applies flap suspension, minimum-apply-interval damping, and
+  failure backoff on the bidirectional reconcile path, mirroring the legacy
+  poll path's contract: only the hold-open (unlock) direction is ever damped,
+  failed lock commands keep retrying every poll, and lockdown enforcement is
+  never deferred. Previously a pathologically cycling lock could drive hub
+  commands on every 5-second poll indefinitely.
+- Bounded the hub-sync flap-detection bookkeeping, which grew without limit in
+  bidirectional mode (one entry per hub actuation for the install's lifetime).
+- The UniFi Protect client no longer replays credentials when two callers race
+  to log in at once; the second caller now reuses the fresh session, matching
+  the Access client's behavior.
+- Signing out is now a CSRF-protected POST; previously a third-party page
+  could force-logout a signed-in admin with a bare `GET /logout` image tag.
+
+### Changed
+
+- Added database indexes for the admin audit log (`timestamp`) and visitors
+  (`created_at`), removing full-table scans from the Settings page and the
+  Visitors page on every load.
+- Dashboard polish across all pages: shared component classes for headings,
+  labels, chips, buttons, and empty states; consistent table styling on the
+  Status, Activity, and Lock History pages; empty-state messages where
+  sections previously vanished silently; and a dark-themed admin-required
+  page so the Ingress 403 no longer flashes light-mode.
+- Dangerous actions are harder to trigger accidentally: manual Unlock now
+  asks for confirmation and carries a danger tint, entry-device deletion and
+  group-member removal now confirm, and every form disables its submit
+  button while a request is in flight (with progress labels on the Settings
+  connection tests and service restart).
+- Mobile layout: the Locks page action row no longer wraps the Delete button
+  into odd positions, visitor extend/delete controls stack on narrow
+  screens, and icon-only buttons have larger tap targets.
+
 ## [1.5.5] - 2026-07-12
 
 ### Added
