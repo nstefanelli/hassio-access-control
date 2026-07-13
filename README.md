@@ -143,7 +143,7 @@ Access WebSocket ─┐
 Protect WebSocket ┘                                      │
                                                          ├─> UniFi door
 HA Ingress ───────> admin dashboard ─────────────────────┤
-Bearer API ───────> health/reporting/lockdown ───────────┤
+Bearer API ───────> health/reporting/door/schedule control ────────┤
                                                          └─> HA lock/alarm
                                                                   │
                                                                   v
@@ -179,9 +179,18 @@ session API. Without a token, compatibility mode retains the existing private
 console path, but firmware-dependent readback—especially after `reset`—cannot
 provide the same schedule/physical-state assurance.
 
-Hub hold-open ownership is written before `keep_unlock` and cleared only after
-a confirmed safe transition. Startup and shutdown recovery therefore lock a
-possibly held-open hub after a crash instead of trusting process-local state.
+For bidirectional hub sync, ownership of persistent `keep_unlock` and
+`keep_lock`, including door/location metadata, is normally written before the
+physical command and cleared only after confirmed replacement. A failed write
+blocks `keep_unlock`; during active lockdown, the app still attempts the safer
+`keep_lock`, reports enforcement unresolved, and retries ownership persistence.
+Crash recovery first drives owned hubs to `keep_lock`; once HA and Access are
+safely locked, `lock_now` replaces that override so future schedules remain
+eligible. On clean non-lockdown shutdown, owned persistent overrides and
+applicable unlocked baselines return to native scheduling; during lockdown,
+managed ownership remains `keep_lock`. A manual native-door **Unlock** is a
+separate persistent Access rule and remains until a later rule command replaces
+it; it is not hub-sync ownership.
 For opted-in pairs, Access rule events trigger an immediate authenticated
 reconcile and the five-second poll catches missed events or external drift.
 HA-only changes flow to Access; Access-only changes, including verified native

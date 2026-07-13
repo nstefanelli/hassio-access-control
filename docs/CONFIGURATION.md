@@ -131,9 +131,11 @@ https://<access-host>:12445/api/v1/developer/...
 The token needs `view:space` for doors/rules/state and `edit:space` for door
 rule changes. Saving it performs read-only doors and lock-rule validation
 before the live client is replaced. The token is encrypted with the same
-installation Fernet key as other upstream secrets and is never shown again;
-leaving a replacement field blank retains the current value, while **Clear
-Token** deliberately returns to compatibility mode.
+installation Fernet key as other upstream secrets and is never shown again.
+The dedicated Settings form requires either a non-blank replacement token or
+the explicit **Clear Token** action; submitting that form blank is rejected and
+does not change the active client. **Clear Token** deliberately returns to
+compatibility mode.
 
 A configured token selects the official path exclusively. An expired token,
 missing permission, unreachable port, malformed response, or confirmation
@@ -261,7 +263,7 @@ Native Access lock buttons intentionally have different meanings:
 | Unlock | `keep_unlock` | Persistent hold-open, confirmed by rule and relay readback. |
 | Lock | `lock_now` | Immediately ends the current unlock schedule and any temporary unlock, then confirms locked. |
 | Follow Schedule | `reset` | Clears the temporary override and returns control to Access. The door can become unlocked immediately if its native schedule is active. |
-| Fail-safe/lockdown lock | `keep_lock` | Persistent locked override used when reopening through a native schedule would be unsafe. |
+| Fail-safe/lockdown lock | `keep_lock` | Persistent locked override used while reopening through a native schedule would be unsafe; ownership remains durable during the incident and is later replaced by confirmed `lock_now`. |
 
 `reset` is never used as a synonym for Lock. A successful HTTP write is also
 not enough: official-mode actions use bounded rule and relay reads before the
@@ -291,10 +293,18 @@ open. Lockdown uses `keep_lock`, refuses every open command under the shared
 barrier, and remains unresolved/observable until the safe direction is
 confirmed.
 
-Before `keep_unlock`, durable ownership is written. Startup/shutdown recovery,
-HA loss, opt-out, pairing replacement, and conflict handling cannot forget a
-possible hold-open merely because the process restarted. Removed hubs are made
-safe before replacements can open. If independent HA entities resolve to one
+For bidirectional sync, durable ownership normally records the persistent
+override type and hub/door/location identity before `keep_unlock` or
+`keep_lock`. A failed write blocks `keep_unlock`; during active lockdown, the
+app still attempts the safer `keep_lock`, reports enforcement unresolved, and
+retries persistence. An uncertain restart first replaces either recorded
+override with confirmed `keep_lock`. Once the incident ends and both HA and
+Access are confirmed locked, `lock_now` replaces the fail-safe override so
+future native schedules remain eligible; ownership is cleared only after
+rule/relay confirmation. On clean non-lockdown shutdown, owned overrides and
+applicable unlocked baselines return to the native Access rule; during
+lockdown, managed ownership remains `keep_lock`. Removed hubs are made safe
+before replacements can open. If independent HA entities resolve to one
 physical hub, all involved pairings lock and remain suppressed with
 `reason=shared_hub_conflict` until the mapping is one-to-one. Failures back off
 and emit `access_control_hub_sync_failed`; pathological flapping is damped and

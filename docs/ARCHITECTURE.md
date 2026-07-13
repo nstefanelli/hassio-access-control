@@ -58,8 +58,8 @@ The process listens on port `8080` inside its container.
    Assistant, and start Protect when its console is reachable.
 6. Atomically synchronize the current UniFi user and native-door topology.
 7. Restore persisted lockdown, pending re-locks, confirmed sync origins, and
-   durable hub hold-open ownership; fail-safe uncertain door state locked
-   before normal convergence.
+   app-owned persistent Access rules (`keep_unlock` or `keep_lock`); fail-safe
+   uncertain door state with `keep_lock` before normal convergence.
 8. Start supervised loops for connection health, hub sync, topology refresh,
    log retention, visitor status, WebSocket liveness, and scheduled restart.
 
@@ -155,6 +155,11 @@ use `reset`, which could reactivate a schedule. Lockdown takes the same path and
 a lockdown-state read exception behaves as enabled. Backoff and flap damping
 bound command volume.
 
+When the incident clears, reconciliation first confirms both HA and Access are
+locked, then replaces app-owned `keep_lock` with confirmed `lock_now`. This
+preserves the current closed interval without allowing the persistent fail-safe
+override to suppress future native schedules.
+
 Pairing resolution is snapshotted per convergence pass. When a mapping changes,
 removed hubs enter the confirmed-safe queue before the newly paired hub may be
 held open, and any expansion invalidates the old applied-state cache so new
@@ -163,15 +168,23 @@ Access hub, every involved pairing is locked and suppressed. The manager emits
 `access_control_hub_sync_failed` with `reason=shared_hub_conflict` until the
 mapping becomes one-to-one.
 
-Hold-open uses write-ahead ownership. Before `keep_unlock`, the app commits an
-`entity_id`/hub row to `hub_sync_holds`; a stale row can cause only an extra
-safe lock. Ownership is cleared only after Access confirms the corresponding
-safe/release transition. Startup loads every row and closes those hubs even if
-HA is unavailable, while graceful shutdown makes the same best-effort action.
-An unavailable or unconfirmed command keeps the durable row and release queue
-for retry. `hub_sync_state` separately stores last fully confirmed HA/Access
-states, origin, Access-rule fingerprint, and pairing signature; Access-origin
-schedule state is never confused with an app-owned hold-open lease.
+Persistent Access overrides created by bidirectional sync use write-ahead
+ownership. Before `keep_unlock` or fail-safe `keep_lock`, the app normally
+commits the HA `entity_id`, Access device and door/location IDs, hub name, and
+override type to `hub_sync_holds`; a stale row can cause only an extra safe
+close. Failure blocks `keep_unlock`. During active lockdown only, a failed
+ownership write still permits the safer `keep_lock`, leaves enforcement
+unresolved, and queues persistence for retry. An uncertain restart first
+replaces any possible open override with confirmed `keep_lock`. That closed
+ownership row is retained until Access proves a later `lock_now`/native-rule
+replacement or an authenticated external rule change supersedes it, preventing
+a crash from silently disabling future schedules. On graceful non-lockdown
+shutdown, owned overrides and applicable unlocked baselines return to native
+schedule ownership; during lockdown, managed ownership remains `keep_lock`.
+Unavailable or unconfirmed commands keep durable ownership queued for retry.
+`hub_sync_state` separately stores last fully confirmed HA/Access states,
+origin, Access-rule fingerprint, and pairing signature; Access-origin schedule
+state is never confused with an app-owned override.
 
 One app-wide command barrier orders authorization/manual unlocks, HA re-locks,
 hub actuation, lockdown transitions, and live client swaps. Critical paths take
@@ -201,16 +214,17 @@ sidecars can exist while the application is running. The database contains:
 - users, locks, rules, groups, visitors, and entry-device associations;
 - access/admin audit logs, rate-limit state, lockdown state, and pending
   re-lock deadlines;
-- durable ownership for hubs that may be in Access `keep_unlock` mode, plus
-  fully confirmed bidirectional convergence snapshots.
+- durable ownership and door identity for bidirectional-sync Access
+  `keep_unlock` or fail-safe `keep_lock`, plus fully confirmed convergence
+  snapshots.
 
 The long-lived SQLite connection runs in autocommit mode, so every ordinary
 single-statement write owns its transaction and another coroutine's
 commit/rollback cannot capture it. Multi-statement logical operations use
 short-lived, task-owned isolated connections with `BEGIN IMMEDIATE`; this
 includes topology/config bundles, group membership replacement, pending
-re-lock ownership, hub-hold ownership, and legacy explicit batches. Process
-locks serialize read-modify-write workflows where needed.
+re-lock ownership, persistent hub-rule ownership, and legacy explicit batches.
+Process locks serialize read-modify-write workflows where needed.
 
 Short-lived UI response caches are process-local and do not create SQLite
 writes. A full topology refresh uses an isolated connection and one atomic

@@ -110,7 +110,7 @@ Returns a health snapshot. All three scopes are accepted.
 | `user_count` | integer | All local user rows, including hidden/deleted-upstream rows. |
 | `lock_count` | integer | Operable configured lock rows, including hidden rows but excluding upstream-missing native locks. |
 | `lockdown` | boolean | Current authorization-engine lockdown state. It normally matches persistence; on a failed transition the safer in-memory state can remain enabled while the request reports `503`. |
-| `lockdown_enforcement_pending` | array of strings | HA entity IDs whose synced Access hubs are not yet confirmed reset for the active lockdown. A non-empty list requires operator attention/retry. |
+| `lockdown_enforcement_pending` | array of strings | HA entity IDs whose synced Access hubs are not yet confirmed locked under the active lockdown. A non-empty list requires operator attention/retry. |
 
 Use `GET /health/live` for process liveness and this endpoint for component
 health. Do not alert from `status` alone.
@@ -341,11 +341,15 @@ that state, so duplicate delivery cannot accidentally invert lockdown. Use
 Lockdown is persisted across restart. Its state change shares a physical-
 command barrier with application unlocks, HA re-locks, and hub-sync commands:
 once an enable request completes, no older application unlock can issue later.
-Enabling lockdown also resets hubs the app may have held open. Repeating
-`enabled=true` may safely reassert those idempotent resets.
+Enabling lockdown applies persistent Access `keep_lock` to paired hubs the app
+may have held open and confirms the paired HA lock is closed when that command
+path is available. Authenticated rule/relay and HA state are re-read while
+lockdown remains active, so a later direct unlock is detected and `keep_lock`
+is safely reasserted. `reset` is not used because it could resume an active
+native unlock schedule.
 
 If enabling cannot persist the desired value or cannot confirm every required
-hub reset, the endpoint returns `503` while retaining the safer enabled
+hub lock, the endpoint returns `503` while retaining the safer enabled
 in-memory state. `GET /api/health` lists unresolved HA entity IDs in
 `lockdown_enforcement_pending`; retry `enabled=true` after restoring the
 database/Access path or correcting a pairing conflict. If `enabled=false`
@@ -353,8 +357,17 @@ cannot be persisted, lockdown likewise remains enabled and the request returns
 `503`. On startup, an error reading the persisted value is interpreted
 fail-closed as enabled until an explicit disable succeeds.
 
-Lockdown does not prevent a separate HA user/integration or direct UniFi
-operator from issuing commands outside this application's authorization path.
+Disabling lockdown does not synchronously clear persistent hub rules in the
+API response. The next authenticated reconciliation confirms both sides locked,
+replaces an app-owned `keep_lock` with `lock_now`, and clears ownership only
+after rule/relay confirmation. A removed pairing returns to its native rule
+after lockdown. Failed replacement remains durable and retries.
+
+Lockdown cannot prevent a separate HA user/integration or direct UniFi operator
+from issuing a command outside this application's authorization path. For
+opted-in HA/Access pairs, event wakeups plus authenticated polling detect that
+drift and drive the pair locked again; unpaired devices remain the upstream
+operator's responsibility.
 
 ### `GET /api/debug`
 
@@ -490,5 +503,5 @@ semantics they understand.
 The changelog calls out breaking API changes. Adding fields is compatible;
 consumers should ignore unknown keys. Removing/renaming fields, changing scope
 requirements, or changing an endpoint's mutation semantics requires a
-documented release change. The Unreleased changelog records the lockdown
+documented release change. The `1.5.3` release notes record the lockdown
 endpoint's change from a toggle to this explicit desired-state contract.

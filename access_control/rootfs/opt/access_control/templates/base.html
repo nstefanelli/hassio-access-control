@@ -24,7 +24,7 @@
       --border-default: #243055;
       --text-primary: #e4e9f4;
       --text-secondary: #8090b0;
-      --text-muted: #4a5a7a;
+      --text-muted: #5e6f92;
       --accent: #3b82f6;
       --accent-hover: #4da3ff;
       --accent-glow: rgba(59, 130, 246, 0.20);
@@ -35,6 +35,13 @@
       --info: #5b9cf5;
       --warning: #f5c542;
     }
+
+    /* Self-hosted fonts (Latin subset) — CSP-safe under HA Ingress; no external CDN.
+       Plus Jakarta Sans & Archivo are variable fonts (single file, weight range). */
+    @font-face { font-family: 'Plus Jakarta Sans'; font-style: normal; font-weight: 200 800; font-display: swap; src: url(static/fonts/plus-jakarta-sans.woff2) format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+    @font-face { font-family: 'Archivo'; font-style: normal; font-weight: 100 900; font-display: swap; src: url(static/fonts/archivo.woff2) format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+    @font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 400; font-display: swap; src: url(static/fonts/ibm-plex-mono-400.woff2) format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+    @font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 500; font-display: swap; src: url(static/fonts/ibm-plex-mono-500.woff2) format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
 
     * { font-family: 'Plus Jakarta Sans', system-ui, sans-serif; }
     h1, h2, h3, .heading { font-family: 'Archivo', system-ui, sans-serif; }
@@ -201,6 +208,43 @@
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--border-subtle); border-radius: 3px; }
     ::-webkit-scrollbar-thumb:hover { background: var(--border-default); }
+
+    /* ─────────────────────────────────────────────────────────────────────
+       PALETTE BRIDGE — maps legacy Tailwind gray/accent utilities onto the
+       navy design tokens so pages not yet migrated to CSS variables render in
+       the same theme as the shell (home/login). Loaded after static/app.css,
+       so these win purely on source order (no !important). This is a transition
+       shim: as templates are rewritten to use the tokens directly, the matching
+       rows here can be removed. Do NOT add utilities here that aren't already
+       used in a template — that would desync the committed Tailwind bundle.
+       ───────────────────────────────────────────────────────────────────── */
+    /* Text — map the gray scale onto the 3 navy text tiers (matches home.html) */
+    .text-gray-100, .text-gray-200 { color: var(--text-primary); }
+    .text-gray-300, .text-gray-400 { color: var(--text-secondary); }
+    .text-gray-500, .text-gray-600 { color: var(--text-muted); }
+    .hover\:text-gray-100:hover, .hover\:text-gray-200:hover { color: var(--text-primary); }
+    .hover\:text-gray-300:hover, .hover\:text-gray-400:hover { color: var(--text-secondary); }
+    /* Surfaces */
+    .bg-gray-900 { background-color: var(--bg-base); }
+    .bg-gray-800, .bg-gray-700 { background-color: var(--bg-elevated); }
+    .bg-gray-600 { background-color: var(--text-muted); }
+    .hover\:bg-gray-800:hover,
+    .hover\:bg-gray-800\/30:hover,
+    .hover\:bg-gray-800\/40:hover,
+    .hover\:bg-gray-800\/60:hover { background-color: var(--bg-elevated); }
+    .hover\:bg-gray-600:hover { background-color: var(--border-default); }
+    /* Borders */
+    .border-gray-800 { border-color: var(--border-subtle); }
+    .border-gray-700, .border-gray-600 { border-color: var(--border-default); }
+    /* Status colours on surfaces → navy semantics (unifies with home's dots/badges) */
+    .text-green-400 { color: var(--success); }
+    .text-red-400 { color: var(--danger); }
+    .text-yellow-400 { color: var(--warning); }
+    .text-blue-500 { color: var(--accent); }
+    .hover\:text-red-400:hover { color: var(--danger); }
+    .bg-green-400 { background-color: var(--success); }
+    .bg-red-400 { background-color: var(--danger); }
+    .bg-yellow-400 { background-color: var(--warning); }
   </style>
 </head>
 <body style="margin:0; min-height:100vh;">

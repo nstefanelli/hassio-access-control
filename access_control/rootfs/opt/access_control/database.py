@@ -1973,6 +1973,25 @@ class Database:
             return None
         return json.loads(value_json)
 
+    async def peek_ui_cache(
+        self, key: str, now: float | None = None
+    ) -> tuple[Any | None, bool]:
+        """Read a UI-cache entry without evicting it, reporting freshness.
+
+        Returns ``(value, is_fresh)``. Unlike :meth:`get_ui_cache`, an expired
+        entry is returned (with ``is_fresh=False``) instead of being dropped,
+        so callers can serve stale data immediately and refresh in the
+        background (stale-while-revalidate). ``(None, False)`` means nothing is
+        cached. Truly abandoned entries are still reclaimed by
+        :meth:`prune_runtime_state`.
+        """
+        now = now if now is not None else time.time()
+        cached = self._ui_cache.get(key)
+        if cached is None:
+            return None, False
+        value_json, expires_at = cached
+        return json.loads(value_json), expires_at > now
+
     async def set_ui_cache(self, key: str, value: Any, ttl: int, now: float | None = None) -> None:
         now = now if now is not None else time.time()
         self._ui_cache[key] = (json.dumps(value), now + ttl)

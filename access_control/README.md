@@ -88,8 +88,9 @@ explicit trusted `RESTART_COMMAND` is available.
 Durable state is stored at `/data/access_control.db`. It contains sensitive
 topology/history and encrypted credentials; database-key installations also
 store the key required to decrypt them. The enrolled Access site identity,
-pending re-locks, and possible hub hold-open ownership also live there so
-startup can reject a namespace change and recover physical state safely. Prefer
+pending re-locks, and app-owned bidirectional-sync `keep_unlock`/`keep_lock`
+hub overrides with their door/location metadata also live there so startup can
+reject a namespace change and recover physical state safely. Prefer
 a Home Assistant backup that includes this app. Related credential and secret
 metadata fields are committed as one serialized bundle. Never make a live raw
 copy of only the SQLite main file, because committed data may still be in its

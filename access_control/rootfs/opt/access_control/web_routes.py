@@ -141,6 +141,74 @@ def _log_task_exception(task: asyncio.Task) -> None:
         logger.error("Unhandled exception in task %r: %s", task.get_name(), exc, exc_info=exc)
 
 
+def _ui_cache_refresh_inflight(request: Request) -> dict:
+    """Per-app map of UI-cache key → in-flight background refresh task.
+
+    Serves two purposes: it de-duplicates concurrent refreshes of the same
+    stale key (a burst of page loads fires one upstream fetch, not several),
+    and it keeps a strong reference to each fire-and-forget task so the event
+    loop can't garbage-collect it mid-flight.
+    """
+    inflight = getattr(request.app.state, "_ui_cache_refresh_inflight", None)
+    if inflight is None:
+        inflight = {}
+        request.app.state._ui_cache_refresh_inflight = inflight
+    return inflight
+
+
+async def _cached_device_options(request: Request, key: str, ttl: int, fetch):
+    """Return cached dashboard data for `key` without blocking on the upstream.
+
+    The per-page device pickers (HA lock entities, Access door locations,
+    Protect cameras) come from upstream calls that take hundreds of ms — and
+    occasionally seconds — on a cold cache. Paying that on every page render is
+    what made tab switches feel slow (e2e review 2026-07-12).
+
+    Stale-while-revalidate: a fresh entry is returned directly; a stale or
+    missing one returns the stale value (or ``None``) immediately and schedules
+    a single background refresh so the *next* render is fresh. `fetch` is an
+    async callable returning the value to cache — the render never awaits it.
+
+    Databases that predate :meth:`peek_ui_cache` (the hand-rolled fakes in the
+    test-suite) transparently fall back to the original block-once-on-miss
+    behaviour, so existing handler tests keep their exact semantics.
+    """
+    db = request.app.state.db
+    peek = getattr(db, "peek_ui_cache", None)
+    if peek is None:
+        # Legacy path — block on a miss, exactly as before SWR existed.
+        value = await db.get_ui_cache(key)
+        if value is not None:
+            return value
+        try:
+            value = await fetch()
+        except Exception:
+            logger.exception("Failed to refresh UI cache %r", key)
+            return None
+        await db.set_ui_cache(key, value, ttl)
+        return value
+
+    value, fresh = await peek(key)
+    if fresh:
+        return value
+
+    inflight = _ui_cache_refresh_inflight(request)
+    if key not in inflight:
+        async def _refresh() -> None:
+            try:
+                fresh_value = await fetch()
+                await db.set_ui_cache(key, fresh_value, ttl)
+            finally:
+                inflight.pop(key, None)
+
+        task = asyncio.create_task(_refresh(), name=f"ui-cache-refresh:{key}")
+        inflight[key] = task
+        task.add_done_callback(_log_task_exception)
+    # Serve whatever we have (possibly stale, or None on first-ever load); the
+    # background refresh makes the next render fresh.
+    return value
+
+
 def _extract_schedule_days(form) -> str | None:
     """Extract checked day checkboxes from form and return comma-separated day names."""
     selected = [d for d in _DAY_NAMES if form.get(d)]
@@ -1057,20 +1125,13 @@ async def locks_list(request: Request, user: str = Depends(require_login)):
     ha_states = {}
     if ha and ha.connected:
         # get_lock_entities() downloads HA's ENTIRE /api/states payload
-        # (1-5 MB on a mid-sized install) — cache the filtered result
-        # like the Access/Protect lists below instead of paying 200-800ms
-        # per page render (e2e review 2026-07-12).
-        cached_ha_locks = await db.get_ui_cache("locks_ha_lock_entities")
-        if cached_ha_locks is not None:
-            all_ha_locks = cached_ha_locks
-        else:
-            try:
-                all_ha_locks = await ha.get_lock_entities()
-                await db.set_ui_cache(
-                    "locks_ha_lock_entities", all_ha_locks, _LOCKS_CACHE_TTL
-                )
-            except Exception:
-                logger.exception("Failed to fetch HA lock states")
+        # (1-5 MB on a mid-sized install). Serve it stale-while-revalidate so
+        # the render never blocks on it; live lock state still comes from the
+        # in-memory lock_states cache below, this is only the fallback + the
+        # "add lock" picker (e2e review 2026-07-12).
+        all_ha_locks = await _cached_device_options(
+            request, "locks_ha_lock_entities", _LOCKS_CACHE_TTL, ha.get_lock_entities
+        ) or []
         ha_states = {l["entity_id"]: l["state"] for l in all_ha_locks}
 
     for lock in locks:
@@ -1092,31 +1153,27 @@ async def locks_list(request: Request, user: str = Depends(require_login)):
     access = request.app.state.access_client
     access_locations = []
     if access and access.connected:
-        access_locations = await db.get_ui_cache("locks_access_locations") or []
-        if not access_locations:
-            try:
-                bootstrap = await access.get_bootstrap()
-                access_locations = access.parse_door_locations(bootstrap)
-                await db.set_ui_cache("locks_access_locations", access_locations, _LOCKS_CACHE_TTL)
-            except Exception:
-                logger.exception("Failed to fetch Access locations")
+        async def _fetch_access_locations():
+            return access.parse_door_locations(await access.get_bootstrap())
+        access_locations = await _cached_device_options(
+            request, "locks_access_locations", _LOCKS_CACHE_TTL, _fetch_access_locations
+        ) or []
 
     # Fetch Protect cameras/doorbells for device association
     protect = request.app.state.protect_client
     protect_doorbells = []
     protect_cameras = []
     if protect and protect.connected:
-        cached_cameras = await db.get_ui_cache("locks_protect_cameras")
-        if cached_cameras is not None:
+        async def _fetch_protect_cameras():
+            all_cams = await protect.get_cameras()
+            doorbells = [c for c in all_cams if c["is_doorbell"] and c["connected"]]
+            cameras = [c for c in all_cams if not c["is_doorbell"] and c["connected"]]
+            return [doorbells, cameras]
+        cached_cameras = await _cached_device_options(
+            request, "locks_protect_cameras", _LOCKS_CACHE_TTL, _fetch_protect_cameras
+        )
+        if cached_cameras:
             protect_doorbells, protect_cameras = cached_cameras
-        else:
-            try:
-                all_cams = await protect.get_cameras()
-                protect_doorbells = [c for c in all_cams if c["is_doorbell"] and c["connected"]]
-                protect_cameras = [c for c in all_cams if not c["is_doorbell"] and c["connected"]]
-                await db.set_ui_cache("locks_protect_cameras", [protect_doorbells, protect_cameras], _LOCKS_CACHE_TTL)
-            except Exception:
-                logger.exception("Failed to fetch Protect cameras")
 
     return await _render(
         "locks.html",
@@ -1748,15 +1805,11 @@ async def visitors_list(request: Request, user: str = Depends(require_login)):
     access = request.app.state.access_client
     access_locations = []
     if access and access.connected:
-        cached = await db.get_ui_cache("visitors_access_locations")
-        access_locations = cached if cached is not None else []
-        if cached is None:
-            try:
-                bootstrap = await access.get_bootstrap()
-                access_locations = access.parse_door_locations(bootstrap)
-                await db.set_ui_cache("visitors_access_locations", access_locations, _VISITORS_CACHE_TTL)
-            except Exception:
-                logger.exception("Failed to fetch Access locations for visitors")
+        async def _fetch_visitor_locations():
+            return access.parse_door_locations(await access.get_bootstrap())
+        access_locations = await _cached_device_options(
+            request, "visitors_access_locations", _VISITORS_CACHE_TTL, _fetch_visitor_locations
+        ) or []
 
     error = request.query_params.get("error")
     site_tz = _site_timezone(request)
