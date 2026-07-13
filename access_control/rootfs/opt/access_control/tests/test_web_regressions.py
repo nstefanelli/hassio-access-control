@@ -264,6 +264,35 @@ class HomeTemplateSafetyTests(unittest.TestCase):
         self.assertIn("Lockdown Active", lockdown_html)
 
 
+class AssetCacheBustingTests(unittest.TestCase):
+    def test_static_asset_links_carry_content_hash(self) -> None:
+        # Without a version query, browsers may satisfy static/app.css from
+        # cache after an add-on update and render new templates against a
+        # stale (or cached-error) stylesheet.
+        html = web_routes.templates.env.get_template("home.html").render(
+            user="admin",
+            page="home",
+            ingress_active=False,
+            ingress_path="",
+            csrf_token="csrf",
+            lockdown=False,
+            locks=[],
+            alarm_panels=[],
+            log_entries=[],
+            ws_last_event={},
+            unvr_connected=True,
+            protect_connected=True,
+            ha_connected=True,
+            ws_connected=True,
+        )
+        css_v = web_routes.ASSET_VERSIONS["app.css"]
+        js_v = web_routes.ASSET_VERSIONS["app.js"]
+        self.assertRegex(css_v, r"^[0-9a-f]{12}$")
+        self.assertRegex(js_v, r"^[0-9a-f]{12}$")
+        self.assertIn(f'href="static/app.css?v={css_v}"', html)
+        self.assertIn(f'src="static/app.js?v={js_v}"', html)
+
+
 class RenderAndValidationTests(unittest.IsolatedAsyncioTestCase):
     async def test_background_poll_does_not_refresh_session_cookie(self) -> None:
         request = _request(headers={"X-Background-Poll": "true"})

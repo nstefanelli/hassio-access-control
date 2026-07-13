@@ -8,6 +8,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 No unreleased changes.
 
+## [1.5.7] - 2026-07-13
+
+### Fixed
+
+- The stylesheet and script are now linked with content-hash version
+  queries, and failed static responses are no longer cacheable. Previously
+  a browser could keep a stale — or transiently failed — cached `app.css`
+  for up to an hour after an add-on update, rendering the dashboard with
+  no styles. If you hit this, one hard refresh (Cmd/Ctrl+Shift+R) clears
+  the stale entry; it cannot recur after this version.
+
 ## [1.5.6] - 2026-07-13
 
 ### Fixed
