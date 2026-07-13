@@ -303,6 +303,21 @@ class TestIngressMiddleware(unittest.IsolatedAsyncioTestCase):
         resp = await ingress_middleware(req, _passthrough)
         self.assertEqual(resp.headers["Cache-Control"], "public, max-age=3600")
 
+    async def test_failed_static_responses_are_not_cacheable(self):
+        # A transient 404/5xx for app.css (request racing an add-on restart)
+        # must not inherit the 1-hour public cache: a browser that caches the
+        # error renders the dashboard unstyled until the entry expires.
+        for status in (404, 500, 502):
+            async def _failing(request, _status=status):
+                resp = await _passthrough(request)
+                resp.status_code = _status
+                return resp
+
+            req = _fake_request({})
+            req.url.path = "/static/app.css"
+            resp = await ingress_middleware(req, _failing)
+            self.assertEqual(resp.headers["Cache-Control"], "no-store")
+
 
 class TestSecurityHeaders(unittest.TestCase):
     """The frame-blocking headers must flip based on ingress_active.

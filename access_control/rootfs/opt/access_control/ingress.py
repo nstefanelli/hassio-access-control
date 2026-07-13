@@ -149,9 +149,14 @@ def _finalize_response(request: Request, response):
     ).items():
         headers[name] = value
     path = getattr(getattr(request, "url", None), "path", "")
-    if path.startswith("/static/"):
+    status = getattr(response, "status_code", 200)
+    if path.startswith("/static/") and status in (200, 206, 304):
         # Asset paths are stable across releases, so keep this bounded rather
         # than immutable; browsers will pick up an add-on upgrade promptly.
+        # Only successful responses may be cached: a transient 404/5xx for
+        # app.css (e.g. a request racing an add-on restart) previously
+        # inherited the 1-hour policy, leaving the dashboard unstyled until
+        # the cached error expired.
         headers["Cache-Control"] = "public, max-age=3600"
     else:
         headers["Cache-Control"] = "no-store"
