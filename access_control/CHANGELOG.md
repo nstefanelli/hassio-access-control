@@ -8,6 +8,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 No unreleased changes.
 
+## [1.5.10] - 2026-07-13
+
+### Fixed
+
+- Access API token validation no longer fails against a console whose first
+  door has no active lock rule. The Open API answers a rule read on an idle
+  door with an empty rule type (`{"type": "", "ended_time": 0}`); the strict
+  parser rejected that as an unknown rule type, which failed Test & Save for
+  valid tokens and would have failed every hub-sync readback of an idle
+  door. The empty type now parses as the native-behavior `reset` rule on
+  the official API path only; legacy envelope parsing stays strict.
+
 ## [1.5.9] - 2026-07-13
 
 ### Fixed
