@@ -57,4 +57,49 @@
   .status-dot.offline {
     @apply bg-red-500;
   }
+
+  /* ── Semantic helpers (UI polish pass) ───────────────────────────────
+     Canonical typographic/utility bundles used across the migrated
+     templates. Colour/background tokens above are remapped onto the navy
+     palette by base.html's palette bridge; the @apply gray utilities here
+     inline Tailwind's own scale, so the shell stays close but not identical
+     — an accepted transition-shim delta. .card-compact, .empty-state's card
+     visual, and the .status-dot lock-state modifiers live in base.html's
+     inline <style> instead (they depend on the CSS-variable card/dot rules
+     that win on load order). */
+  .page-title {
+    @apply text-xl font-extrabold text-gray-100;
+  }
+  .card-heading {
+    @apply text-sm font-semibold uppercase tracking-wider text-gray-300;
+  }
+  .field-label {
+    @apply mb-1 block text-xs uppercase tracking-wider text-gray-500;
+  }
+  .chip {
+    @apply rounded bg-gray-800 px-1.5 py-0.5 text-xs text-gray-400;
+  }
+  .chip-feature {
+    @apply rounded-full px-2 py-0.5 text-xs;
+  }
+  .btn-sm {
+    @apply px-2.5 py-1.5 text-xs;
+  }
+  .btn-icon {
+    @apply px-2.5 py-1.5;
+  }
+  @media (max-width: 639px) {
+    .btn-icon {
+      @apply p-2;
+    }
+  }
+  .empty-state {
+    @apply py-8 text-center text-sm text-gray-500;
+  }
+  .empty-state-inline {
+    @apply px-4 py-12 text-center text-sm text-gray-500;
+  }
+  .empty-note {
+    @apply text-sm text-gray-500;
+  }
 }

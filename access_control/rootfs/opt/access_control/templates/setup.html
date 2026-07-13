@@ -22,7 +22,7 @@
             d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
         </svg>
       </div>
-      <h1 class="heading" style="font-size:1.5rem; font-weight:800; color:var(--text-primary); margin:0;">Initial Setup</h1>
+      <h1 style="font-size:1.5rem; font-weight:800; color:var(--text-primary); margin:0;">Initial Setup</h1>
       <p style="font-size:0.8125rem; color:var(--text-muted); margin-top:0.5rem;">Configure your Access Control instance</p>
     </div>
 
@@ -51,11 +51,11 @@
         <div class="section-heading" style="margin-bottom:1rem;">Admin Account</div>
         <div class="space-y-4">
           <div>
-            <label for="admin_username" class="block text-sm font-medium text-gray-300 mb-1">Username</label>
+            <label for="admin_username" class="field-label">Username</label>
             <input id="admin_username" name="admin_username" type="text" required class="input" placeholder="admin" autocomplete="username" />
           </div>
           <div>
-            <label for="admin_password" class="block text-sm font-medium text-gray-300 mb-1">Password</label>
+            <label for="admin_password" class="field-label">Password</label>
             <input id="admin_password" name="admin_password" type="password" required class="input" placeholder="Choose a strong password" autocomplete="new-password" />
           </div>
         </div>
@@ -67,15 +67,15 @@
         <div class="section-heading" style="margin-bottom:1rem;">Primary UNVR / Protect Console</div>
         <div class="space-y-4">
           <div>
-            <label for="unvr_host" class="block text-sm font-medium text-gray-300 mb-1">Host / IP</label>
+            <label for="unvr_host" class="field-label">Host / IP</label>
             <input id="unvr_host" name="unvr_host" type="text" required class="input" placeholder="192.168.1.10" />
           </div>
           <div>
-            <label for="unvr_username" class="block text-sm font-medium text-gray-300 mb-1">Username</label>
+            <label for="unvr_username" class="field-label">Username</label>
             <input id="unvr_username" name="unvr_username" type="text" required class="input" placeholder="admin" />
           </div>
           <div>
-            <label for="unvr_password" class="block text-sm font-medium text-gray-300 mb-1">Password</label>
+            <label for="unvr_password" class="field-label">Password</label>
             <input id="unvr_password" name="unvr_password" type="password" required class="input" placeholder="••••••••" />
           </div>
         </div>
@@ -89,15 +89,15 @@
         </p>
         <div class="space-y-4">
           <div>
-            <label for="access_host" class="block text-sm font-medium text-gray-300 mb-1">Host / IP</label>
+            <label for="access_host" class="field-label">Host / IP</label>
             <input id="access_host" name="access_host" type="text" class="input" placeholder="192.168.1.11" />
           </div>
           <div>
-            <label for="access_username" class="block text-sm font-medium text-gray-300 mb-1">Username</label>
+            <label for="access_username" class="field-label">Username</label>
             <input id="access_username" name="access_username" type="text" class="input" autocomplete="username" />
           </div>
           <div>
-            <label for="access_password" class="block text-sm font-medium text-gray-300 mb-1">Password</label>
+            <label for="access_password" class="field-label">Password</label>
             <input id="access_password" name="access_password" type="password" class="input" autocomplete="current-password" />
           </div>
         </div>
@@ -113,7 +113,7 @@
           Existing installations can add it later from Settings.
         </p>
         <div>
-          <label for="access_api_token" class="block text-sm font-medium text-gray-300 mb-1">API Token</label>
+          <label for="access_api_token" class="field-label">API Token</label>
           <input id="access_api_token" name="access_api_token" type="password" class="input"
                  autocomplete="new-password" placeholder="Optional during initial setup" />
         </div>
@@ -134,11 +134,11 @@
         <div class="section-heading" style="margin-bottom:1rem;">Home Assistant</div>
         <div class="space-y-4">
           <div>
-            <label for="ha_url" class="block text-sm font-medium text-gray-300 mb-1">URL</label>
+            <label for="ha_url" class="field-label">URL</label>
             <input id="ha_url" name="ha_url" type="url" required class="input" placeholder="http://homeassistant.local:8123" />
           </div>
           <div>
-            <label for="ha_token" class="block text-sm font-medium text-gray-300 mb-1">Long-Lived Access Token</label>
+            <label for="ha_token" class="field-label">Long-Lived Access Token</label>
             <input id="ha_token" name="ha_token" type="password" required class="input" placeholder="eyJ..." />
           </div>
         </div>

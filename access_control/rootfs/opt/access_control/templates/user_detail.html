@@ -21,7 +21,7 @@
 
   <!-- PIN Code -->
   <div class="card space-y-2">
-    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">PIN Code</h2>
+    <h2 class="card-heading">PIN Code</h2>
     {% if has_stored_pin %}
     <p class="text-sm text-gray-400">
       A PIN is stored locally for this user.
@@ -38,7 +38,7 @@
   <!-- Add Lock Access -->
   {% if available_locks %}
   <div class="card">
-    <h2 class="text-sm font-semibold text-gray-300 mb-3">Add Lock Access</h2>
+    <h2 class="card-heading">Add Lock Access</h2>
     <form method="post" action="users/{{ target_user.id }}/rules" class="flex gap-3 flex-wrap">
       <select name="lock_id" required class="input flex-1 min-w-40">
         <option value="" disabled selected>Select a lock…</option>
@@ -58,7 +58,7 @@
 
   <!-- Rules list -->
   <div>
-    <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">Access Rules</h2>
+    <h2 class="card-heading">Access Rules</h2>
 
     {% if rules %}
     <div class="space-y-3">
@@ -83,7 +83,7 @@
               <button
                 type="submit"
                 title="{% if rule.enabled %}Disable{% else %}Enable{% endif %}"
-                class="btn-secondary text-xs px-2 py-1 {% if rule.enabled %}text-green-400{% else %}text-gray-500{% endif %}"
+                class="btn-secondary btn-sm {% if rule.enabled %}text-green-400{% else %}text-gray-500{% endif %}"
               >
                 {% if rule.enabled %}
                   <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -102,7 +102,7 @@
             <!-- Delete -->
             <form method="post" action="rules/{{ rule.id }}/delete"
               data-lock-name="{{ rule.lock_name|e }}" onsubmit="return confirm('Delete access to ' + this.dataset.lockName + '?')">
-              <button type="submit" class="btn-danger text-xs px-2 py-1">
+              <button type="submit" class="btn-danger btn-sm">
                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                     d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
@@ -113,7 +113,7 @@
             <!-- Expand schedule toggle -->
             <button
               type="button"
-              class="btn-secondary text-xs px-2 py-1"
+              class="btn-secondary btn-sm"
               onclick="this.closest('.card').querySelector('.schedule-editor').classList.toggle('hidden')"
               title="Edit schedule"
             >
@@ -193,7 +193,7 @@
     </div>
 
     {% else %}
-    <div class="card text-center text-gray-500 text-sm py-8">
+    <div class="card empty-state">
       No access rules yet. Add a lock above.
     </div>
     {% endif %}

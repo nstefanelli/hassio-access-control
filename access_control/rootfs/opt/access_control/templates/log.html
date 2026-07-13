@@ -5,7 +5,7 @@
 {% block content %}
 <div class="p-4 sm:p-6 space-y-6">
 
-  <h1 class="text-xl font-bold text-gray-100">Activity Log</h1>
+  <h1 class="page-title">Activity Log</h1>
 
   <div class="card p-0 overflow-hidden">
     {% if log_entries %}
@@ -48,7 +48,7 @@
       </table>
     </div>
     {% else %}
-    <div class="px-4 py-12 text-center text-gray-500 text-sm">No log entries yet.</div>
+    <div class="empty-state-inline">No log entries yet.</div>
     {% endif %}
   </div>
 

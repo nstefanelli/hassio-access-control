@@ -71,12 +71,17 @@ _ADMIN_TRUE_VALUES = frozenset({"1", "true", "yes"})
 # check — `$` matches before `\n` at end-of-string by default.
 INGRESS_PATH_RE = re.compile(r"\A/api/hassio_ingress/[A-Za-z0-9_-]+\Z")
 
+# Dark, self-contained 403 page. Colours are the literal base.html CSS-variable
+# values (--bg-deep, --text-primary, --text-muted) so the rejection matches the
+# app's all-dark theme even though it renders without the stylesheet.
 _FORBIDDEN_BODY = (
     "<!doctype html><meta charset=utf-8>"
     "<title>Access Control — admin required</title>"
-    "<style>body{font-family:system-ui;max-width:32rem;margin:4rem auto;"
-    "padding:1rem;color:#1f2937}h1{font-size:1.5rem;margin:0 0 1rem}"
-    "p{margin:0 0 .75rem}</style>"
+    "<style>html{background:#050810}"
+    "body{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;"
+    "padding:1rem;background:#050810;color:#e4e9f4}"
+    "h1{font-size:1.5rem;margin:0 0 1rem}"
+    "p{margin:0 0 .75rem;color:#5e6f92}</style>"
     "<h1>Admin access required</h1>"
     "<p>This add-on is restricted to Home Assistant administrators. "
     "Ask your HA owner to grant your account admin permissions if you "

@@ -5,7 +5,7 @@
 {% block content %}
 <div class="p-4 sm:p-6 space-y-6">
 
-  <h1 class="text-xl font-bold text-gray-100">Visitors</h1>
+  <h1 class="page-title">Visitors</h1>
 
   {% if error %}
   <div style="padding:0.75rem 1rem; border-radius:0.5rem; background:var(--danger-bg); border:1px solid rgba(239,100,97,0.25); color:var(--danger); font-size:0.8125rem; font-weight:500;">
@@ -15,7 +15,7 @@
 
   <!-- Add Visitor Form -->
   <div class="card space-y-3">
-    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Add Visitor</h2>
+    <h2 class="card-heading">Add Visitor</h2>
     <form method="post" action="visitors/add" class="space-y-3">
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <input name="first_name" type="text" required class="input" placeholder="First name" />
@@ -70,7 +70,7 @@
   {% set active_visitors = visitors | selectattr('status', 'equalto', 1) | list %}
   {% if active_visitors %}
   <div class="card space-y-3">
-    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Active Visitors</h2>
+    <h2 class="card-heading">Active Visitors</h2>
     <div class="divide-y divide-gray-800 -mx-4 px-4">
       {% for v in active_visitors %}
       <div class="py-3 space-y-2">
@@ -86,16 +86,17 @@
             <div class="text-xs text-gray-600 mt-0.5">{{ v.notes }}</div>
             {% endif %}
           </div>
-          <div class="flex gap-2 shrink-0">
+          <div class="flex flex-col sm:flex-row sm:items-center gap-2">
             <form method="post" action="visitors/{{ v.id }}/extend" class="flex gap-1 items-center">
               <input name="end_date" type="date" required class="input text-xs py-1 w-32" />
               <input name="end_time" type="time" value="17:00" class="input text-xs py-1 w-20" />
-              <button type="submit" class="btn-secondary text-xs">Extend</button>
+              <button type="submit" class="btn-secondary btn-sm">Extend</button>
             </form>
             <form method="post" action="visitors/{{ v.id }}/delete"
               data-name="{{ v.name|e }}"
-              onsubmit="return confirm('Delete visitor ' + this.dataset.name + '?')">
-              <button type="submit" class="btn-danger text-xs">Delete</button>
+              onsubmit="return confirm('Delete visitor ' + this.dataset.name + '?')"
+              class="sm:ml-auto">
+              <button type="submit" class="btn-danger btn-sm">Delete</button>
             </form>
           </div>
         </div>
@@ -109,7 +110,7 @@
   {% set expired_visitors = visitors | rejectattr('status', 'equalto', 1) | list %}
   {% if expired_visitors %}
   <div class="card space-y-3">
-    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Expired / Deleted</h2>
+    <h2 class="card-heading">Expired / Deleted</h2>
     <div class="divide-y divide-gray-800 -mx-4 px-4">
       {% for v in expired_visitors %}
       <div class="py-3 flex items-center justify-between gap-4 opacity-50">
@@ -123,7 +124,7 @@
         <form method="post" action="visitors/{{ v.id }}/delete"
           data-name="{{ v.name|e }}"
           onsubmit="return confirm('Remove expired visitor ' + this.dataset.name + '?')">
-          <button type="submit" class="btn-danger text-xs">Remove</button>
+          <button type="submit" class="btn-danger btn-sm">Remove</button>
         </form>
       </div>
       {% endfor %}
@@ -132,7 +133,7 @@
   {% endif %}
 
   {% if not visitors %}
-  <p class="text-sm text-gray-500">No visitors. Create one above to grant temporary access.</p>
+  <div class="card empty-state">No visitors. Create one above to grant temporary access.</div>
   {% endif %}
 
 </div>

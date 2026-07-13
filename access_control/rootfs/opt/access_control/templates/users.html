@@ -7,12 +7,12 @@
 
   <!-- Header -->
   <div class="flex items-center justify-between gap-3 flex-wrap">
-    <h1 class="text-xl font-bold text-gray-100">Users</h1>
+    <h1 class="page-title">Users</h1>
     <div class="flex items-center gap-2">
       {% if show_hidden %}
-      <a href="users" class="btn-secondary text-xs">Hide Hidden</a>
+      <a href="users" class="btn-secondary btn-sm">Hide Hidden</a>
       {% else %}
-      <a href="users?show_hidden=1" class="btn-secondary text-xs">Show Hidden</a>
+      <a href="users?show_hidden=1" class="btn-secondary btn-sm">Show Hidden</a>
       {% endif %}
       <form method="post" action="sync-users">
         <button type="submit" class="btn-secondary">
@@ -55,7 +55,7 @@
               {% if u.groups %}
               <div class="flex flex-wrap gap-1">
                 {% for g in u.groups %}
-                <span class="text-xs bg-gray-800 text-gray-400 px-1.5 py-0.5 rounded">{{ g }}</span>
+                <span class="chip">{{ g }}</span>
                 {% endfor %}
               </div>
               {% else %}
@@ -113,7 +113,7 @@
       </table>
     </div>
     {% else %}
-    <div class="px-4 py-12 text-center text-gray-500 text-sm">
+    <div class="empty-state-inline">
       No users yet.
       <form method="post" action="sync-users" class="mt-4 inline-block">
         <button type="submit" class="btn-primary text-xs">Sync from UNVR</button>
