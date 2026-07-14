@@ -31,7 +31,7 @@ Useful Home Assistant events are:
 |---|---|
 | `access_control_granted` | An authorization event unlocked at least one configured lock. |
 | `access_control_doorbell_ring` | A mapped Protect doorbell/ring event was received. |
-| `access_control_relock_failed` | A durable HA re-lock exhausted its immediate retries. |
+| `access_control_relock_failed` | A durable HA re-lock exhausted its immediate retries. While the re-lock stays overdue it re-fires on a bounded per-lock cadence (roughly every 10 minutes), so a stranded door does not go quiet after one missed event. |
 | `access_control_hub_sync_failed` | An optional hub-sync apply/release failed or was suspended for flapping. |
 
 Build alerts around the two failure events and around prolonged degraded health.
@@ -345,11 +345,15 @@ start and the current time.
 
 ### A pending re-lock is stuck
 
-Compare `pending_relocks_live` and `pending_relocks_db` in `/api/debug` and
-inspect HA connectivity. A durable row with no live task is retried on HA
-recovery and by the overdue sweep. The `access_control_relock_failed` event is
-the alert signal. Do not delete the row to silence the symptom while a door may
-still be unlocked.
+Start with the surfaces built for this: `GET /api/health` reports
+`pending_relocks` counts (`total` and `overdue`), the Locks page badges
+affected cards with "re-lock pending" or "re-lock overdue", and the
+`access_control_relock_failed` event re-fires on a bounded per-lock cadence
+(roughly every 10 minutes) while the re-lock stays overdue. For deeper
+diagnosis, compare `pending_relocks_live` and `pending_relocks_db` in
+`/api/debug` and inspect HA connectivity. A durable row with no live task is
+retried on HA recovery and by the overdue sweep. Do not delete the row to
+silence the symptom while a door may still be unlocked.
 
 Timed unlock paths persist and arm their new deadline before issuing the HA
 unlock. If that call fails or times out, the earliest applicable intent stays
