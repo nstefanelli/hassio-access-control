@@ -49,7 +49,12 @@ only success cases. In particular, preserve coverage for:
 - atomic topology sync, empty-upstream guards, and native-lock
   retirement/revival;
 - hub pairing changes, shared-hub conflicts, HA unknown/read errors, and
-  lockdown enforcement-pending behavior.
+  lockdown enforcement-pending behavior;
+- ingress-mode static asset serving, including a root_path/mount path-
+  arithmetic mismatch;
+- the official Open API's empty rule type on an idle door;
+- locked-direction hard-rejection retry spacing, with lockdown exempt from the
+  backoff.
 
 ## Frontend assets
 

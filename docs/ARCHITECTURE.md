@@ -119,7 +119,11 @@ its Access-native rule. Consequently **Follow Schedule** may immediately
 produce an unlocked relay when the native schedule is active. `reset` is not a
 lock command. Compatibility mode recognizes known private response envelopes,
 but firmware that cannot expose physical state after `reset` produces an
-unconfirmed operation instead of a guessed success.
+unconfirmed operation instead of a guessed success. On the official Open API
+only, a door with no active override reports an empty rule type, which the
+client normalizes to `reset` (native behavior); this normalization does not
+change how state is confirmed — always through relay readback, never inferred
+from the rule — and legacy envelope parsing stays strict.
 
 Timed re-locks apply to HA-external locks. For a timed buzz or device-auth
 unlock, the replacement deadline is stored and armed before the physical HA
@@ -153,7 +157,13 @@ multi-hub disagreement, HA loss, or expired momentary-unlock lease also resolves
 in the safe locked direction. Fail-safe operations use `keep_lock`; they do not
 use `reset`, which could reactivate a schedule. Lockdown takes the same path and
 a lockdown-state read exception behaves as enabled. Backoff and flap damping
-bound command volume.
+bound command volume on both the legacy poll path and the bidirectional
+reconcile path; only the hold-open (unlock) direction is ever damped, so a
+failed lock retries on every poll. The one exception is a permanent hard
+rejection — a removed legacy endpoint or an explicit legacy-rule rejection —
+which, after 3 consecutive identical failures, is spaced onto the existing
+~30 second failure backoff; it is never suppressed indefinitely, only spaced.
+Lockdown enforcement always bypasses this damping and drives at full cadence.
 
 When the incident clears, reconciliation first confirms both HA and Access are
 locked, then replaces app-owned `keep_lock` with confirmed `lock_now`. This

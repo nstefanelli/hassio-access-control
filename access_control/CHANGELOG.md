@@ -6,7 +6,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-No unreleased changes.
+### Documentation
+
+- Synchronized the reference docs ([Architecture](../docs/ARCHITECTURE.md),
+  [Operations](../docs/OPERATIONS.md), [Security model](../docs/SECURITY-MODEL.md),
+  [Development](../docs/DEVELOPMENT.md)) with the behavior changes shipped in
+  1.5.6 through 1.5.10: hub-sync damping scope, the removed legacy Access
+  lock-rule API and its retry/backoff behavior, static-asset cache-busting and
+  Ingress path resolution, the official Open API's empty rule type for idle
+  doors, and CSRF-protected sign-out.
 
 ## [1.5.10] - 2026-07-13
 
