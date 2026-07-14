@@ -321,6 +321,19 @@ async def execute_lock_action(
                         lock_name=lock.get("name", entity_id),
                         source="buzz",
                     )
+                    # A buzz on a bidirectionally synced lock is a momentary,
+                    # app-owned timed unlock: lease it so the hub poller does
+                    # not echo HA's temporary unlocked state back as a
+                    # persistent Access keep_unlock override (which would also
+                    # burn flap budget). Same duration semantics as the remote
+                    # path; set before the physical unlock. The lease also marks
+                    # the unlock app-initiated so relock_on_ha_origin ignores it.
+                    if lock.get("sync_hub_state"):
+                        hub_sync = getattr(state, "hub_sync_manager", None)
+                        if hub_sync is not None:
+                            hub_sync.mark_access_momentary(
+                                entity_id, float(duration)
+                            )
                     accepted = await ha.unlock(entity_id)
                     await release_barrier()
                     confirmed = bool(
@@ -356,6 +369,14 @@ async def execute_lock_action(
                 if relock_manager is not None:
                     paused_relock = await relock_manager.pause(entity_id)
                     paused_needs_resolution = True
+                # A manual dashboard Unlock is a deliberate hold-open (it cancels
+                # pending re-locks below). Mark it app-initiated with a short TTL
+                # so relock_on_ha_origin does not observe this HA edge as an
+                # external thumb-turn and time-bound the operator's hold-open.
+                if action == "unlock" and lock.get("sync_hub_state"):
+                    hub_sync = getattr(state, "hub_sync_manager", None)
+                    if hub_sync is not None:
+                        hub_sync.mark_app_initiated_unlock(entity_id)
                 accepted = (
                     await ha.unlock(entity_id)
                     if action == "unlock"

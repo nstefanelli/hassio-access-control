@@ -9,7 +9,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, time, timezone, tzinfo
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
 
 from .access_client import AccessClient
@@ -78,6 +78,7 @@ class AuthEngine:
         camera_map_getter: Callable[[], dict[str, str]] | None = None,
         command_lock: asyncio.Lock | None = None,
         on_lockdown_enabled: Callable[[], Awaitable[None]] | None = None,
+        hub_sync_getter: Callable[[], Any] | None = None,
     ) -> None:
         self._db = db
         self._access_client = access_client
@@ -87,6 +88,10 @@ class AuthEngine:
         self._enc_key = enc_key
         self._relock_manager = relock_manager
         self._get_camera_map = camera_map_getter
+        # Lazily fetched HubSyncManager (constructed after the engine) — used to
+        # lease a momentary Access unlock so a device-auth timed unlock on a
+        # synced lock is not echoed back as a persistent keep_unlock override.
+        self._get_hub_sync = hub_sync_getter
         self._command_lock = command_lock or asyncio.Lock()
         self._lockdown_transition_lock = asyncio.Lock()
         self._on_lockdown_enabled = on_lockdown_enabled
@@ -589,8 +594,29 @@ class AuthEngine:
                     lock_name=lock.get("name", entity_id),
                     source="device_auth",
                 )
+                # For a bidirectionally synced lock, this timed credential
+                # unlock is momentary and app-owned: lease it so the hub poller
+                # does not turn HA's temporary unlocked state into a persistent
+                # Access keep_unlock override. Same duration semantics as the
+                # remote path; set before the physical unlock below. The lease
+                # also marks the unlock app-initiated for relock_on_ha_origin.
+                if lock.get("sync_hub_state") and self._get_hub_sync is not None:
+                    hub_sync = self._get_hub_sync()
+                    if hub_sync is not None:
+                        hub_sync.mark_access_momentary(
+                            entity_id, float(lock.get("relock_duration", 30))
+                        )
             elif self._relock_manager is not None:
                 paused_relock = await self._relock_manager.pause(entity_id)
+                # relock_on_device_auth is OFF: an authorized tap is a chosen
+                # hold-open (this branch cancels any pending timer on success).
+                # Mark it app-initiated so relock_on_ha_origin cannot silently
+                # re-time it — that toggle covers external unlocks only, and
+                # this exclusion mirrors the manual dashboard Unlock.
+                if lock.get("sync_hub_state") and self._get_hub_sync is not None:
+                    hub_sync = self._get_hub_sync()
+                    if hub_sync is not None:
+                        hub_sync.mark_app_initiated_unlock(entity_id)
             try:
                 success = await self._ha_client.unlock(entity_id)
                 if not success:

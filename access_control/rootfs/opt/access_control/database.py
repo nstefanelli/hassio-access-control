@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS locks (
     remote_buzz_enabled INTEGER NOT NULL DEFAULT 0,
     access_location_id  TEXT,
     sync_hub_state      INTEGER NOT NULL DEFAULT 0,
+    relock_on_ha_origin INTEGER NOT NULL DEFAULT 0,
     upstream_present    INTEGER NOT NULL DEFAULT 1
 );
 
@@ -554,6 +555,19 @@ class Database:
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_visitors_created_at ON visitors(created_at)"
             )
+
+            # Migration 25: opt-in "re-lock after external unlocks". When a
+            # bidirectionally synced HA lock is unlocked from HA's side (a
+            # thumb-turn or HA automation), schedule a durable time-bounded
+            # re-lock. Default 0 (off) so existing installs keep current
+            # behaviour. Mirrors the migration-18 sync_hub_state add.
+            async with self._db.execute("PRAGMA table_info(locks)") as cur:
+                cols = {row[1] for row in await cur.fetchall()}
+            if "relock_on_ha_origin" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE locks ADD COLUMN relock_on_ha_origin "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
 
             await self._db.commit()
         except Exception:
@@ -1138,15 +1152,17 @@ class Database:
         self, lock_id: int, buzz_enabled: bool, relock_duration: int,
         access_location_id: Any = _KEEP, relock_on_remote: bool = False,
         relock_on_device_auth: bool = False, sync_hub_state: bool = False,
+        relock_on_ha_origin: bool = False,
     ) -> None:
         sets = (
             "buzz_enabled = ?, relock_duration = ?, relock_on_remote = ?, "
-            "relock_on_device_auth = ?, sync_hub_state = ?"
+            "relock_on_device_auth = ?, sync_hub_state = ?, "
+            "relock_on_ha_origin = ?"
         )
         params: list[Any] = [
             1 if buzz_enabled else 0, relock_duration,
             1 if relock_on_remote else 0, 1 if relock_on_device_auth else 0,
-            1 if sync_hub_state else 0,
+            1 if sync_hub_state else 0, 1 if relock_on_ha_origin else 0,
         ]
         # Resolve the sentinel via type(self), NOT the module-global
         # `Database`: importlib.reload (used by the integration tests)

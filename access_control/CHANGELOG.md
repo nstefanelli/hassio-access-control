@@ -16,6 +16,42 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Ingress path resolution, the official Open API's empty rule type for idle
   doors, and CSRF-protected sign-out.
 
+## [1.5.11] - 2026-07-13
+
+### Fixed
+
+- A timed buzz or device-auth unlock on a bidirectionally synced HA lock no
+  longer mints a persistent Access `keep_unlock` override. Both paths now lease
+  the same momentary hold the remote-unlock path already used, so the hub
+  poller treats the temporary HA-unlocked window as app-owned instead of
+  echoing it back as a persistent rule — which also stops a routine buzz on a
+  busy door from burning flap budget and tripping flap suspension. Unsynced
+  locks and the remote path are unchanged.
+- Live re-lock timers are now bounded by a monotonic clock captured when they
+  are armed, in addition to the durable wall-clock deadline. A backward NTP or
+  DST step can now only shorten an open-door window (re-locking sooner, the
+  fail-safe direction) and can never silently extend it. The persisted
+  wall-clock deadline remains authoritative for cross-restart recovery, and
+  rehydrated, swept, and resumed rows keep pure wall-clock behaviour.
+- A re-lock that stays overdue is no longer silent after the first failure. The
+  failure event now re-fires on a bounded (~10 minute) per-entity cadence while
+  the sweep keeps retrying, `/api/health` reports `pending_relocks` counts
+  (total and overdue, no entity IDs so the low-privilege read stays
+  scope-safe), and the Locks page shows a "re-lock pending" / "re-lock overdue"
+  badge on affected lock cards.
+
+### Added
+
+- New per-lock setting "Auto re-lock after external (thumb-turn / HA) unlocks"
+  (`relock_on_ha_origin`, default off). When enabled on a bidirectionally
+  synced lock, an unlock that originates on Home Assistant's side (a thumb-turn
+  or HA automation) schedules a durable, time-bounded re-lock. App-initiated
+  unlocks are excluded: a manual dashboard Unlock stays held open, an
+  authorized credential tap on a lock with auto re-lock disabled keeps its
+  chosen hold-open semantics, and a buzz, device-auth, or remote unlock that
+  already owns its timer is never double-scheduled. With the setting off,
+  behaviour is unchanged.
+
 ## [1.5.10] - 2026-07-13
 
 ### Fixed

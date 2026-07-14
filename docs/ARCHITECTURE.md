@@ -125,13 +125,23 @@ client normalizes to `reset` (native behavior); this normalization does not
 change how state is confirmed — always through relay readback, never inferred
 from the rule — and legacy envelope parsing stays strict.
 
-Timed re-locks apply to HA-external locks. For a timed buzz or device-auth
-unlock, the replacement deadline is stored and armed before the physical HA
-unlock. The returned generation token snapshots the exact predecessor. Since
-a timeout can occur after HA executes the request, ambiguous failure retains
-the earliest applicable deadline and never removes a sole new intent. A late
-recovery cannot overwrite a newer schedule. Restart rehydration, HA
-recovery, and an overdue sweep keep retrying durable rows. Manual overrides
+Timed re-locks apply to HA-external locks. Four sources arm one: a timed buzz,
+a device-auth credential unlock, a remote unlock, and — when the per-lock
+`relock_on_ha_origin` option is enabled — an observed HA-origin unlock on a
+bidirectionally synced lock. For a timed buzz or device-auth unlock, the
+replacement deadline is stored and armed before the physical HA unlock. The
+returned generation token snapshots the exact predecessor. Since a timeout can
+occur after HA executes the request, ambiguous failure retains the earliest
+applicable deadline and never removes a sole new intent. A late recovery cannot
+overwrite a newer schedule. On a synced lock, a buzz, device-auth, or remote
+timed unlock also leases a momentary Access hold so the hub poller does not echo
+HA's temporary unlocked state back as a persistent `keep_unlock` rule. The
+durable deadline is authoritative wall-clock time for cross-restart recovery; a
+live timer additionally carries a monotonic bound captured when it is armed and
+fires at whichever bound is nearer, so a backward clock step can only re-lock
+sooner and never extend an open-door window. Restart rehydration, HA recovery,
+and an overdue sweep keep retrying durable rows, and an overdue row re-fires its
+failure event on a bounded cadence until it clears. Manual overrides
 that create no new timer pause and restore the prior safety row on failure.
 An HA `lock` call returning success is provisional: manual and scheduled
 re-lock paths perform bounded state reads and remove the safety row only after

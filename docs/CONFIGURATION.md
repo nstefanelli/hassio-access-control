@@ -245,6 +245,7 @@ Per-lock controls include:
 | Relock after remote unlock | Arms a timer after the matching UniFi remote-unlock event. |
 | Relock after device authentication | Arms a timer after an authorized face, PIN, NFC, or fingerprint event. |
 | Sync hub state | Opt-in bidirectional reconciliation between an HA lock and its paired Access door. |
+| Auto re-lock after external unlocks | Only shown when hub sync is on. Arms a timer when a synced lock is unlocked from Home Assistant's side (thumb-turn or HA automation). App-initiated unlocks — a manual dashboard Unlock, or a buzz/device-auth/remote unlock that already owns a timer — are excluded. Off by default. |
 | Hidden | Removes the card from normal lists without deleting mappings. |
 
 Pending HA re-locks survive restarts. Manual unlock/lock commands replace or
