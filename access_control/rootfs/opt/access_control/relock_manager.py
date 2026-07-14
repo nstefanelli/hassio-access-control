@@ -36,6 +36,11 @@ _LOCK_RETRY_DELAY = 1.5
 _CONFIRM_ATTEMPTS = 3
 _CONFIRM_DELAY = 0.25
 
+# While a relock stays overdue (retries exhausted, sweep still failing), the
+# failure event is re-fired at most this often per entity so a stuck door stays
+# visible to alerting automations instead of going silent after the first fire.
+_RELOCK_RENOTIFY_INTERVAL = 600.0
+
 
 @dataclass(frozen=True)
 class RelockIntent:
@@ -91,6 +96,10 @@ class RelockManager:
         # until the caller resolves the pause via schedule/cancel/resume.
         self._paused: set[str] = set()
         self._shutting_down = False
+        # entity_id → monotonic time of the last relock-failure event fired
+        # while overdue. Spaces the re-notification cadence and is cleared the
+        # moment the entity relocks or its timer is cancelled/rescheduled.
+        self._overdue_notified_at: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -130,6 +139,12 @@ class RelockManager:
                 if self._shutting_down:
                     raise RuntimeError("RelockManager is shutting down")
                 deadline = time.time() + duration
+                # Live timers also carry a monotonic bound captured now. The
+                # persisted wall-clock deadline is authoritative across restarts,
+                # but a backward NTP/DST step must never *extend* a live
+                # open-door window — the timer fires at whichever bound arrives
+                # first, so a clock jump can only shorten it (fail-safe).
+                monotonic_deadline = time.monotonic() + duration
                 previous_row = await self._db.get_pending_relock(entity_id)
                 # Persist first. If SQLite fails, the existing safety timer
                 # remains live instead of being cancelled with no replacement.
@@ -142,6 +157,9 @@ class RelockManager:
                 )
                 self._cancel_locked(entity_id)
                 self._paused.discard(entity_id)
+                # A fresh unlock replaces any prior overdue timer for this
+                # entity; reset its re-notification cadence.
+                self._clear_overdue_notified(entity_id)
                 _LOGGER.info(
                     "Re-lock scheduled (%s): %s in %.0fs",
                     source,
@@ -149,7 +167,12 @@ class RelockManager:
                     duration,
                 )
                 task = asyncio.create_task(
-                    self._wait_and_lock(entity_id, lock_name, deadline),
+                    self._wait_and_lock(
+                        entity_id,
+                        lock_name,
+                        deadline,
+                        monotonic_deadline=monotonic_deadline,
+                    ),
                     name=f"relock-{source}-{entity_id}",
                 )
                 self._tasks[entity_id] = task
@@ -282,6 +305,7 @@ class RelockManager:
                 ):
                     return False
                 new_deadline = time.time() + duration
+                new_monotonic_deadline = time.monotonic() + duration
                 changed = await self._db.replace_pending_relock_deadline(
                     entity_id, intent.deadline, new_deadline
                 )
@@ -293,6 +317,7 @@ class RelockManager:
                         entity_id,
                         current.get("lock_name") or entity_id,
                         new_deadline,
+                        monotonic_deadline=new_monotonic_deadline,
                     ),
                     name=f"relock-extended-{entity_id}",
                 )
@@ -310,6 +335,23 @@ class RelockManager:
                 await self._db.remove_pending_relock(entity_id)
                 self._cancel_locked(entity_id)
                 self._paused.discard(entity_id)
+                self._clear_overdue_notified(entity_id)
+
+    async def pending_relock_status(self) -> dict[str, bool]:
+        """Map each pending relock's ``entity_id`` to whether it is overdue.
+
+        Read-only observability for ``/api/health`` and the locks page. Overdue
+        means the durable wall-clock deadline has passed (the door should have
+        re-locked already). Deliberately returns no other row detail so the
+        lowest-privilege health read stays scope-safe.
+        """
+        rows = await self._db.get_pending_relocks()
+        now = time.time()
+        return {
+            row["entity_id"]: float(row["deadline"]) <= now
+            for row in rows
+            if row.get("entity_id")
+        }
 
     async def pause(self, entity_id: str) -> dict | None:
         """Pause a pending relock without deleting its durable row.
@@ -510,7 +552,10 @@ class RelockManager:
             entity_id, lock_name, deadline=deadline
         )
         if not ok:
-            # Retain the durable row for the next recovery sweep.
+            # Retain the durable row for the next recovery sweep, and keep the
+            # stuck door visible: re-fire the failure event on a bounded cadence
+            # instead of letting the silent sweep hide an overdue relock.
+            await self._notify_relock_failed(entity_id, lock_name)
             return False
 
         async with operation_lock:
@@ -526,21 +571,43 @@ class RelockManager:
                 removed = await self._db.remove_pending_relock_at_deadline(
                     entity_id, deadline
                 )
-                if removed and self._on_locked is not None:
-                    try:
-                        self._on_locked(entity_id)
-                    except Exception:
-                        _LOGGER.exception(
-                            "on_locked callback raised for %s", entity_id
-                        )
+                if removed:
+                    self._clear_overdue_notified(entity_id)
+                    if self._on_locked is not None:
+                        try:
+                            self._on_locked(entity_id)
+                        except Exception:
+                            _LOGGER.exception(
+                                "on_locked callback raised for %s", entity_id
+                            )
                 return bool(removed)
 
-    async def _notify_relock_failed(self, entity_id: str, lock_name: str) -> None:
+    def _clear_overdue_notified(self, entity_id: str) -> None:
+        """Reset re-notification cadence once an entity is no longer overdue."""
+        self._overdue_notified_at.pop(entity_id, None)
+
+    async def _notify_relock_failed(
+        self, entity_id: str, lock_name: str, *, force: bool = False
+    ) -> None:
         """
         Fire an ``access_control_relock_failed`` HA event so automations can
         alert on a door that failed to re-lock. Best-effort — a failure to
         fire the event must not raise into the relock task.
+
+        ``force`` fires unconditionally (used at first retry-exhaustion). Later
+        callers (the sweep retrying a still-overdue row) are rate-limited to one
+        re-fire per :data:`_RELOCK_RENOTIFY_INTERVAL` per entity so a genuinely
+        stuck door keeps surfacing without spamming an event every 30s.
         """
+        now = time.monotonic()
+        last = self._overdue_notified_at.get(entity_id)
+        if (
+            not force
+            and last is not None
+            and now - last < _RELOCK_RENOTIFY_INTERVAL
+        ):
+            return
+        self._overdue_notified_at[entity_id] = now
         ha = self._get_ha()
         if not ha:
             return
@@ -563,12 +630,28 @@ class RelockManager:
             existing.cancel()
 
     async def _wait_and_lock(
-        self, entity_id: str, lock_name: str, deadline: float
+        self,
+        entity_id: str,
+        lock_name: str,
+        deadline: float,
+        *,
+        monotonic_deadline: float | None = None,
     ) -> None:
         current_task = asyncio.current_task()
         try:
-            remaining = max(0.0, deadline - time.time())
-            await asyncio.sleep(remaining)
+            # The durable wall-clock ``deadline`` stays authoritative for CAS,
+            # persistence, and cross-restart recovery. When this timer was armed
+            # live, ``monotonic_deadline`` bounds the same interval on a clock
+            # that cannot run backwards; firing at whichever bound is nearer
+            # means a backward wall-clock jump can only re-lock sooner, never
+            # extend the window. Rehydrated/swept/resumed rows have no monotonic
+            # context and pass ``None`` here, preserving pure wall-clock timing.
+            remaining = deadline - time.time()
+            if monotonic_deadline is not None:
+                remaining = min(
+                    remaining, monotonic_deadline - time.monotonic()
+                )
+            await asyncio.sleep(max(0.0, remaining))
         except asyncio.CancelledError:
             return
 
@@ -598,13 +681,15 @@ class RelockManager:
                                 entity_id,
                             )
                             removed = 0
-                        if removed and self._on_locked is not None:
-                            try:
-                                self._on_locked(entity_id)
-                            except Exception:
-                                _LOGGER.exception(
-                                    "on_locked callback raised for %s", entity_id
-                                )
+                        if removed:
+                            self._clear_overdue_notified(entity_id)
+                            if self._on_locked is not None:
+                                try:
+                                    self._on_locked(entity_id)
+                                except Exception:
+                                    _LOGGER.exception(
+                                        "on_locked callback raised for %s", entity_id
+                                    )
                     else:
                         # All retries exhausted. Leave the DB row so the
                         # periodic sweep can retry while HA stays connected.
@@ -626,7 +711,7 @@ class RelockManager:
             return
 
         if notify_failed:
-            await self._notify_relock_failed(entity_id, lock_name)
+            await self._notify_relock_failed(entity_id, lock_name, force=True)
 
     async def _call_ha_lock(
         self,

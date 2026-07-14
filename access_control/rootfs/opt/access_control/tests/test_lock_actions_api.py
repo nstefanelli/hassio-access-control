@@ -7,7 +7,7 @@ import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -214,6 +214,136 @@ class SharedLockActionTests(unittest.IsolatedAsyncioTestCase):
         relock.extend_after_success.assert_not_awaited()
         self.assertNotIn("lock.side", state.lock_states)
 
+    async def test_buzz_on_synced_lock_leases_momentary_hold(self) -> None:
+        # Change 1: a timed buzz on a bidirectionally synced lock must lease a
+        # momentary Access hold (same duration semantics as the remote path)
+        # before the HA unlock, so the hub poller does not echo it back as a
+        # persistent keep_unlock override.
+        lock = {
+            "id": 8,
+            "type": "ha_external",
+            "entity_id": "lock.sync",
+            "name": "Sync",
+            "buzz_enabled": 1,
+            "relock_duration": 30,
+            "sync_hub_state": 1,
+        }
+        db = _db_for(lock)
+        intent = object()
+        relock = SimpleNamespace(
+            schedule=AsyncMock(return_value=intent),
+            retain_after_uncertain_unlock=AsyncMock(),
+            extend_after_success=AsyncMock(),
+        )
+        ha = SimpleNamespace(
+            unlock=AsyncMock(return_value=True),
+            get_entity_state=AsyncMock(return_value="unlocked"),
+        )
+        hub_sync = SimpleNamespace(mark_access_momentary=MagicMock())
+        state = _state(db=db, ha=ha, relock=relock)
+        state.hub_sync_manager = hub_sync
+
+        with patch("access_control.lock_actions.asyncio.sleep", new=AsyncMock()):
+            result = await execute_lock_action(
+                state, 8, "buzz", actor="admin", source="manual"
+            )
+
+        self.assertTrue(result.granted)
+        hub_sync.mark_access_momentary.assert_called_once_with("lock.sync", 30.0)
+
+    async def test_buzz_on_unsynced_lock_does_not_lease(self) -> None:
+        lock = {
+            "id": 8,
+            "type": "ha_external",
+            "entity_id": "lock.plain",
+            "name": "Plain",
+            "buzz_enabled": 1,
+            "relock_duration": 30,
+            "sync_hub_state": 0,
+        }
+        db = _db_for(lock)
+        relock = SimpleNamespace(
+            schedule=AsyncMock(return_value=object()),
+            retain_after_uncertain_unlock=AsyncMock(),
+            extend_after_success=AsyncMock(),
+        )
+        ha = SimpleNamespace(
+            unlock=AsyncMock(return_value=True),
+            get_entity_state=AsyncMock(return_value="unlocked"),
+        )
+        hub_sync = SimpleNamespace(mark_access_momentary=MagicMock())
+        state = _state(db=db, ha=ha, relock=relock)
+        state.hub_sync_manager = hub_sync
+
+        with patch("access_control.lock_actions.asyncio.sleep", new=AsyncMock()):
+            result = await execute_lock_action(
+                state, 8, "buzz", actor="admin", source="manual"
+            )
+
+        self.assertTrue(result.granted)
+        hub_sync.mark_access_momentary.assert_not_called()
+
+    async def test_manual_unlock_marks_app_initiated_on_synced_lock(self) -> None:
+        # Change 4 exclusion (ii): a deliberate manual Unlock (hold-open) must
+        # tag the imminent HA edge app-initiated so relock_on_ha_origin ignores
+        # it. Unsynced locks are unaffected.
+        lock = {
+            "id": 9,
+            "type": "ha_external",
+            "entity_id": "lock.sync2",
+            "name": "Sync2",
+            "sync_hub_state": 1,
+        }
+        db = _db_for(lock)
+        relock = SimpleNamespace(
+            pause=AsyncMock(return_value=None),
+            resume=AsyncMock(),
+            cancel=AsyncMock(),
+        )
+        ha = SimpleNamespace(
+            unlock=AsyncMock(return_value=True),
+            get_entity_state=AsyncMock(return_value="unlocked"),
+        )
+        hub_sync = SimpleNamespace(mark_app_initiated_unlock=MagicMock())
+        state = _state(db=db, ha=ha, relock=relock)
+        state.hub_sync_manager = hub_sync
+
+        result = await execute_lock_action(
+            state, 9, "unlock", actor="admin", source="manual"
+        )
+
+        self.assertTrue(result.granted)
+        hub_sync.mark_app_initiated_unlock.assert_called_once_with("lock.sync2")
+
+    async def test_manual_lock_does_not_mark_app_initiated(self) -> None:
+        lock = {
+            "id": 9,
+            "type": "ha_external",
+            "entity_id": "lock.sync3",
+            "name": "Sync3",
+            "sync_hub_state": 1,
+        }
+        db = _db_for(lock)
+        relock = SimpleNamespace(
+            pause=AsyncMock(return_value=None),
+            resume=AsyncMock(),
+            cancel=AsyncMock(),
+        )
+        ha = SimpleNamespace(
+            lock=AsyncMock(return_value=True),
+            get_entity_state=AsyncMock(return_value="locked"),
+        )
+        hub_sync = SimpleNamespace(mark_app_initiated_unlock=MagicMock())
+        state = _state(db=db, ha=ha, relock=relock)
+        state.hub_sync_manager = hub_sync
+
+        result = await execute_lock_action(
+            state, 9, "lock", actor="admin", source="manual"
+        )
+
+        self.assertTrue(result.granted)
+        hub_sync.mark_app_initiated_unlock.assert_not_called()
+
     async def test_restore_schedule_uses_confirmed_native_operation(self) -> None:
         lock = {
             "id": 7,
@@ -365,6 +495,55 @@ class LockModeApiTests(unittest.TestCase):
                     self.assertEqual(
                         response.json()["reason"], "safe public reason"
                     )
+
+
+class HealthPendingRelockTests(unittest.TestCase):
+    """Change 3(b): /api/health reports scope-safe pending-relock counts."""
+
+    @staticmethod
+    def _app(scope: str = "read_only") -> FastAPI:
+        app = FastAPI()
+        app.include_router(api_routes.router)
+        app.state.access_client = None
+        app.state.ha_client = None
+        app.state.protect_client = None
+        app.state.hub_sync_manager = None
+        app.state.relock_manager = None
+        app.state.db = SimpleNamespace(
+            get_user_count=AsyncMock(return_value=3),
+            get_lock_count=AsyncMock(return_value=2),
+        )
+        app.state.auth_engine = SimpleNamespace(lockdown=False)
+        app.dependency_overrides[api_routes.verify_api_key] = lambda: {
+            "key_id": 1,
+            "name": "automation",
+            "scope": scope,
+        }
+        return app
+
+    def test_health_reports_total_and_overdue_counts(self) -> None:
+        app = self._app()
+        app.state.relock_manager = SimpleNamespace(
+            pending_relock_status=AsyncMock(
+                return_value={"lock.a": True, "lock.b": False, "lock.c": True}
+            )
+        )
+        with TestClient(app) as client:
+            resp = client.get("/api/health")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.json()["pending_relocks"], {"total": 3, "overdue": 2}
+        )
+        # Scope-safe: no entity IDs leak into the lowest-privilege read.
+        self.assertNotIn("lock.a", resp.text)
+
+    def test_health_pending_relocks_zero_without_manager(self) -> None:
+        app = self._app()
+        with TestClient(app) as client:
+            resp = client.get("/api/health")
+        self.assertEqual(
+            resp.json()["pending_relocks"], {"total": 0, "overdue": 0}
+        )
 
 
 class ApiAuthIdentityTests(unittest.IsolatedAsyncioTestCase):

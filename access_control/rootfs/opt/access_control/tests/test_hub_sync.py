@@ -2101,5 +2101,116 @@ class TestPersistentOverrideLifecycleRegressions(unittest.TestCase):
         _run(go())
 
 
+class TestRelockOnHaOrigin(unittest.TestCase):
+    """Change 4: opt-in relock_on_ha_origin time-bounds a genuine external
+    (thumb-turn / HA-automation) unlock, while excluding every app-initiated
+    unlock."""
+
+    def _fixture(self, *, ha_origin=True):
+        lock = dict(HA_LOCK)
+        lock["relock_on_ha_origin"] = 1 if ha_origin else 0
+        ha_states = {"lock.front": "locked"}
+        access_rules = {"dev-hub-1": {"type": "reset"}}
+        access_states = {"dev-hub-1": "locked"}
+        db = _make_db([lock, HUB], location_map={"loc-1": [HUB]})
+        db.get_pending_relock = AsyncMock(return_value=None)
+        ha = _make_bidirectional_ha(ha_states)
+        access = _make_bidirectional_access(access_rules, access_states)
+        relock = MagicMock()
+        relock.schedule = AsyncMock()
+        mgr = HubSyncManager(
+            db=db,
+            ha_client_getter=lambda: ha,
+            access_client_getter=lambda: access,
+            relock_manager_getter=lambda: relock,
+        )
+        return mgr, ha, access, relock, db, ha_states
+
+    def test_ha_origin_unlock_schedules_relock_once_per_edge(self) -> None:
+        async def go():
+            mgr, ha, access, relock, db, ha_states = self._fixture()
+            await mgr.poll_once()  # confirmed locked baseline
+            ha_states["lock.front"] = "unlocked"  # external thumb-turn
+            _clear_damping(mgr)
+
+            self.assertEqual(await mgr.poll_once(), 1)
+            # The external unlock still propagates to Access as keep_unlock ...
+            access.hold_unlocked.assert_awaited_once_with(
+                "dev-hub-1", location_id="loc-1"
+            )
+            # ... and a durable ha_origin re-lock is scheduled exactly once.
+            relock.schedule.assert_awaited_once()
+            kwargs = relock.schedule.await_args.kwargs
+            self.assertEqual(kwargs["entity_id"], "lock.front")
+            self.assertEqual(kwargs["source"], "ha_origin")
+            self.assertEqual(kwargs["duration"], 30.0)
+
+            # The next converged poll observes both sides unlocked and does not
+            # re-schedule for the same edge.
+            await mgr.poll_once()
+            relock.schedule.assert_awaited_once()
+        _run(go())
+
+    def test_manual_app_initiated_unlock_is_not_relocked(self) -> None:
+        async def go():
+            mgr, ha, access, relock, db, ha_states = self._fixture()
+            await mgr.poll_once()
+            # A manual dashboard Unlock marks the imminent edge app-initiated.
+            mgr.mark_app_initiated_unlock("lock.front")
+            ha_states["lock.front"] = "unlocked"
+            _clear_damping(mgr)
+
+            self.assertEqual(await mgr.poll_once(), 1)
+            # Hold-open is preserved; no time-bound is imposed on the operator.
+            access.hold_unlocked.assert_awaited_once()
+            relock.schedule.assert_not_awaited()
+        _run(go())
+
+    def test_momentary_lease_suppresses_ha_origin_schedule(self) -> None:
+        async def go():
+            mgr, ha, access, relock, db, ha_states = self._fixture()
+            await mgr.poll_once()
+            # A buzz / device-auth / remote unlock leases the momentary hold.
+            mgr.mark_access_momentary("lock.front", 30)
+            ha_states["lock.front"] = "unlocked"
+            _clear_damping(mgr)
+
+            self.assertEqual(await mgr.poll_once(), 0)
+            relock.schedule.assert_not_awaited()
+        _run(go())
+
+    def test_existing_pending_relock_is_not_double_scheduled(self) -> None:
+        async def go():
+            mgr, ha, access, relock, db, ha_states = self._fixture()
+            # A buzz already owns a durable pending row for this entity.
+            db.get_pending_relock = AsyncMock(
+                return_value={"entity_id": "lock.front", "deadline": 123.0}
+            )
+            await mgr.poll_once()
+            ha_states["lock.front"] = "unlocked"
+            _clear_damping(mgr)
+
+            self.assertEqual(await mgr.poll_once(), 1)
+            relock.schedule.assert_not_awaited()
+        _run(go())
+
+    def test_toggle_off_preserves_todays_behavior(self) -> None:
+        async def go():
+            mgr, ha, access, relock, db, ha_states = self._fixture(
+                ha_origin=False
+            )
+            await mgr.poll_once()
+            ha_states["lock.front"] = "unlocked"
+            _clear_damping(mgr)
+
+            self.assertEqual(await mgr.poll_once(), 1)
+            # Byte-for-byte today's behavior: keep_unlock, no re-lock timer.
+            access.hold_unlocked.assert_awaited_once_with(
+                "dev-hub-1", location_id="loc-1"
+            )
+            relock.schedule.assert_not_awaited()
+        _run(go())
+
+
 if __name__ == "__main__":
     unittest.main()

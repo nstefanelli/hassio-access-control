@@ -951,6 +951,10 @@ async def _lifespan_inner(app: FastAPI):
             # Protect doorbell entry device (G6 Entry) resolve their hub.
             camera_map_getter=lambda: app.state.camera_to_location,
             command_lock=app.state.physical_command_lock,
+            # Opt-in relock_on_ha_origin schedules a durable re-lock through the
+            # RelockManager (constructed just above) when an external HA unlock
+            # is observed on a synced lock.
+            relock_manager_getter=lambda: app.state.relock_manager,
         )
 
         async def _enforce_hub_lockdown() -> None:
@@ -968,6 +972,9 @@ async def _lifespan_inner(app: FastAPI):
             camera_map_getter=lambda: app.state.camera_to_location,
             command_lock=app.state.physical_command_lock,
             on_lockdown_enabled=_enforce_hub_lockdown,
+            # Lazily fetched so a device-auth timed unlock can lease a momentary
+            # Access hold on a bidirectionally synced lock.
+            hub_sync_getter=lambda: app.state.hub_sync_manager,
         )
 
         # Restore lockdown mode persisted before a restart (incident control

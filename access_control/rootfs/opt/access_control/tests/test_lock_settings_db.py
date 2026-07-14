@@ -104,5 +104,41 @@ class TestUpdateLockSettingsPreservesPairing(unittest.TestCase):
         _run(go())
 
 
+class TestRelockOnHaOriginColumn(unittest.TestCase):
+    """Change 4 plumbing: the relock_on_ha_origin column defaults off and round
+    trips through update_lock_settings."""
+
+    def test_column_defaults_off_and_persists(self) -> None:
+        async def go():
+            db = Database(path=Path(tempfile.mkdtemp()) / "t.db")
+            await db.connect()
+            try:
+                lock_id = await db.add_external_lock(
+                    entity_id="lock.front", name="Front",
+                )
+                lock = await db.get_lock(lock_id)
+                # Default off — existing installs keep current behaviour.
+                self.assertEqual(lock["relock_on_ha_origin"], 0)
+
+                await db.update_lock_settings(
+                    lock_id, buzz_enabled=True, relock_duration=30,
+                    sync_hub_state=True, relock_on_ha_origin=True,
+                )
+                lock = await db.get_lock(lock_id)
+                self.assertEqual(lock["relock_on_ha_origin"], 1)
+                self.assertEqual(lock["sync_hub_state"], 1)
+
+                # Omitting the kwarg writes the default (checkbox unchecked).
+                await db.update_lock_settings(
+                    lock_id, buzz_enabled=True, relock_duration=30,
+                    sync_hub_state=True,
+                )
+                lock = await db.get_lock(lock_id)
+                self.assertEqual(lock["relock_on_ha_origin"], 0)
+            finally:
+                await db.close()
+        _run(go())
+
+
 if __name__ == "__main__":
     unittest.main()

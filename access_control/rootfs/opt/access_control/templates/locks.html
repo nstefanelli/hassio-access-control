@@ -54,6 +54,12 @@
         </div>
       </div>
 
+      {% if lock.relock_overdue %}
+      <div><span class="badge-denied">re-lock overdue</span></div>
+      {% elif lock.relock_pending %}
+      <div><span class="chip">re-lock pending</span></div>
+      {% endif %}
+
       <!-- Actions: primary row -->
       <div class="flex items-center gap-2 pt-1 border-t border-gray-800 flex-wrap">
         <!-- Lock -->
@@ -165,6 +171,13 @@
                    class="rounded bg-gray-800 border-gray-700" />
             Sync this lock &amp; Access door bidirectionally
           </label>
+          {% if lock.sync_hub_state %}
+          <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+            <input type="checkbox" name="relock_on_ha_origin" value="1" {{ 'checked' if lock.relock_on_ha_origin else '' }}
+                   class="rounded bg-gray-800 border-gray-700" />
+            Auto re-lock after external (thumb-turn / HA) unlocks
+          </label>
+          {% endif %}
           {% endif %}
           <div class="flex items-center gap-2">
             <label class="text-xs text-gray-500">Relock duration:</label>

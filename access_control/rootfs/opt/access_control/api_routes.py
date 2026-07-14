@@ -62,6 +62,18 @@ async def health(request: Request, auth: dict = Depends(verify_api_key)):
     user_count = await db.get_user_count()
     lock_count = await db.get_lock_count()
 
+    # Pending re-lock observability — counts only (no entity IDs) so the
+    # lowest-privilege health read stays scope-safe. "overdue" means a durable
+    # re-lock deadline has passed and the door has not yet confirmed locked.
+    relock_manager = getattr(app.state, "relock_manager", None)
+    relock_status: dict[str, bool] = {}
+    if relock_manager is not None:
+        relock_status = await relock_manager.pending_relock_status()
+    pending_relocks = {
+        "total": len(relock_status),
+        "overdue": sum(1 for overdue in relock_status.values() if overdue),
+    }
+
     return {
         "status": "ok",
         "unvr_connected": access.connected if access else False,
@@ -87,6 +99,7 @@ async def health(request: Request, auth: dict = Depends(verify_api_key)):
             if getattr(app.state, "hub_sync_manager", None)
             else ()
         ),
+        "pending_relocks": pending_relocks,
     }
 
 

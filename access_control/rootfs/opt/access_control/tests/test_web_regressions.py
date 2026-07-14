@@ -264,6 +264,67 @@ class HomeTemplateSafetyTests(unittest.TestCase):
         self.assertIn("Lockdown Active", lockdown_html)
 
 
+class LocksTemplateRelockBadgeTests(unittest.TestCase):
+    """Change 3(c): the locks page shows a neutral "re-lock pending" chip and a
+    danger "re-lock overdue" badge only on affected cards."""
+
+    def _render(self, locks):
+        template = web_routes.templates.env.get_template("locks.html")
+        return template.render(
+            request=SimpleNamespace(scope={}),
+            user="admin",
+            page="locks",
+            ingress_active=False,
+            ingress_path="",
+            csrf_token="csrf",
+            lockdown=False,
+            locks=locks,
+            ha_locks=[],
+            access_locations=[],
+            protect_doorbells=[],
+            protect_cameras=[],
+            unvr_connected=True,
+            protect_connected=True,
+            ha_connected=True,
+            ws_connected=True,
+        )
+
+    @staticmethod
+    def _lock(**over):
+        base = {
+            "id": 1, "name": "Door", "type": "ha_external",
+            "entity_id": "lock.x", "state": "unlocked",
+            "buzz_enabled": 0, "relock_duration": 30, "hidden": 0,
+            "entry_devices": [],
+        }
+        base.update(over)
+        return base
+
+    def test_badges_render_only_on_affected_cards(self) -> None:
+        overdue = self._lock(
+            id=1, name="Overdue", entity_id="lock.a",
+            relock_pending=True, relock_overdue=True,
+        )
+        pending = self._lock(
+            id=2, name="Pending", entity_id="lock.b",
+            relock_pending=True, relock_overdue=False,
+        )
+        clean = self._lock(id=3, name="Clean", entity_id="lock.c")
+
+        html = self._render([overdue, pending, clean])
+
+        self.assertIn('<span class="badge-denied">re-lock overdue</span>', html)
+        self.assertIn('<span class="chip">re-lock pending</span>', html)
+        # One card each; the clean lock shows neither.
+        self.assertEqual(html.count("re-lock overdue"), 1)
+        self.assertEqual(html.count("re-lock pending"), 1)
+
+    def test_no_badge_when_no_pending_relock(self) -> None:
+        html = self._render([self._lock()])
+        self.assertNotIn("re-lock pending", html)
+        self.assertNotIn("re-lock overdue", html)
+
+
 class AssetCacheBustingTests(unittest.TestCase):
     def test_static_asset_links_carry_content_hash(self) -> None:
         # Without a version query, browsers may satisfy static/app.css from

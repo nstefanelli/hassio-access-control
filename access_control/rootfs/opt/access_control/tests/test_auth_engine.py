@@ -916,5 +916,108 @@ class TestScheduleTimezone(unittest.TestCase):
         self.assertFalse(engine._check_schedule(rule))
 
 
+class TestDeviceAuthMomentaryLease(unittest.IsolatedAsyncioTestCase):
+    """Change 1: a device-auth timed unlock on a synced lock leases a momentary
+    Access hold so the hub poller does not echo it back as keep_unlock."""
+
+    def _relock(self):
+        return SimpleNamespace(
+            schedule=AsyncMock(return_value=object()),
+            extend_after_success=AsyncMock(),
+            cancel=AsyncMock(),
+            pause=AsyncMock(return_value=None),
+            resume=AsyncMock(),
+        )
+
+    def _engine(self, relock, hub_sync):
+        ha = make_ha()
+        ha.get_entity_state = AsyncMock(return_value="unlocked")
+        return AuthEngine(
+            db=make_db(),
+            access_client=None,
+            ha_client=ha,
+            relock_tasks={},
+            relock_manager=relock,
+            hub_sync_getter=lambda: hub_sync,
+        )
+
+    async def test_relock_enabled_synced_lock_leases_momentary(self) -> None:
+        relock = self._relock()
+        hub_sync = SimpleNamespace(mark_access_momentary=MagicMock())
+        engine = self._engine(relock, hub_sync)
+        lock = {
+            "id": 10, "type": "ha_external", "entity_id": "lock.front",
+            "name": "Front", "relock_on_device_auth": 1,
+            "sync_hub_state": 1, "relock_duration": 45,
+        }
+        await engine._unlock(lock)
+        relock.schedule.assert_awaited_once()
+        hub_sync.mark_access_momentary.assert_called_once_with("lock.front", 45.0)
+
+    async def test_relock_enabled_unsynced_lock_does_not_lease(self) -> None:
+        relock = self._relock()
+        hub_sync = SimpleNamespace(mark_access_momentary=MagicMock())
+        engine = self._engine(relock, hub_sync)
+        lock = {
+            "id": 10, "type": "ha_external", "entity_id": "lock.front",
+            "name": "Front", "relock_on_device_auth": 1,
+            "sync_hub_state": 0, "relock_duration": 30,
+        }
+        await engine._unlock(lock)
+        relock.schedule.assert_awaited_once()
+        hub_sync.mark_access_momentary.assert_not_called()
+
+    async def test_relock_disabled_synced_lock_does_not_lease(self) -> None:
+        relock = self._relock()
+        hub_sync = SimpleNamespace(
+            mark_access_momentary=MagicMock(),
+            mark_app_initiated_unlock=MagicMock(),
+        )
+        engine = self._engine(relock, hub_sync)
+        lock = {
+            "id": 10, "type": "ha_external", "entity_id": "lock.front",
+            "name": "Front", "relock_on_device_auth": 0,
+            "sync_hub_state": 1, "relock_duration": 30,
+        }
+        await engine._unlock(lock)
+        relock.schedule.assert_not_awaited()
+        hub_sync.mark_access_momentary.assert_not_called()
+
+    async def test_relock_disabled_tap_marks_app_initiated_hold_open(self) -> None:
+        # relock_on_device_auth OFF means an authorized tap is a chosen
+        # hold-open (the success path cancels any pending timer). It must be
+        # marked app-initiated so relock_on_ha_origin — which covers external
+        # unlocks only — cannot silently re-time it; the same exclusion the
+        # manual dashboard Unlock gets.
+        relock = self._relock()
+        hub_sync = SimpleNamespace(
+            mark_access_momentary=MagicMock(),
+            mark_app_initiated_unlock=MagicMock(),
+        )
+        engine = self._engine(relock, hub_sync)
+        lock = {
+            "id": 10, "type": "ha_external", "entity_id": "lock.front",
+            "name": "Front", "relock_on_device_auth": 0,
+            "sync_hub_state": 1, "relock_duration": 30,
+        }
+        await engine._unlock(lock)
+        hub_sync.mark_app_initiated_unlock.assert_called_once_with("lock.front")
+
+    async def test_relock_disabled_unsynced_tap_does_not_mark(self) -> None:
+        relock = self._relock()
+        hub_sync = SimpleNamespace(
+            mark_access_momentary=MagicMock(),
+            mark_app_initiated_unlock=MagicMock(),
+        )
+        engine = self._engine(relock, hub_sync)
+        lock = {
+            "id": 10, "type": "ha_external", "entity_id": "lock.front",
+            "name": "Front", "relock_on_device_auth": 0,
+            "sync_hub_state": 0, "relock_duration": 30,
+        }
+        await engine._unlock(lock)
+        hub_sync.mark_app_initiated_unlock.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

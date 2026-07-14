@@ -126,6 +126,7 @@ class HubSyncManager:
         lockdown_getter: Optional[Callable[[], bool]] = None,
         camera_map_getter: Optional[Callable[[], dict]] = None,
         command_lock: Optional[asyncio.Lock] = None,
+        relock_manager_getter: Optional[Callable[[], Any]] = None,
     ) -> None:
         # Clients are fetched lazily via getters — same rationale as
         # RelockManager: credential updates from Settings swap the client
@@ -141,6 +142,10 @@ class HubSyncManager:
         self._on_hub_state = on_hub_state
         self._lockdown_getter = lockdown_getter
         self._get_camera_map = camera_map_getter
+        # Lazily fetched RelockManager. Used only by the opt-in
+        # ``relock_on_ha_origin`` feature: a genuine HA-origin unlock edge on a
+        # synced lock schedules a durable time-bounded re-lock through it.
+        self._get_relock_manager = relock_manager_getter
         self._command_lock = command_lock or asyncio.Lock()
         self._poll_lock = asyncio.Lock()
         # ``enforce_lockdown`` sets this before waiting for ``_poll_lock``.
@@ -210,6 +215,12 @@ class HubSyncManager:
         # A remote Access unlock is momentary. While its durable HA relock is
         # live, do not echo HA's temporary unlocked state back as keep_unlock.
         self._access_momentary_until: dict[str, float] = {}
+        # entity_id → monotonic deadline before which an observed HA unlock edge
+        # is known to be app-initiated (manual dashboard Unlock, buzz,
+        # device-auth, or remote). ``relock_on_ha_origin`` skips scheduling a
+        # durable re-lock while this is live so it only fires for genuinely
+        # external (thumb-turn / HA-automation) unlocks.
+        self._app_initiated_until: dict[str, float] = {}
         # Event hints reduce latency. They are never trusted as proof of an
         # unsafe open; reconciliation still performs authenticated readback.
         self._dirty_locations: set[str] = set()
@@ -239,9 +250,29 @@ class HubSyncManager:
         The caller must first persist the matching HA relock. This marker is
         intentionally in memory: after a crash the durable relock is restored,
         while startup conflict handling remains locked-wins.
+
+        A momentary lease is also app-initiated for the same window, so the
+        opt-in ``relock_on_ha_origin`` feature never double-schedules a re-lock
+        for a buzz / device-auth / remote unlock that already owns its timer.
         """
-        self._access_momentary_until[entity_id] = (
-            time.monotonic() + max(0.0, float(duration))
+        window = time.monotonic() + max(0.0, float(duration))
+        self._access_momentary_until[entity_id] = window
+        self._app_initiated_until[entity_id] = max(
+            self._app_initiated_until.get(entity_id, 0.0), window
+        )
+
+    def mark_app_initiated_unlock(
+        self, entity_id: str, ttl: float = 15.0
+    ) -> None:
+        """Mark an imminent HA unlock as app-initiated for ``ttl`` seconds.
+
+        Used by the manual dashboard Unlock (a deliberate hold-open that cancels
+        pending re-locks) so ``relock_on_ha_origin`` does not observe that HA
+        edge as an external thumb-turn. The short TTL covers the 5s poll edge
+        without leaving a genuine later external unlock uncovered.
+        """
+        self._app_initiated_until[entity_id] = (
+            time.monotonic() + max(0.0, float(ttl))
         )
 
     async def reconcile_location(
@@ -1531,7 +1562,54 @@ class HubSyncManager:
         self._backoff_until.pop(eid, None)
         self._failure_notified.discard(eid)
         self._clear_incident_signatures(eid)
+
+        # Opt-in: a genuine HA-origin unlock (thumb-turn / HA automation) on a
+        # synced lock becomes time-bounded. This runs only after the edge is
+        # confirmed and persisted, so it fires exactly once per edge — the next
+        # pass reads both sides unlocked (``already_converged``).
+        await self._maybe_schedule_ha_origin_relock(lock, source, desired, now)
         return 1 if changed else 0
+
+    async def _maybe_schedule_ha_origin_relock(
+        self, lock: dict, source: str, desired: str, now: float
+    ) -> None:
+        """Time-bound a genuine HA-origin unlock when the lock opted in.
+
+        Guarded so it never touches an app-initiated unlock: a manual dashboard
+        Unlock (short-TTL marker), a buzz / device-auth / remote unlock (their
+        momentary lease marks app-initiated and they already own a durable
+        timer), or any entity that already has a live pending re-lock row. The
+        result is that only a real external unlock (thumb-turn / HA automation)
+        earns a new ``ha_origin`` re-lock, scheduled once per edge.
+        """
+        if source != "ha" or desired != "unlocked":
+            return
+        if not lock.get("relock_on_ha_origin"):
+            return
+        eid = lock["entity_id"]
+        if self._app_initiated_until.get(eid, 0.0) > now:
+            return
+        if self._get_relock_manager is None:
+            return
+        relock_manager = self._get_relock_manager()
+        if relock_manager is None:
+            return
+        try:
+            # A buzz / device-auth / remote unlock already owns a durable timer.
+            # Never replace or double it.
+            if await self._db.get_pending_relock(eid) is not None:
+                return
+            await relock_manager.schedule(
+                entity_id=eid,
+                duration=float(lock.get("relock_duration", 30)),
+                lock_id=lock.get("id"),
+                lock_name=lock.get("name", eid),
+                source="ha_origin",
+            )
+        except Exception:
+            _LOGGER.exception(
+                "Could not schedule ha_origin re-lock for %s", eid
+            )
 
     async def _apply_state(
         self,
@@ -2149,6 +2227,7 @@ class HubSyncManager:
         self._last_access_rule.pop(eid, None)
         self._last_converged.pop(eid, None)
         self._access_momentary_until.pop(eid, None)
+        self._app_initiated_until.pop(eid, None)
         self._clear_incident_signatures(eid)
 
     def _clear_incident_signatures(self, eid: str) -> None:

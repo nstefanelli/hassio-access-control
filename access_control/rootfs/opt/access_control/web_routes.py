@@ -1164,6 +1164,13 @@ async def locks_list(request: Request, user: str = Depends(require_login)):
         ) or []
         ha_states = {l["entity_id"]: l["state"] for l in all_ha_locks}
 
+    # Per-lock pending/overdue re-lock status for the "re-lock pending/overdue"
+    # card badge. One read; annotate each affected lock below.
+    relock_manager = getattr(request.app.state, "relock_manager", None)
+    relock_status: dict[str, bool] = {}
+    if relock_manager is not None:
+        relock_status = await relock_manager.pending_relock_status()
+
     for lock in locks:
         if lock["type"] == "ha_external" and lock.get("entity_id"):
             lock["state"] = lock_states.get(lock["entity_id"], ha_states.get(lock["entity_id"], "unknown"))
@@ -1172,6 +1179,10 @@ async def locks_list(request: Request, user: str = Depends(require_login)):
         else:
             lock["state"] = "unknown"
         lock["entry_devices"] = entry_devices_by_lock.get(lock["id"], [])
+        eid = lock.get("entity_id")
+        if eid in relock_status:
+            lock["relock_pending"] = True
+            lock["relock_overdue"] = relock_status[eid]
 
     # Available HA locks for adding (exclude already-added)
     ha_locks = []
@@ -1256,6 +1267,7 @@ async def update_lock_settings(
     relock_on_remote: str = Form(default=""),
     relock_on_device_auth: str = Form(default=""),
     sync_hub_state: str = Form(default=""),
+    relock_on_ha_origin: str = Form(default=""),
     user: str = Depends(require_csrf),
 ):
     limited = await _enforce_action_rate_limit(request, user, "lock_admin")
@@ -1276,6 +1288,7 @@ async def update_lock_settings(
         relock_on_remote=bool(relock_on_remote),
         relock_on_device_auth=bool(relock_on_device_auth),
         sync_hub_state=bool(sync_hub_state),
+        relock_on_ha_origin=bool(relock_on_ha_origin),
     )
     return _redirect(request, "/locks")
 

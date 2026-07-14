@@ -9,7 +9,7 @@ import time as _time
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -851,6 +851,168 @@ class TestRelockManagerFailureEvent(unittest.TestCase):
             self.assertEqual(event_type, "access_control_relock_failed")
             # Row retained for the sweep to retry
             db.remove_pending_relock.assert_not_awaited()
+        _run(go())
+
+
+class TestRelockMonotonicBound(unittest.TestCase):
+    """Change 2: a live timer fires at whichever of the wall-clock deadline and
+    the schedule-time monotonic bound arrives first, so a backward clock jump
+    can shorten but never extend an open-door window."""
+
+    def _capture_wait(
+        self, *, sched_time, sched_mono, wait_time, wait_mono, duration=100.0
+    ):
+        # Patching relock_manager.asyncio.sleep patches the shared asyncio
+        # module globally, so yield with a real-sleep reference captured before
+        # the patch — otherwise the test's own yields would pollute ``sleeps``.
+        real_sleep = asyncio.sleep
+        sleeps: list[float] = []
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        async def go():
+            db = _make_db()
+            ha = _make_ha(ok=True)
+            mgr = RelockManager(db=db, ha_client_getter=lambda: ha)
+            fake_time = MagicMock()
+            fake_time.time.return_value = sched_time
+            fake_time.monotonic.return_value = sched_mono
+            with patch("access_control.relock_manager.time", fake_time), patch(
+                "access_control.relock_manager.asyncio.sleep", new=fake_sleep
+            ):
+                await mgr.schedule(
+                    entity_id="lock.foo", duration=duration,
+                    lock_id=1, lock_name="Foo", source="buzz",
+                )
+                fake_time.time.return_value = wait_time
+                fake_time.monotonic.return_value = wait_mono
+                for _ in range(5):
+                    await real_sleep(0)
+            await mgr.cancel("lock.foo")
+        _run(go())
+        return sleeps
+
+    def test_backward_clock_jump_does_not_extend_window(self) -> None:
+        # deadline=1100, monotonic bound=5100. Wall clock jumped back 500s.
+        sleeps = self._capture_wait(
+            sched_time=1000.0, sched_mono=5000.0,
+            wait_time=500.0, wait_mono=5001.0,
+        )
+        # wall_remaining=600, mono_remaining=99 → bounded to 99, not 600.
+        self.assertAlmostEqual(sleeps[0], 99.0, places=5)
+
+    def test_forward_clock_jump_fires_early_via_wall_deadline(self) -> None:
+        # deadline=1100, monotonic bound=5100. Wall clock jumped forward 90s.
+        sleeps = self._capture_wait(
+            sched_time=1000.0, sched_mono=5000.0,
+            wait_time=1090.0, wait_mono=5001.0,
+        )
+        # wall_remaining=10, mono_remaining=99 → wall deadline wins.
+        self.assertAlmostEqual(sleeps[0], 10.0, places=5)
+
+    def test_rehydrated_row_uses_pure_wall_clock(self) -> None:
+        # Rehydrate has no monotonic context; the wait is pure wall-clock even
+        # though the module's monotonic clock is far from the deadline.
+        real_sleep = asyncio.sleep
+        sleeps: list[float] = []
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        async def go():
+            db = _make_db()
+            ha = _make_ha(ok=True)
+            mgr = RelockManager(db=db, ha_client_getter=lambda: ha)
+            _set_pending_rows(db, [{
+                "entity_id": "lock.foo", "lock_id": 1, "lock_name": "Foo",
+                "source": "buzz", "deadline": 1050.0, "created_at": 900.0,
+            }])
+            fake_time = MagicMock()
+            fake_time.time.return_value = 1000.0
+            fake_time.monotonic.return_value = 5000.0
+            with patch("access_control.relock_manager.time", fake_time), patch(
+                "access_control.relock_manager.asyncio.sleep", new=fake_sleep
+            ):
+                await mgr.rehydrate()
+                for _ in range(5):
+                    await real_sleep(0)
+            await mgr.cancel("lock.foo")
+        _run(go())
+        # remaining = 1050 - 1000 = 50, no monotonic bound applied.
+        self.assertAlmostEqual(sleeps[0], 50.0, places=5)
+
+
+class TestPendingRelockStatus(unittest.TestCase):
+    """Change 3(b): status map drives health counts and the locks-page badge."""
+
+    def test_status_maps_each_entity_to_overdue_flag(self) -> None:
+        async def go():
+            db = _make_db()
+            ha = _make_ha()
+            mgr = RelockManager(db=db, ha_client_getter=lambda: ha)
+            now = _time.time()
+            _set_pending_rows(db, [
+                {"entity_id": "lock.a", "deadline": now - 5,
+                 "lock_name": "A", "source": "buzz", "created_at": now},
+                {"entity_id": "lock.b", "deadline": now + 500,
+                 "lock_name": "B", "source": "buzz", "created_at": now},
+            ])
+            status = await mgr.pending_relock_status()
+            self.assertEqual(status, {"lock.a": True, "lock.b": False})
+        _run(go())
+
+
+class TestRelockOverdueRenotify(unittest.TestCase):
+    """Change 3(a): a stuck overdue relock re-fires its failure event on a
+    bounded per-entity cadence, and clears on success."""
+
+    def _overdue_db(self) -> MagicMock:
+        db = _make_db()
+        now = _time.time()
+        _set_pending_rows(db, [{
+            "entity_id": "lock.foo", "lock_id": 1, "lock_name": "Foo",
+            "source": "buzz", "deadline": now - 100, "created_at": now - 100,
+        }])
+        return db
+
+    def test_overdue_sweep_refires_on_bounded_cadence(self) -> None:
+        async def go():
+            db = self._overdue_db()
+            ha = _make_ha(ok=False)  # HA lock keeps failing
+            mgr = RelockManager(db=db, ha_client_getter=lambda: ha)
+            with patch(
+                "access_control.relock_manager.asyncio.sleep", new=AsyncMock()
+            ):
+                await mgr.sweep_overdue()
+                self.assertEqual(ha.fire_event.await_count, 1)
+                # Immediate re-sweep stays silent inside the cadence window.
+                await mgr.sweep_overdue()
+                self.assertEqual(ha.fire_event.await_count, 1)
+                # Past the window it re-fires so the stuck door stays visible.
+                mgr._overdue_notified_at["lock.foo"] = (
+                    _time.monotonic()
+                    - rm_module._RELOCK_RENOTIFY_INTERVAL
+                    - 1
+                )
+                await mgr.sweep_overdue()
+                self.assertEqual(ha.fire_event.await_count, 2)
+        _run(go())
+
+    def test_success_clears_renotify_state(self) -> None:
+        async def go():
+            db = self._overdue_db()
+            ha = _make_ha(ok=False)
+            mgr = RelockManager(db=db, ha_client_getter=lambda: ha)
+            with patch(
+                "access_control.relock_manager.asyncio.sleep", new=AsyncMock()
+            ):
+                await mgr.sweep_overdue()
+                self.assertIn("lock.foo", mgr._overdue_notified_at)
+                # HA recovers; the overdue row locks and the cadence resets.
+                ha.lock = AsyncMock(return_value=True)
+                await mgr.sweep_overdue()
+            self.assertNotIn("lock.foo", mgr._overdue_notified_at)
         _run(go())
 
 
