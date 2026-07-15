@@ -425,8 +425,10 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
             "unvr.local", "service", "secret", api_token="token"
         )
         stale = {"type": "lock_early", "ended_time": 123}
+        # 1.5.12 widened the confirm window from 3 to
+        # len(_LOCK_CONFIRM_DELAYS) + 1 = 6 readbacks (pre-read + write + reads).
         client._open_api_request = AsyncMock(
-            side_effect=[stale, "success", stale, stale, stale]
+            side_effect=[stale, "success", *([stale] * 6)]
         )
 
         with patch("access_control.access_client.asyncio.sleep", new=AsyncMock()):
@@ -435,7 +437,7 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
                     "hub-1", location_id="door-1"
                 )
 
-        self.assertEqual(client._open_api_request.await_count, 5)
+        self.assertEqual(client._open_api_request.await_count, 8)
 
     async def test_confirmation_is_bounded_and_rejects_stale_rule(self) -> None:
         client = AccessClient(
@@ -444,12 +446,11 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
             "secret",
             api_token="token",
         )
+        # 1.5.12 widened the confirm window to 6 readbacks (write + 6 GETs).
         client._open_api_request = AsyncMock(
             side_effect=[
                 "success",
-                {"type": "keep_lock", "ended_time": None},
-                {"type": "keep_lock", "ended_time": None},
-                {"type": "keep_lock", "ended_time": None},
+                *([{"type": "keep_lock", "ended_time": None}] * 6),
             ]
         )
 
@@ -457,7 +458,7 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(AccessClientError, "not confirmed"):
                 await client.hold_unlocked("hub-1", location_id="door-1")
 
-        self.assertEqual(client._open_api_request.await_count, 4)
+        self.assertEqual(client._open_api_request.await_count, 7)
 
     async def test_release_persistent_lock_rejects_stale_keep_lock(self) -> None:
         """A relay-locked readback must not prove that keep_lock was removed."""
@@ -473,9 +474,8 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
                 {"type": "keep_lock", "ended_time": None},
                 "success",
                 # All bounded readbacks are the unchanged persistent override.
-                {"type": "keep_lock", "ended_time": None},
-                {"type": "keep_lock", "ended_time": None},
-                {"type": "keep_lock", "ended_time": None},
+                # 1.5.12 widened the window to 6 readbacks.
+                *([{"type": "keep_lock", "ended_time": None}] * 6),
             ]
         )
 
@@ -486,7 +486,7 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
                     location_id="door-1",
                 )
 
-        self.assertEqual(client._open_api_request.await_count, 5)
+        self.assertEqual(client._open_api_request.await_count, 8)
 
     async def test_release_persistent_lock_accepts_changed_locked_rule(self) -> None:
         client = AccessClient(
@@ -514,6 +514,160 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"type": "lock_early", "state": "locked"})
         self.assertEqual(client._open_api_request.await_count, 4)
+
+    # ------------------------------------------------------------------
+    # 1.5.12 — extended progressive confirm window + lock_now/reset semantics.
+    # sleep is patched so the ~5s window costs no wall-clock time.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _relay(status: str) -> dict:
+        return {"id": "door-1", "door_lock_relay_status": status}
+
+    async def test_keep_unlock_confirms_when_relay_reports_late(self) -> None:
+        """(i) keep_unlock: rule echoes at once but the relay only reports
+        unlocked on the 4th read (~2s). The widened window confirms instead of
+        timing out at <1s as the old fixed loop did."""
+        client = AccessClient(
+            "unvr.local", "service", "secret", api_token="token"
+        )
+        client._open_api_request = AsyncMock(
+            side_effect=[
+                "success",
+                # attempts 0..2: rule accepted, relay still lagging locked.
+                {"type": "keep_unlock", "ended_time": None}, self._relay("lock"),
+                {"type": "keep_unlock", "ended_time": None}, self._relay("lock"),
+                {"type": "keep_unlock", "ended_time": None}, self._relay("lock"),
+                # attempt 3 (~1.75s): relay finally settles unlocked.
+                {"type": "keep_unlock", "ended_time": None}, self._relay("unlock"),
+            ]
+        )
+
+        with patch("access_control.access_client.asyncio.sleep", new=AsyncMock()):
+            result = await client.hold_unlocked("hub-1", location_id="door-1")
+
+        self.assertEqual(result, {"type": "keep_unlock", "state": "unlocked"})
+
+    async def test_lock_now_confirms_when_relay_reports_late(self) -> None:
+        """(i)/(ii) lock_now: firmware self-clears the rule to `reset` and the
+        relay only reports locked on the 4th read. `reset` is accepted as the
+        documented post-execution state, and the late relay read confirms."""
+        client = AccessClient(
+            "unvr.local", "service", "secret", api_token="token"
+        )
+        client._open_api_request = AsyncMock(
+            side_effect=[
+                "success",
+                {"type": "reset", "ended_time": None}, self._relay("unlock"),
+                {"type": "reset", "ended_time": None}, self._relay("unlock"),
+                {"type": "reset", "ended_time": None}, self._relay("unlock"),
+                {"type": "reset", "ended_time": None}, self._relay("lock"),
+            ]
+        )
+
+        with patch("access_control.access_client.asyncio.sleep", new=AsyncMock()):
+            result = await client.force_lock("hub-1", location_id="door-1")
+
+        self.assertEqual(result, {"type": "reset", "state": "locked"})
+
+    async def test_lock_now_reset_with_locked_relay_confirms_immediately(
+        self,
+    ) -> None:
+        """(ii) lock_now + observed rule=reset + relay=lock on the first read is
+        a confirmed success (momentary self-clear is not a rejection)."""
+        client = AccessClient(
+            "unvr.local", "service", "secret", api_token="token"
+        )
+        client._open_api_request = AsyncMock(
+            side_effect=[
+                "success",
+                {"type": "reset", "ended_time": None},
+                self._relay("lock"),
+            ]
+        )
+
+        with patch("access_control.access_client.asyncio.sleep", new=AsyncMock()):
+            result = await client.force_lock("hub-1", location_id="door-1")
+
+        self.assertEqual(result, {"type": "reset", "state": "locked"})
+        self.assertEqual(client._open_api_request.await_count, 3)
+
+    async def test_lock_now_reset_relay_never_settles_fails_closed(self) -> None:
+        """(iii) rule=reset but the relay never reads locked → the command
+        stays unconfirmed and raises fail-closed, with the distinct
+        rule-accepted/relay-stale message."""
+        client = AccessClient(
+            "unvr.local", "service", "secret", api_token="token"
+        )
+        client._open_api_request = AsyncMock(
+            side_effect=[
+                "success",
+                *sum(
+                    (
+                        [{"type": "reset", "ended_time": None}, self._relay("unlock")]
+                        for _ in range(6)
+                    ),
+                    [],
+                ),
+            ]
+        )
+
+        with patch("access_control.access_client.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaisesRegex(
+                AccessClientError, "relay did not report locked"
+            ):
+                await client.force_lock("hub-1", location_id="door-1")
+
+        # write + 6 * (rule + relay) reads.
+        self.assertEqual(client._open_api_request.await_count, 13)
+
+    async def test_missing_relay_state_mid_window_is_retried(self) -> None:
+        """(iv) a relay read that returns no usable state mid-window is retried,
+        not treated as a failure; a later good read confirms."""
+        client = AccessClient(
+            "unvr.local", "service", "secret", api_token="token"
+        )
+        client._open_api_request = AsyncMock(
+            side_effect=[
+                "success",
+                # attempt 0: relay reports no state yet (mid-actuation).
+                {"type": "keep_unlock", "ended_time": None}, self._relay(None),
+                # attempt 1: relay settles unlocked.
+                {"type": "keep_unlock", "ended_time": None}, self._relay("unlock"),
+            ]
+        )
+
+        with patch("access_control.access_client.asyncio.sleep", new=AsyncMock()):
+            result = await client.hold_unlocked("hub-1", location_id="door-1")
+
+        self.assertEqual(result, {"type": "keep_unlock", "state": "unlocked"})
+        self.assertEqual(client._open_api_request.await_count, 5)
+
+    async def test_keep_unlock_stale_relay_reports_distinct_error(self) -> None:
+        """The keep_unlock rule echoes but the relay stays locked for the whole
+        window → a distinct 'rule accepted but relay did not report unlocked'
+        error rather than the generic not-confirmed message."""
+        client = AccessClient(
+            "unvr.local", "service", "secret", api_token="token"
+        )
+        client._open_api_request = AsyncMock(
+            side_effect=[
+                "success",
+                *sum(
+                    (
+                        [{"type": "keep_unlock", "ended_time": None}, self._relay("lock")]
+                        for _ in range(6)
+                    ),
+                    [],
+                ),
+            ]
+        )
+
+        with patch("access_control.access_client.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaisesRegex(
+                AccessClientError, "relay did not report unlocked"
+            ):
+                await client.hold_unlocked("hub-1", location_id="door-1")
 
     async def test_official_malformed_or_failed_envelope_is_rejected(self) -> None:
         for payload in (

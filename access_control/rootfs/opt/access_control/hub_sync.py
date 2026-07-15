@@ -88,8 +88,17 @@ _FLAP_SUSPEND = 600.0
 
 _HA_CONFIRM_ATTEMPTS = 3
 _HA_CONFIRM_DELAY = 0.25
-_ACCESS_OBSERVE_ATTEMPTS = 3
-_ACCESS_OBSERVE_DELAY = 0.15
+# Access relay observation runs on a bounded progressive window (~5s total),
+# matching the access_client confirm window. Current Access firmware can echo a
+# freshly written rule while the relay reports the previous state for several
+# seconds, and a momentary lock_now transiently returns no relay state at all.
+# A short fixed loop classified that normal actuation latency as an
+# inconsistent/unreadable side and latched locked-wins. Reads at
+# t≈0,0.25,0.75,1.75,3.25,5.25s; a missing/invalid read mid-window is retried,
+# and only the final read is classified. This path runs under the poll lock,
+# not the physical-command barrier, so it never blocks a door command.
+_ACCESS_OBSERVE_DELAYS = (0.25, 0.5, 1.0, 1.5, 2.0)
+_ACCESS_OBSERVE_WINDOW = round(sum(_ACCESS_OBSERVE_DELAYS), 1)
 
 _ACCESS_OPEN_RULES = {"schedule", "keep_unlock", "custom"}
 _ACCESS_CLOSED_RULES = {
@@ -238,6 +247,18 @@ class HubSyncManager:
     def lockdown_unresolved(self) -> tuple[str, ...]:
         """Entity ids whose hubs are not yet confirmed reset in lockdown."""
         return tuple(sorted(self._lockdown_unresolved))
+
+    @property
+    def fail_safe_pending(self) -> tuple[str, ...]:
+        """Entity ids currently held by the locked-wins fail-safe latch.
+
+        A non-empty tuple means bidirectional sync is forcing that pair locked
+        (reverting any unlock) until both sides are confirmed/observed locked.
+        Surfaced in ``/api/health`` so a stuck latch is visible rather than
+        silently reverting unlocks. Matches ``lockdown_unresolved`` scope
+        handling: it already exposes entity IDs to every health scope.
+        """
+        return tuple(sorted(self._fail_safe_reset_eids))
 
     @staticmethod
     def is_access_state_event(event_type: str) -> bool:
@@ -834,6 +855,37 @@ class HubSyncManager:
         )
 
     @staticmethod
+    async def _invoke_access_command(
+        command: Callable[..., Awaitable[Any]],
+        device_id: str,
+        location_id: str | None,
+        on_written: Callable[[], None],
+    ) -> Any:
+        """Call an Access lock command, passing ``on_written`` when supported.
+
+        The production client accepts an ``on_written`` hook so the caller can
+        release the physical-command barrier after the write and before the
+        multi-second relay confirm. Lightweight test doubles and older injected
+        clients may not; those are called without it (the barrier is then simply
+        released when the whole command returns, which is harmless because they
+        do not perform a long confirm).
+        """
+        supports = False
+        try:
+            # Require an *explicit* ``on_written`` parameter. A bare
+            # ``AsyncMock`` reports ``(*args, **kwargs)``; a restrictive
+            # side_effect behind it would then reject the unexpected kwarg, so a
+            # generic VAR_KEYWORD is deliberately not treated as support.
+            supports = "on_written" in inspect.signature(command).parameters
+        except (TypeError, ValueError):
+            supports = False
+        if supports:
+            return await command(
+                device_id, location_id=location_id, on_written=on_written
+            )
+        return await command(device_id, location_id=location_id)
+
+    @staticmethod
     def _access_available(access: Any) -> bool:
         if access is None:
             return False
@@ -1114,7 +1166,9 @@ class HubSyncManager:
             raise RuntimeError("Access client lacks lock-rule readback")
         device_id = hub["device_id"]
         location_id = hub.get("location_id")
-        for attempt in range(_ACCESS_OBSERVE_ATTEMPTS):
+        attempts = len(_ACCESS_OBSERVE_DELAYS) + 1
+        for attempt in range(attempts):
+            final = attempt + 1 >= attempts
             rule_result, door_state = await asyncio.gather(
                 get_rule(device_id, location_id=location_id),
                 get_state(device_id, location_id=location_id),
@@ -1128,15 +1182,21 @@ class HubSyncManager:
                 raise ValueError(f"unknown Access lock-rule type {rule_type!r}")
             if door_state not in {"locked", "unlocked"}:
                 raise ValueError(f"unknown Access door state {door_state!r}")
-            # Access can publish its new schedule/hold rule just before the
-            # relay catches up. Give that normal transition a bounded chance
-            # to settle before classifying it as inconsistent.
+            # Access can publish its new schedule/hold rule several seconds
+            # before the relay catches up (observed on current firmware after a
+            # keep_unlock mirror). Give that normal actuation latency the full
+            # progressive window to settle before classifying it inconsistent.
+            # A genuinely unreadable/invalid read (rule or relay) still raises
+            # immediately above and latches locked-wins on this same pass:
+            # retrying a down hub for the whole window would stall the poll loop
+            # ~5s per hub, and the momentary lock_now `reset`/no-relay case is
+            # confirmed authoritatively on the command path, not here.
             if (
                 rule_type in _ACCESS_OPEN_RULES
                 and door_state == "locked"
-                and attempt + 1 < _ACCESS_OBSERVE_ATTEMPTS
+                and not final
             ):
-                await asyncio.sleep(_ACCESS_OBSERVE_DELAY)
+                await asyncio.sleep(_ACCESS_OBSERVE_DELAYS[attempt])
                 continue
             break
 
@@ -1348,6 +1408,17 @@ class HubSyncManager:
                 self._access_momentary_until.pop(eid, None)
                 valid_ha = False  # expired lease falls into locked-wins
 
+        # Captured from the observation alone, before any drive mutates the
+        # working copies below. Used for observation-driven fail-safe release:
+        # when the latch is set but both sides are independently observed
+        # locked, the incident's goal (converge locked) is visibly achieved.
+        observed_both_locked = bool(
+            valid_ha
+            and valid_access
+            and ha_state == "locked"
+            and access_state == "locked"
+        )
+
         previous_ha = self._last_ha_observed.get(eid)
         previous_access = self._last_access_observed.get(eid)
         previous_rule = self._last_access_rule.get(eid)
@@ -1510,6 +1581,34 @@ class HubSyncManager:
                     else None
                 ),
             ):
+                # Observation-driven fail-safe release (1.5.12 wedge fix). When
+                # both sides were independently observed locked this pass, no
+                # drive was needed to converge — the only write was the cosmetic
+                # keep_lock→lock_now release, whose confirm can fail forever on
+                # firmware that self-clears lock_now to `reset`. The incident's
+                # goal (both sides locked) is already met, so release the latch
+                # on the observation rather than leaving it wedged, reverting
+                # every future unlock indefinitely. Durable keep_lock ownership
+                # stays queued for a later confirmed lock_now; the door remains
+                # safely locked. Only fires when release_fail_safe_override was
+                # the reason we drove (both observed locked); a real failed lock
+                # toward a not-yet-locked side keeps the latch (fail-closed).
+                if (
+                    release_fail_safe_override
+                    and observed_both_locked
+                    and eid in self._fail_safe_reset_eids
+                ):
+                    self._last_ha_observed[eid] = "locked"
+                    self._last_access_observed[eid] = "locked"
+                    self._last_access_rule[eid] = access_rule
+                    self._release_fail_safe_latch(eid)
+                    _LOGGER.info(
+                        "Hub sync: fail-safe latch for %s released on "
+                        "observation — both sides locked though the keep_lock "
+                        "release did not confirm",
+                        eid,
+                    )
+                    return 0
                 # HA may already have moved. Keep the desired baseline absent so
                 # the next pass retries rather than treating this partial apply
                 # as a new external HA change.
@@ -1554,14 +1653,13 @@ class HubSyncManager:
 
         self._pairing_signature[eid] = self._hub_signature(hubs)
         self._paired_hubs[eid] = [dict(hub) for hub in hubs]
-        if desired == "locked":
-            self._fail_safe_reset_eids.discard(eid)
-        # A confirmed convergence clears any prior unsafe-direction backoff so
-        # the next genuine change is not needlessly deferred (legacy parity),
-        # and re-arms hard-rejection tracking + loud logging for a new incident.
-        self._backoff_until.pop(eid, None)
-        self._failure_notified.discard(eid)
-        self._clear_incident_signatures(eid)
+        # A confirmed convergence releases the fail-safe latch (when locked) and
+        # clears any prior unsafe-direction backoff so the next genuine change
+        # is not needlessly deferred (legacy parity), re-arming hard-rejection
+        # tracking + loud logging for a new incident. The latch is only ever set
+        # while desired is forced locked, so this shares one helper with the
+        # observation-driven release to keep the bookkeeping consistent.
+        self._release_fail_safe_latch(eid)
 
         # Opt-in: a genuine HA-origin unlock (thumb-turn / HA automation) on a
         # synced lock becomes time-bounded. This runs only after the edge is
@@ -2241,6 +2339,20 @@ class HubSyncManager:
         self._drive_log_signature.pop(eid, None)
         self._observe_log_signature.pop(eid, None)
 
+    def _release_fail_safe_latch(self, eid: str) -> None:
+        """Release the locked-wins fail-safe latch and its incident bookkeeping.
+
+        Shared by the confirmed-convergence path and the observation-driven
+        release so both discard the same latch, unsafe-direction backoff,
+        one-shot failure notification, and hard-rejection/log-once signatures.
+        The latch is only set while ``desired`` is forced locked, so discarding
+        it on an unlocked convergence is a harmless no-op.
+        """
+        self._fail_safe_reset_eids.discard(eid)
+        self._backoff_until.pop(eid, None)
+        self._failure_notified.discard(eid)
+        self._clear_incident_signatures(eid)
+
     @staticmethod
     def _hard_rejection_signature(exc: BaseException) -> str | None:
         """Return a stable bucket when ``exc`` is a permanent hard rejection.
@@ -2375,11 +2487,26 @@ class HubSyncManager:
         for attempt in range(1, max_attempts + 1):
             if self._urgent_lockdown.is_set() and not enforcing_lockdown:
                 return False
+            barrier_released = False
+
+            def _release_barrier() -> None:
+                # Release the global command barrier exactly once, after the
+                # physical *write* is accepted and before the multi-second
+                # relay confirm. Threaded into the Access command as
+                # ``on_written`` so the ordered write stays serialized while the
+                # idempotent readback GETs do not (mirrors the HA re-lock path).
+                nonlocal barrier_released
+                if not barrier_released:
+                    barrier_released = True
+                    self._command_lock.release()
+
             try:
-                # Hold the global barrier for exactly one physical request.
-                # Retry sleeps and SQLite bookkeeping remain outside it, so a
-                # degraded hub cannot stall every unrelated door for 30+s.
-                async with self._command_lock:
+                # Hold the global barrier for exactly one physical *write*.
+                # Retry sleeps, SQLite bookkeeping, and the extended relay
+                # confirm all run outside it, so a degraded or slow-to-actuate
+                # hub cannot stall every unrelated door for the confirm window.
+                await self._command_lock.acquire()
+                try:
                     if self._urgent_lockdown.is_set() and not enforcing_lockdown:
                         return False
                     if state == "unlocked" and self._in_lockdown():
@@ -2416,8 +2543,11 @@ class HubSyncManager:
                         if state == "unlocked":
                             command = self._method(access, "hold_unlocked")
                             if command is not None:
-                                confirmation = await command(
-                                    device_id, location_id=location_id
+                                confirmation = await self._invoke_access_command(
+                                    command,
+                                    device_id,
+                                    location_id,
+                                    _release_barrier,
                                 )
                             else:
                                 confirmation = await access.unlock_persistent(
@@ -2426,8 +2556,11 @@ class HubSyncManager:
                         elif force_transient:
                             command = self._method(access, "force_lock")
                             if command is not None:
-                                confirmation = await command(
-                                    device_id, location_id=location_id
+                                confirmation = await self._invoke_access_command(
+                                    command,
+                                    device_id,
+                                    location_id,
+                                    _release_barrier,
                                 )
                             else:
                                 confirmation = await access.lock(device_id)
@@ -2438,32 +2571,44 @@ class HubSyncManager:
                             if command is None:
                                 command = self._method(access, "force_lock")
                             if command is not None:
-                                confirmation = await command(
-                                    device_id, location_id=location_id
+                                confirmation = await self._invoke_access_command(
+                                    command,
+                                    device_id,
+                                    location_id,
+                                    _release_barrier,
                                 )
                             else:
                                 confirmation = await access.lock(device_id)
                         elif restore_native:
                             command = self._method(access, "restore_native_rule")
                             if command is not None:
-                                confirmation = await command(
-                                    device_id, location_id=location_id
+                                confirmation = await self._invoke_access_command(
+                                    command,
+                                    device_id,
+                                    location_id,
+                                    _release_barrier,
                                 )
                             else:
                                 confirmation = await access.lock(device_id)
                         elif enforcing_lockdown or fail_safe:
                             command = self._method(access, "hold_locked")
                             if command is not None:
-                                confirmation = await command(
-                                    device_id, location_id=location_id
+                                confirmation = await self._invoke_access_command(
+                                    command,
+                                    device_id,
+                                    location_id,
+                                    _release_barrier,
                                 )
                             else:
                                 confirmation = await access.lock(device_id)
                         else:
                             command = self._method(access, "force_lock")
                             if command is not None:
-                                confirmation = await command(
-                                    device_id, location_id=location_id
+                                confirmation = await self._invoke_access_command(
+                                    command,
+                                    device_id,
+                                    location_id,
+                                    _release_barrier,
                                 )
                             else:
                                 confirmation = await access.lock(device_id)
@@ -2473,6 +2618,8 @@ class HubSyncManager:
                             if confirmed_state in {"locked", "unlocked"}:
                                 return str(confirmed_state)
                         return state
+                finally:
+                    _release_barrier()
             except Exception as exc:
                 # Record whether this failure is a permanent hard rejection so
                 # the bidirectional reconcile can space (never stop) the locked

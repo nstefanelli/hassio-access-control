@@ -16,6 +16,43 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Ingress path resolution, the official Open API's empty rule type for idle
   doors, and CSRF-protected sign-out.
 
+## [1.5.12] - 2026-07-14
+
+### Fixed
+
+- A bidirectionally synced lock could get stuck re-locking itself after every
+  unlock on current UniFi Access firmware. That firmware reports the door relay
+  state several seconds after it accepts a rule write, and it self-clears a
+  momentary `lock_now` to `reset` while the relay is still actuating. The
+  previous confirmation window was shorter than a second, so a normal unlock or
+  lock command frequently could not be confirmed in time. When the lock
+  direction failed to confirm, the locked-wins fail-safe latch never released —
+  even though both sides were in fact locked — and every subsequent unlock from
+  anyone was reverted within one poll (~5 s), indefinitely, until the add-on was
+  restarted. Three changes fix it: the Access rule-write confirmation and the
+  hub-sync relay observation now wait on a bounded progressive window (~5 s
+  total) instead of a fixed sub-second loop, so a slow-to-report relay is given
+  time to settle; the confirmation now understands that an observed `reset` rule
+  right after a momentary lock is the documented post-execution state and relies
+  on the relay reading locked for its positive evidence; and the fail-safe latch
+  now releases as soon as a poll independently observes both sides locked, so a
+  command whose confirmation keeps failing can no longer wedge the pair. An
+  unconfirmed command still fails closed, locked-wins conflict resolution is
+  unchanged, and lockdown enforcement is untouched. When a rule write is accepted
+  but the relay never reaches the expected state, the error now says so
+  explicitly ("rule accepted but relay did not report ... within Ns").
+- The physical-command barrier is now released before the extended Access relay
+  confirmation waits (as the Home Assistant re-lock path already did), so a
+  single slow-to-actuate hub cannot stall commands to unrelated doors for the
+  whole confirmation window.
+
+### Added
+
+- `GET /api/health` now reports `hub_sync_fail_safe`: the HA entity IDs whose
+  bidirectionally synced pair is currently held by the locked-wins fail-safe
+  latch. A non-empty list means unlocks on those locks are being reverted until
+  both sides confirm locked, so a stuck latch is visible instead of silent.
+
 ## [1.5.11] - 2026-07-13
 
 ### Fixed

@@ -46,10 +46,22 @@ SUPPORTED_DEVICE_TYPES = ("UA-Hub-Door-Mini", "UAH", "UA-ULTRA", "UVC G6 Pro Ent
 _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 # A successful PUT means only that Access accepted the request. Bound the
-# subsequent readback so a slow/offline controller cannot strand the global
-# physical-command barrier indefinitely.
-_LOCK_CONFIRM_ATTEMPTS = 3
-_LOCK_CONFIRM_DELAY = 0.25
+# subsequent readback so a slow/offline controller cannot strand the caller
+# indefinitely, but give a real relay time to actuate.
+#
+# Some Access firmware/hardware echoes the rule write immediately yet only
+# reports the new relay state several seconds later, and a momentary `lock_now`
+# self-clears its rule to `reset` mid-actuation. A fixed sub-second loop times
+# out before the relay settles and then falsely reports the command
+# unconfirmed. The confirm therefore reads on a bounded *progressive* window:
+# reads at t≈0, 0.25, 0.75, 1.75, 3.25, 5.25s (~5s total). A read that returns
+# no usable state mid-window is retried, not treated as a failure. The final
+# outcome on timeout is unchanged: an unconfirmed command still raises
+# (fail-closed). The barrier that orders physical commands is released before
+# these waits by the caller (see hub_sync `_drive_hub`), so the extended window
+# does not stall unrelated doors.
+_LOCK_CONFIRM_DELAYS = (0.25, 0.5, 1.0, 1.5, 2.0)
+_LOCK_CONFIRM_WINDOW = round(sum(_LOCK_CONFIRM_DELAYS), 1)
 
 _LOCK_RULE_TYPES = frozenset(
     {
@@ -1099,12 +1111,18 @@ class AccessClient:
         rejected_types: frozenset[str] = frozenset(),
         expected_state: str | None,
         must_change_from: dict[str, object] | None = None,
+        momentary_reset_ok: bool = False,
     ) -> dict[str, str]:
         last_error: AccessClientError | None = None
         last_rule: str | None = None
         last_state: str | None = None
+        # Track whether the rule ever satisfied acceptance so a timeout whose
+        # only remaining problem is a stale relay reads as a distinct, clearer
+        # failure than a rule that was never accepted at all.
+        rule_ever_matched = False
 
-        for attempt in range(_LOCK_CONFIRM_ATTEMPTS):
+        attempts = len(_LOCK_CONFIRM_DELAYS) + 1
+        for attempt in range(attempts):
             try:
                 rule = await self.get_lock_rule(
                     device_id,
@@ -1116,9 +1134,17 @@ class AccessClient:
                     if accepted_types is not None
                     else last_rule not in rejected_types
                 )
+                # A momentary `lock_now` is documented to self-clear to `reset`
+                # immediately after it executes on current Access firmware.
+                # Treat that observed `reset` as the post-execution state rather
+                # than a rejection — positive relay evidence (expected_state) is
+                # still required below before the command is called confirmed.
+                if momentary_reset_ok and last_rule == "reset":
+                    rule_matches = True
                 if must_change_from is not None and rule == must_change_from:
                     rule_matches = False
                 if rule_matches:
+                    rule_ever_matched = True
                     if self.open_api_configured:
                         last_state = await self.get_door_state(
                             device_id,
@@ -1129,17 +1155,36 @@ class AccessClient:
                     if expected_state is None or last_state == expected_state:
                         return {"type": last_rule, "state": last_state}
             except AccessClientError as exc:
+                # A missing/invalid read mid-window is normal actuation latency
+                # on this firmware; retain it and retry rather than failing now.
                 last_error = exc
 
-            if attempt + 1 < _LOCK_CONFIRM_ATTEMPTS:
-                await asyncio.sleep(_LOCK_CONFIRM_DELAY)
+            if attempt + 1 < attempts:
+                await asyncio.sleep(_LOCK_CONFIRM_DELAYS[attempt])
 
-        detail = ""
-        if last_rule is not None or last_state is not None:
-            detail = f" (observed rule={last_rule}, state={last_state})"
-        error = AccessClientError(
-            f"UniFi Access {requested_type} command was not confirmed{detail}"
-        )
+        # The rule was accepted (or is the documented post-lock_now `reset`) but
+        # the relay never reported the expected physical state within the
+        # window. That is a distinct, more actionable condition than a rule that
+        # was never accepted, so surface it explicitly.
+        if (
+            rule_ever_matched
+            and expected_state is not None
+            and last_state is not None
+            and last_state != expected_state
+        ):
+            error = AccessClientError(
+                f"UniFi Access {requested_type} rule accepted but relay did "
+                f"not report {expected_state} within "
+                f"{_LOCK_CONFIRM_WINDOW:g}s "
+                f"(observed rule={last_rule}, state={last_state})"
+            )
+        else:
+            detail = ""
+            if last_rule is not None or last_state is not None:
+                detail = f" (observed rule={last_rule}, state={last_state})"
+            error = AccessClientError(
+                f"UniFi Access {requested_type} command was not confirmed{detail}"
+            )
         if last_error is not None:
             raise error from last_error
         raise error
@@ -1154,7 +1199,15 @@ class AccessClient:
         rejected_types: frozenset[str] = frozenset(),
         expected_state: str | None,
         must_change_from: dict[str, object] | None = None,
+        momentary_reset_ok: bool = False,
+        on_written: Callable[[], None] | None = None,
     ) -> dict[str, str]:
+        # ``on_written`` is invoked exactly once, after Access has accepted the
+        # mutating write and before the (potentially multi-second) readback
+        # confirmation. Callers that hold the global physical-command barrier
+        # use it to release the barrier for the confirm waits — the write is
+        # ordered, the idempotent readback GETs are not — mirroring the HA
+        # re-lock/confirm path.
         if rule_type not in _LOCK_RULE_TYPES:
             raise AccessClientError("Unsupported UniFi Access lock rule")
 
@@ -1193,6 +1246,9 @@ class AccessClient:
                 raise
             self._validate_legacy_rule_write(payload, rule_type)
 
+        if on_written is not None:
+            on_written()
+
         return await self._confirm_rule_command(
             device_id,
             location_id,
@@ -1201,6 +1257,7 @@ class AccessClient:
             rejected_types=rejected_types,
             expected_state=expected_state,
             must_change_from=must_change_from,
+            momentary_reset_ok=momentary_reset_ok,
         )
 
     async def hold_unlocked(
@@ -1208,6 +1265,7 @@ class AccessClient:
         device_id: str,
         *,
         location_id: str | None = None,
+        on_written: Callable[[], None] | None = None,
     ) -> dict[str, str]:
         """Apply and confirm a persistent ``keep_unlock`` override."""
         result = await self._write_rule_and_confirm(
@@ -1216,6 +1274,7 @@ class AccessClient:
             rule_type="keep_unlock",
             accepted_types=frozenset({"keep_unlock"}),
             expected_state="unlocked",
+            on_written=on_written,
         )
         logger.info("Persistent unlock confirmed for device %s", device_id)
         return result
@@ -1225,6 +1284,7 @@ class AccessClient:
         device_id: str,
         *,
         location_id: str | None = None,
+        on_written: Callable[[], None] | None = None,
     ) -> dict[str, str]:
         """Apply and confirm a persistent ``keep_lock`` override."""
         result = await self._write_rule_and_confirm(
@@ -1233,6 +1293,7 @@ class AccessClient:
             rule_type="keep_lock",
             accepted_types=frozenset({"keep_lock"}),
             expected_state="locked",
+            on_written=on_written,
         )
         logger.info("Persistent lock confirmed for device %s", device_id)
         return result
@@ -1242,6 +1303,7 @@ class AccessClient:
         device_id: str,
         *,
         location_id: str | None = None,
+        on_written: Callable[[], None] | None = None,
     ) -> dict[str, str]:
         """Lock now, terminating an active schedule or temporary unlock."""
         result = await self._write_rule_and_confirm(
@@ -1250,9 +1312,14 @@ class AccessClient:
             rule_type="lock_now",
             # The official GET schema treats lock_now as an input operation;
             # firmware commonly reports the resulting override as lock_early
-            # or keep_lock. Private firmware may echo lock_now.
+            # or keep_lock. Private firmware may echo lock_now. Current firmware
+            # self-clears the momentary command to `reset` right after it fires;
+            # momentary_reset_ok accepts that documented post-execution rule but
+            # still demands the relay read back locked before success.
             accepted_types=_LOCKED_RULE_TYPES,
             expected_state="locked",
+            momentary_reset_ok=True,
+            on_written=on_written,
         )
         logger.info("Immediate lock confirmed for device %s", device_id)
         return result
@@ -1262,6 +1329,7 @@ class AccessClient:
         device_id: str,
         *,
         location_id: str | None = None,
+        on_written: Callable[[], None] | None = None,
     ) -> dict[str, str]:
         """Replace ``keep_lock`` with a schedule-safe immediate lock.
 
@@ -1282,6 +1350,12 @@ class AccessClient:
             accepted_types=_LOCKED_RULE_TYPES,
             expected_state="locked",
             must_change_from=must_change_from,
+            # Same momentary self-clear as force_lock: `reset` after the write
+            # is the post-execution state, not a stale keep_lock, so the
+            # must_change_from guard is still satisfied and the relay must read
+            # locked before success.
+            momentary_reset_ok=True,
+            on_written=on_written,
         )
         logger.info(
             "Persistent lock override released and immediate lock confirmed for %s",
@@ -1294,6 +1368,7 @@ class AccessClient:
         device_id: str,
         *,
         location_id: str | None = None,
+        on_written: Callable[[], None] | None = None,
     ) -> dict[str, str]:
         """Clear this app's temporary override and restore Access behavior."""
         previous = await self.get_lock_rule(
@@ -1316,6 +1391,7 @@ class AccessClient:
             rejected_types=frozenset({"keep_lock", "keep_unlock", "custom"}),
             expected_state=None,
             must_change_from=must_change_from,
+            on_written=on_written,
         )
         logger.info("Native lock rule restored for device %s", device_id)
         return result
@@ -1325,18 +1401,24 @@ class AccessClient:
         device_id: str,
         *,
         location_id: str | None = None,
+        on_written: Callable[[], None] | None = None,
     ) -> dict[str, str]:
         """Compatibility wrapper for :meth:`hold_unlocked`."""
-        return await self.hold_unlocked(device_id, location_id=location_id)
+        return await self.hold_unlocked(
+            device_id, location_id=location_id, on_written=on_written
+        )
 
     async def lock(
         self,
         device_id: str,
         *,
         location_id: str | None = None,
+        on_written: Callable[[], None] | None = None,
     ) -> dict[str, str]:
         """Compatibility wrapper for immediate locking, never rule reset."""
-        return await self.force_lock(device_id, location_id=location_id)
+        return await self.force_lock(
+            device_id, location_id=location_id, on_written=on_written
+        )
 
     async def unlock_momentary(self, location_id: str) -> None:
         """

@@ -99,6 +99,11 @@ async def health(request: Request, auth: dict = Depends(verify_api_key)):
             if getattr(app.state, "hub_sync_manager", None)
             else ()
         ),
+        "hub_sync_fail_safe": list(
+            getattr(app.state.hub_sync_manager, "fail_safe_pending", ())
+            if getattr(app.state, "hub_sync_manager", None)
+            else ()
+        ),
         "pending_relocks": pending_relocks,
     }
 

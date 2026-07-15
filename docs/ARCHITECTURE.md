@@ -110,7 +110,17 @@ retained only as tokenless compatibility mode. A configured token selects the
 official path exclusively: authentication, permission, transport, or schema
 failure never falls back to the private endpoint. Official responses require a
 strict `SUCCESS` envelope, and door mutations complete only after bounded rule
-and relay-state readback.
+and relay-state readback. Because current firmware can report the relay state
+several seconds after it accepts a rule write, that readback runs on a bounded
+progressive window (~5 s total) rather than a fixed sub-second loop; a read that
+returns no usable state mid-window is retried, and only a genuine timeout raises
+(fail-closed, unchanged). A momentary `lock_now` self-clears its rule to `reset`
+right after it executes, so the confirmation treats an observed `reset` after
+`lock_now` as the documented post-execution state and relies on the relay
+reading `locked` for its positive evidence — a rule echo alone is never success.
+When a write is accepted but the relay never reaches the expected state, the
+error distinguishes that ("rule accepted but relay did not report … within Ns")
+from a rule that was never accepted.
 
 Native actions map to distinct Access rules. `keep_unlock` is a persistent
 hold-open; `keep_lock` is a persistent fail-safe lock; `lock_now` terminates an
@@ -178,7 +188,18 @@ Lockdown enforcement always bypasses this damping and drives at full cadence.
 When the incident clears, reconciliation first confirms both HA and Access are
 locked, then replaces app-owned `keep_lock` with confirmed `lock_now`. This
 preserves the current closed interval without allowing the persistent fail-safe
-override to suppress future native schedules.
+override to suppress future native schedules. The locked-wins fail-safe latch
+(which forces the pair locked and reverts any unlock until it clears) is
+released through one shared helper on either of two conditions: a fully
+confirmed locked convergence, or — new in 1.5.12 — a poll that independently
+observes both sides validly locked even though the cosmetic `lock_now` release
+could not be confirmed. The latter prevents a permanent wedge on firmware whose
+momentary `lock_now` self-clears to `reset`: without it, a release whose confirm
+kept failing would revert every subsequent unlock indefinitely. The observation
+release requires both sides observed `locked`; any unknown, unreadable, or
+unlocked side keeps the latch (locked-wins is never weakened), and durable
+`keep_lock` ownership remains queued for a later confirmed `lock_now`. Latched
+entities are surfaced in `hub_sync_fail_safe` in authenticated health.
 
 Pairing resolution is snapshotted per convergence pass. When a mapping changes,
 removed hubs enter the confirmed-safe queue before the newly paired hub may be
@@ -210,10 +231,14 @@ One app-wide command barrier orders authorization/manual unlocks, HA re-locks,
 hub actuation, lockdown transitions, and live client swaps. Critical paths take
 the barrier before per-entity locks. This avoids deadlock and gives lockdown a
 clear completion guarantee: after enable returns, an older application command
-cannot issue later. Enabling lockdown also synchronously enforces a safe hub
-lock. If persistence or a required lock is unresolved, the API returns `503`, keeps the
-safer in-memory lockdown state, and reports unresolved entity IDs through
-`lockdown_enforcement_pending` in authenticated health.
+cannot issue later. The barrier is held for exactly one physical write and is
+released before the (now multi-second) relay-confirmation reads, mirroring the
+HA re-lock/confirm path, so a slow-to-actuate hub cannot stall commands to
+unrelated doors for the whole confirmation window. Enabling lockdown also
+synchronously enforces a safe hub lock. If persistence or a required lock is
+unresolved, the API returns `503`, keeps the safer in-memory lockdown state, and
+reports unresolved entity IDs through `lockdown_enforcement_pending` in
+authenticated health.
 
 Remote-unlock events are different from ordinary queued authorization work: the
 upstream event says the door has already opened. Their re-lock scheduling tasks
