@@ -18,6 +18,10 @@ For automation and monitoring:
   circuit-breaker, WebSocket, count, lockdown state, and unresolved hub-safety
   enforcement in `lockdown_enforcement_pending` (the field name is retained
   for API compatibility; enforcement now uses a safe locked override).
+  `hub_sync_fail_safe` lists any HA entity IDs whose bidirectionally synced pair
+  is currently held by the locked-wins fail-safe latch: while listed, unlocks on
+  that lock are reverted until both sides confirm locked, so a persistently
+  non-empty entry is a stuck sync that needs attention.
 - `GET /api/debug` requires `full` and reports reconnect counters, last-event
   ages, and live-versus-durable pending re-lock counts.
 
@@ -444,6 +448,26 @@ locked-direction hub drive is spaced onto a ~30 second retry cadence — it
 never stops retrying, only slows down; lockdown enforcement is never spaced
 and always drives at full cadence. The failure logs once at full volume, then
 at debug level until the condition clears.
+
+Second cause (slow relay confirmation, fixed in 1.5.12): some current UniFi
+Access firmware accepts a rule write immediately but only reports the door
+relay state several seconds later, and self-clears a momentary `lock_now` to
+`reset` while the relay is still actuating. Before 1.5.12 the confirmation
+window was under a second, so ordinary unlock/lock commands frequently could
+not be confirmed. A lock command that failed to confirm left the locked-wins
+fail-safe latch engaged even though both sides were in fact locked, and every
+subsequent unlock was reverted within one poll (~5 s) until the add-on was
+restarted. Symptoms differ from the endpoint-removed case: logs mention
+`... command was not confirmed (observed rule=reset ...)` or `rule accepted but
+relay did not report ... within Ns` rather than HTTP 404, and the affected HA
+entity appears in `hub_sync_fail_safe` in `GET /api/health`. The fix widened
+the rule-write confirmation and relay observation to a bounded progressive
+window (~5 s), taught the confirmation that a post-`lock_now` `reset` rule is
+the documented momentary state (with the relay reading providing the positive
+evidence), and made the fail-safe latch release as soon as a poll observes both
+sides locked. If you see a lock listed in `hub_sync_fail_safe` for more than a
+few minutes, confirm the console is reachable and current; a restart clears a
+latch immediately but the 1.5.12 changes stop it from re-wedging.
 
 ### Rate limit responses appear
 

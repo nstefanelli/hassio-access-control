@@ -1261,6 +1261,43 @@ class AccessApiTokenHealthTests(unittest.TestCase):
         self.assertEqual(
             response.json()["access_open_api_error"], "AccessClientError"
         )
+        # The fail-safe field is present (and empty) even without a live latch.
+        self.assertEqual(response.json()["hub_sync_fail_safe"], [])
+
+    def test_health_exposes_hub_sync_fail_safe_latch(self) -> None:
+        """1.5.12 (viii): a stuck locked-wins latch is visible in health so it
+        cannot silently revert unlocks unnoticed, matching the scope handling of
+        lockdown_enforcement_pending (entity IDs, all health scopes)."""
+        app = FastAPI()
+        app.include_router(api_routes.router)
+        app.state.db = SimpleNamespace(
+            get_user_count=AsyncMock(return_value=1),
+            get_lock_count=AsyncMock(return_value=2),
+        )
+        app.state.access_client = SimpleNamespace(
+            connected=True, ws_connected=True, open_api_configured=True
+        )
+        app.state.protect_client = None
+        app.state.ha_client = None
+        app.state.auth_engine = SimpleNamespace(lockdown=False)
+        app.state.hub_sync_manager = SimpleNamespace(
+            lockdown_unresolved=(),
+            fail_safe_pending=("lock.front", "lock.back"),
+        )
+        app.state.access_open_api_ready = True
+        app.state.access_open_api_error = None
+        app.dependency_overrides[api_routes.verify_api_key] = lambda: {
+            "scope": "read_only"
+        }
+
+        with TestClient(app) as client:
+            response = client.get("/api/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["hub_sync_fail_safe"],
+            ["lock.front", "lock.back"],
+        )
 
 
 class StartupSafetyWiringTests(unittest.IsolatedAsyncioTestCase):

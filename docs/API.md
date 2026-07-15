@@ -92,6 +92,7 @@ Returns a health snapshot. All three scopes are accepted.
   "lock_count": 3,
   "lockdown": false,
   "lockdown_enforcement_pending": [],
+  "hub_sync_fail_safe": [],
   "pending_relocks": {"total": 1, "overdue": 0}
 }
 ```
@@ -112,6 +113,7 @@ Returns a health snapshot. All three scopes are accepted.
 | `lock_count` | integer | Operable configured lock rows, including hidden rows but excluding upstream-missing native locks. |
 | `lockdown` | boolean | Current authorization-engine lockdown state. It normally matches persistence; on a failed transition the safer in-memory state can remain enabled while the request reports `503`. |
 | `lockdown_enforcement_pending` | array of strings | HA entity IDs whose synced Access hubs are not yet confirmed locked under the active lockdown. A non-empty list requires operator attention/retry. |
+| `hub_sync_fail_safe` | array of strings | HA entity IDs whose bidirectionally synced pair is currently held by the locked-wins fail-safe latch. While listed, the pair is forced locked and any unlock is reverted until both sides confirm/observe locked. A persistently non-empty entry points to an unconfirmed lock/unlock command or an unreadable Access side and warrants investigation. Entity IDs are exposed to every health scope, matching `lockdown_enforcement_pending`. |
 | `pending_relocks` | object | Durable re-lock intent counts: `total` rows and how many are `overdue` (past their deadline and still retrying). Counts only — entity IDs are deliberately omitted so the lowest-privilege scope stays safe. A non-zero `overdue` means a door the app promised to re-lock is not confirmed locked; see the Locks page badges and the `access_control_relock_failed` event. |
 
 Use `GET /health/live` for process liveness and this endpoint for component

@@ -2101,6 +2101,166 @@ class TestPersistentOverrideLifecycleRegressions(unittest.TestCase):
         _run(go())
 
 
+class TestFailSafeObservationRelease(unittest.TestCase):
+    """1.5.12 change 3: the locked-wins fail-safe latch is released when a poll
+    observes both sides locked, even if the cosmetic keep_lock→lock_now release
+    confirm fails forever (the ``reset`` self-clear wedge). It must NOT release
+    on a partial/invalid observation, and lockdown is on a separate path."""
+
+    def _fixture(self, *, ha_state="locked", rule="keep_lock", door_state="locked"):
+        ha_states = {"lock.front": ha_state}
+        access_rules = {"dev-hub-1": {"type": rule}}
+        access_states = {"dev-hub-1": door_state}
+        db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+        ha = _make_bidirectional_ha(ha_states)
+        access = _make_bidirectional_access(access_rules, access_states)
+        mgr = _make_mgr(db, ha, access)
+        return mgr, ha, access, ha_states, access_rules, access_states
+
+    def test_wedge_release_on_observed_both_locked_then_unlock_mirrored(
+        self,
+    ) -> None:
+        """(v) THE WEDGE: latched entity whose lock_now release confirm fails
+        forever; a poll observing both sides locked releases the latch, and a
+        following HA-origin unlock is mirrored (not reverted)."""
+        async def go():
+            mgr, ha, access, ha_states, rules, access_states = self._fixture()
+            await mgr.poll_once()  # both-locked baseline; recovery complete
+
+            # The pair is latched closed and the app owns a durable keep_lock,
+            # but the lock_now release confirm fails forever on this firmware
+            # (rule self-clears to `reset` mid-actuation).
+            mgr._fail_safe_reset_eids.add("lock.front")
+            mgr._held_locked["lock.front"] = [
+                {
+                    "device_id": "dev-hub-1",
+                    "hub_lock_id": 1,
+                    "hub_location_id": "loc-1",
+                    "hub_name": "Front Door Hub",
+                }
+            ]
+
+            async def failing_release(device_id, location_id=None, on_written=None):
+                if on_written is not None:
+                    on_written()
+                raise AccessClientError(
+                    "lock_now command was not confirmed "
+                    "(observed rule=reset, state=None)"
+                )
+
+            access.release_persistent_lock = AsyncMock(side_effect=failing_release)
+
+            with patch(
+                "access_control.hub_sync.asyncio.sleep", new=AsyncMock()
+            ):
+                await mgr.poll_once()
+
+            # The cosmetic release drive was attempted and permanently failed,
+            # yet the latch is released on the both-locked observation so it can
+            # no longer revert unlocks indefinitely.
+            self.assertGreaterEqual(
+                access.release_persistent_lock.await_count, 1
+            )
+            self.assertNotIn("lock.front", mgr._fail_safe_reset_eids)
+
+            # A following genuine HA-origin unlock is now mirrored, not reverted.
+            ha_states["lock.front"] = "unlocked"
+            _clear_damping(mgr)
+            with patch(
+                "access_control.hub_sync.asyncio.sleep", new=AsyncMock()
+            ):
+                self.assertEqual(await mgr.poll_once(), 1)
+            access.hold_unlocked.assert_awaited_once_with(
+                "dev-hub-1", location_id="loc-1"
+            )
+            self.assertEqual(ha_states["lock.front"], "unlocked")
+        _run(go())
+
+    def test_latch_not_released_when_a_side_is_not_locked(self) -> None:
+        """(vi) A partial observation (Access still unlocked) must keep the
+        latch even when the fail-safe lock drive fails; only both-sides-locked
+        releases it."""
+        async def go():
+            mgr, ha, access, ha_states, rules, access_states = self._fixture(
+                ha_state="locked", rule="keep_unlock", door_state="unlocked"
+            )
+            # Non-fresh baseline so the mismatch is source-classified, then latch.
+            mgr._last_ha_observed["lock.front"] = "locked"
+            mgr._last_access_observed["lock.front"] = "locked"
+            mgr._last_access_rule["lock.front"] = "prev-locked"
+            mgr._fail_safe_reset_eids.add("lock.front")
+
+            async def failing_lock(device_id, location_id=None, on_written=None):
+                raise AccessClientError("keep_lock was not confirmed")
+
+            access.hold_locked = AsyncMock(side_effect=failing_lock)
+
+            with patch(
+                "access_control.hub_sync.asyncio.sleep", new=AsyncMock()
+            ):
+                await mgr.poll_once()
+
+            # Access was observed unlocked (partial), so the latch is retained.
+            self.assertIn("lock.front", mgr._fail_safe_reset_eids)
+        _run(go())
+
+    def test_latch_not_released_when_access_is_unreadable(self) -> None:
+        """(vi) An unreadable Access side (observation invalid → None) keeps the
+        latch even though HA reads locked."""
+        async def go():
+            mgr, ha, access, ha_states, rules, access_states = self._fixture()
+            await mgr.poll_once()
+            mgr._fail_safe_reset_eids.add("lock.front")
+            # Unknown rule → _observe_access_hub raises → access side is None.
+            rules["dev-hub-1"] = {"type": "future_unknown_rule"}
+
+            async def failing_lock(device_id, location_id=None, on_written=None):
+                raise AccessClientError("keep_lock was not confirmed")
+
+            access.hold_locked = AsyncMock(side_effect=failing_lock)
+
+            with patch(
+                "access_control.hub_sync.asyncio.sleep", new=AsyncMock()
+            ):
+                await mgr.poll_once()
+
+            self.assertIn("lock.front", mgr._fail_safe_reset_eids)
+        _run(go())
+
+    def test_lockdown_enforcement_unaffected(self) -> None:
+        """(vii) Lockdown enforcement drives keep_lock through its own branch,
+        unaffected by the extended confirm window or the fail-safe release
+        path (it converges and does not use rule restore)."""
+        async def go():
+            mgr, ha, access, ha_states, rules, access_states = self._fixture(
+                ha_state="unlocked", rule="schedule", door_state="unlocked"
+            )
+            mgr._lockdown_getter = lambda: True
+
+            with patch(
+                "access_control.hub_sync.asyncio.sleep", new=AsyncMock()
+            ):
+                self.assertEqual(await mgr.poll_once(), 1)
+
+            access.hold_locked.assert_awaited_once_with(
+                "dev-hub-1", location_id="loc-1"
+            )
+            access.restore_native_rule.assert_not_awaited()
+            self.assertEqual(access_states["dev-hub-1"], "locked")
+
+    def test_fail_safe_pending_property_reflects_latched_entities(self) -> None:
+        """(viii) The health property exposes latched entity IDs (sorted),
+        matching lockdown_unresolved's scope handling."""
+        async def go():
+            mgr, *_ = self._fixture()
+            self.assertEqual(mgr.fail_safe_pending, ())
+            mgr._fail_safe_reset_eids.update({"lock.back", "lock.front"})
+            self.assertEqual(
+                mgr.fail_safe_pending, ("lock.back", "lock.front")
+            )
+        _run(go())
+
+
 class TestRelockOnHaOrigin(unittest.TestCase):
     """Change 4: opt-in relock_on_ha_origin time-bounds a genuine external
     (thumb-turn / HA-automation) unlock, while excluding every app-initiated
