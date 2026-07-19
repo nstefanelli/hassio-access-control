@@ -98,10 +98,14 @@ _HA_CONFIRM_DELAY = 0.25
 # A short fixed loop classified that normal actuation latency as an
 # inconsistent/unreadable side and latched locked-wins. Reads at
 # t≈0,0.25,0.75,1.75,3.25,5.25s; a missing/invalid read mid-window is retried,
-# and only the final read is classified. This path runs under the poll lock,
-# not the physical-command barrier, so it never blocks a door command.
+# and only the final read is classified. Settling observations run under the
+# poll lock, never the physical-command barrier: the one observation taken
+# while the barrier is held (the write-ahead freshness guard) uses a single
+# non-settling read bounded by _GUARD_OBSERVE_TIMEOUT and fails safe on
+# ambiguity, so it cannot stall unrelated door commands.
 _ACCESS_OBSERVE_DELAYS = (0.25, 0.5, 1.0, 1.5, 2.0)
 _ACCESS_OBSERVE_WINDOW = round(sum(_ACCESS_OBSERVE_DELAYS), 1)
+_GUARD_OBSERVE_TIMEOUT = 6.0
 
 _ACCESS_OPEN_RULES = {"schedule", "keep_unlock", "custom"}
 _ACCESS_CLOSED_RULES = {
@@ -1214,16 +1218,21 @@ class HubSyncManager:
             return False
 
     async def _observe_access_hub(
-        self, access: Any, hub: dict
+        self, access: Any, hub: dict, *, settle: bool = True
     ) -> tuple[str | None, dict, bool, str | None]:
-        """Return effective intent plus separate authoritative relay state."""
+        """Return effective intent plus separate authoritative relay state.
+
+        ``settle=False`` takes a single read without the progressive
+        relay-lag window; callers holding the physical-command barrier must
+        use it so actuation latency on one hub cannot stall other doors.
+        """
         get_rule = self._method(access, "get_lock_rule")
         get_state = self._method(access, "get_door_state")
         if get_rule is None or get_state is None:
             raise RuntimeError("Access client lacks lock-rule readback")
         device_id = hub["device_id"]
         location_id = hub.get("location_id")
-        attempts = len(_ACCESS_OBSERVE_DELAYS) + 1
+        attempts = (len(_ACCESS_OBSERVE_DELAYS) + 1) if settle else 1
         for attempt in range(attempts):
             final = attempt + 1 >= attempts
             rule_result, door_state = await asyncio.gather(
@@ -1994,9 +2003,16 @@ class HubSyncManager:
                 ):
                     return False
                 try:
-                    current_state, current_rule, _active, _relay_state = (
-                        await self._observe_access_hub(access, hub_row)
-                    )
+                    # This guard runs with the global physical-command barrier
+                    # held: one bounded non-settling read, and any ambiguity
+                    # suppresses the unlock (fail-safe) rather than stalling
+                    # every other door behind the relay-lag window.
+                    async with asyncio.timeout(_GUARD_OBSERVE_TIMEOUT):
+                        current_state, current_rule, _active, _relay_state = (
+                            await self._observe_access_hub(
+                                access, hub_row, settle=False
+                            )
+                        )
                 except Exception:
                     return False
                 current = {

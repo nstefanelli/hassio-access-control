@@ -740,10 +740,17 @@ async def execute_lock_action(
             raise cancellation
         result = finish("error", reason="Upstream lock command failed")
     finally:
-        await release_barrier()
-        await ha_lease_stack.aclose()
-        if entity_lock_acquired:
-            entity_lock.release()
+        # Each cleanup step must run even if an earlier awaited step is
+        # cancelled: a skipped entity_lock.release() would wedge every future
+        # command and pending re-lock for this door.
+        try:
+            await release_barrier()
+        finally:
+            try:
+                await ha_lease_stack.aclose()
+            finally:
+                if entity_lock_acquired:
+                    entity_lock.release()
 
     assert result is not None
     await _audit_result(db, result, actor=actor, source=source)
