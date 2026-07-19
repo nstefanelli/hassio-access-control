@@ -55,9 +55,17 @@ def _reload_access_control_modules():
         "access_control.web_routes",
         "access_control.main",
     ]
+    # Only database.py captures DATA_DIR at import and main.py owns the app
+    # singleton that must be rebuilt around that database. Reloading client and
+    # policy modules creates new exception classes while already-collected test
+    # modules retain the old identities, making results depend on file order.
+    reload_names = {
+        "access_control.database",
+        "access_control.main",
+    }
     loaded = {}
     for name in module_names:
-        if name in sys.modules:
+        if name in reload_names and name in sys.modules:
             loaded[name] = importlib.reload(sys.modules[name])
         else:
             loaded[name] = importlib.import_module(name)
@@ -355,6 +363,48 @@ class EventDispatchTests(unittest.TestCase):
             hub.mark_access_momentary.assert_called_once_with("lock.front", 20.0)
             rm.extend_after_success.assert_awaited_once_with(intent, 20.0)
             rm.retain_after_uncertain_unlock.assert_not_awaited()
+        self._run_in_lifespan(body)
+
+    def test_unconfirmed_remote_ha_mirror_marks_cache_unknown(self) -> None:
+        async def body(app):
+            app.state.event_topology_ready = True
+            engine = _make_engine_mock()
+            engine.lockdown = False
+            engine.get_locks_for_location = AsyncMock(return_value=[{
+                "id": 8,
+                "type": "ha_external",
+                "entity_id": "lock.side",
+                "name": "Side Door",
+                "relock_on_remote": 1,
+                "relock_duration": 20,
+                "sync_hub_state": 1,
+            }])
+            app.state.auth_engine = engine
+
+            intent = MagicMock()
+            rm = MagicMock()
+            rm.schedule = AsyncMock(return_value=intent)
+            rm.extend_after_success = AsyncMock()
+            rm.retain_after_uncertain_unlock = AsyncMock()
+            app.state.relock_manager = rm
+
+            ha = MagicMock()
+            ha.connected = True
+            ha.unlock = AsyncMock(return_value=True)
+            ha.get_entity_state = AsyncMock(return_value="locked")
+            app.state.ha_client = ha
+            app.state.lock_states["lock.side"] = "locked"
+            app.state.hub_sync_manager = MagicMock()
+
+            app.state.on_access_event({
+                "event": "remote_unlock",
+                "data": {"location_id": "door-side-unconfirmed"},
+            })
+            await asyncio.sleep(1)
+
+            self.assertEqual(app.state.lock_states["lock.side"], "unknown")
+            rm.retain_after_uncertain_unlock.assert_awaited_once_with(intent)
+            rm.extend_after_success.assert_not_awaited()
         self._run_in_lifespan(body)
 
     def test_empty_user_snapshot_keeps_topology_fail_closed(self) -> None:

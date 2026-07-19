@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 
 import aiohttp
 
@@ -34,6 +35,15 @@ class HAClient:
         self._connected = False
         self._last_error: str | None = None
         self._circuit: CircuitBreaker = CircuitBreaker("ha_client")
+        # Physical workflows release the app-wide write barrier before exact
+        # state readback. A Settings swap may close this client in that window,
+        # so close drains leased write+confirmation operations and retired
+        # clients can never recreate an HTTP session.
+        self._lifecycle = asyncio.Condition()
+        self._active_operations = 0
+        self._closing = False
+        self._closed = False
+        self._close_task: asyncio.Task | None = None
 
     @property
     def connected(self) -> bool:
@@ -49,8 +59,25 @@ class HAClient:
         return self._circuit.state
 
     async def _ensure_session(self) -> None:
+        if self._closed:
+            raise HAClientError("Home Assistant client is closed")
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
+
+    @asynccontextmanager
+    async def operation_lease(self):
+        """Keep this exact client alive through a write and its readback."""
+        async with self._lifecycle:
+            if self._closing or self._closed:
+                raise HAClientError("Home Assistant client is closing")
+            self._active_operations += 1
+        try:
+            yield
+        finally:
+            async with self._lifecycle:
+                self._active_operations -= 1
+                if self._active_operations == 0:
+                    self._lifecycle.notify_all()
 
     def _headers(self) -> dict[str, str]:
         # Resolve the token env-first on EVERY call. Supervisor rotates
@@ -78,6 +105,11 @@ class HAClient:
                 headers=self._headers(),
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
+                # The health probe is an authenticated HA request too. A
+                # successful transport response must close a circuit opened by
+                # earlier service/state failures before the health loop runs
+                # relock recovery and state seeding.
+                self._circuit.record_success()
                 if resp.status == 200:
                     self._connected = True
                     self._last_error = None
@@ -90,6 +122,7 @@ class HAClient:
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             self._connected = False
             self._last_error = str(err)
+            self._circuit.record_failure()
             return False
 
     async def check_health(self) -> dict:
@@ -366,8 +399,50 @@ class HAClient:
         finally:
             self._circuit.abort_probe()
 
-    async def close(self) -> None:
+    async def _close_impl(self) -> None:
+        async with self._lifecycle:
+            if self._closed:
+                return
+            self._closing = True
+            while self._active_operations:
+                await self._lifecycle.wait()
+            self._closed = True
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
         self._connected = False
+
+    async def close(self) -> None:
+        """Retire the client completely even if the caller is cancelled."""
+        async with self._lifecycle:
+            task = self._close_task
+            if task is None:
+                task = asyncio.create_task(
+                    self._close_impl(),
+                    name="ha-client-close",
+                )
+                self._close_task = task
+
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                # Closing a client owns sockets and may be waiting for an
+                # accepted write's readback lease. Finish that cleanup before
+                # propagating request/lifespan cancellation.
+                cancellation = exc
+        task.result()
+        if cancellation is not None:
+            raise cancellation
+
+
+@asynccontextmanager
+async def ha_client_operation(client):
+    """Lease a real HAClient while remaining compatible with test doubles."""
+    lease = getattr(client, "operation_lease", None)
+    if callable(lease):
+        async with lease():
+            yield
+        return
+    yield

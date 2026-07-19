@@ -155,6 +155,175 @@ class DatabaseRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.db.get_ui_cache("expired", now=20.0))
         self.assertFalse(any("UI_CACHE" in statement.upper() for statement in statements))
 
+    async def test_access_rule_business_key_is_idempotent_under_concurrency(
+        self,
+    ) -> None:
+        user_id = await self.db.upsert_user(
+            "rule-person", "Rule Person", None, "ACTIVE"
+        )
+        lock_id = await self.db.add_external_lock(
+            "lock.rule_target", "Rule Target", None
+        )
+
+        rule_ids = await asyncio.gather(
+            *(self.db.add_rule(user_id, lock_id) for _ in range(20))
+        )
+
+        self.assertEqual(len(set(rule_ids)), 1)
+        await self.db.close()
+        self.db = Database(path=self.path)
+        await self.db.connect()
+        async with self.db._db.execute(
+            """SELECT COUNT(*) FROM access_rules
+               WHERE user_id = ? AND lock_id = ?""",
+            (user_id, lock_id),
+        ) as cursor:
+            self.assertEqual((await cursor.fetchone())[0], 1)
+
+    async def test_concurrent_rule_toggle_and_schedule_update_do_not_lose_policy(
+        self,
+    ) -> None:
+        user_id = await self.db.upsert_user(
+            "atomic-rule-person", "Atomic Rule Person", None, "ACTIVE"
+        )
+        lock_id = await self.db.add_external_lock(
+            "lock.atomic_rule", "Atomic Rule", None
+        )
+        rule_id = await self.db.add_rule(user_id, lock_id, enabled=True)
+
+        toggle, schedule = await asyncio.gather(
+            self.db.toggle_rule_enabled(rule_id),
+            self.db.update_rule_schedule(
+                rule_id,
+                schedule_enabled=True,
+                schedule_days="mon,fri",
+                schedule_start="08:00",
+                schedule_end="17:00",
+            ),
+        )
+
+        self.assertEqual(toggle["enabled"], 0)
+        self.assertEqual(schedule["user_id"], user_id)
+        row = await self.db.get_rule(rule_id)
+        self.assertEqual(row["enabled"], 0)
+        self.assertEqual(row["schedule_enabled"], 1)
+        self.assertEqual(row["schedule_days"], "mon,fri")
+        self.assertEqual(row["schedule_start"], "08:00")
+        self.assertEqual(row["schedule_end"], "17:00")
+
+    async def test_protect_usage_tracks_durable_doorbell_mappings(self) -> None:
+        self.assertFalse(await self.db.is_protect_in_use())
+        lock_id = await self.db.add_external_lock(
+            "lock.protect_entry", "Protect Entry", None
+        )
+        await self.db.add_entry_device(
+            lock_id,
+            "access_reader",
+            "Access Reader",
+            device_id="reader-1",
+        )
+        self.assertFalse(await self.db.is_protect_in_use())
+        await self.db.add_entry_device(
+            lock_id,
+            "protect_doorbell",
+            "Protect Doorbell",
+            device_id="camera-1",
+        )
+        self.assertTrue(await self.db.is_protect_in_use())
+
+    async def test_conflicting_legacy_duplicate_rules_migrate_fail_closed(
+        self,
+    ) -> None:
+        user_id = await self.db.upsert_user(
+            "legacy-rule-person", "Legacy Rule Person", None, "ACTIVE"
+        )
+        lock_id = await self.db.add_external_lock(
+            "lock.legacy_rule", "Legacy Rule", None
+        )
+        survivor_id = await self.db.add_rule(
+            user_id,
+            lock_id,
+            enabled=True,
+            schedule_enabled=True,
+            schedule_days="mon",
+            schedule_start="08:00",
+            schedule_end="09:00",
+        )
+        await self.db._db.execute("DROP INDEX idx_access_rules_user_lock")
+        await self.db._db.execute(
+            """INSERT INTO access_rules
+                   (user_id, lock_id, enabled, schedule_enabled,
+                    schedule_days, schedule_start, schedule_end)
+               VALUES (?, ?, 1, 1, 'tue', '18:00', '19:00')""",
+            (user_id, lock_id),
+        )
+        await self.db.close()
+
+        self.db = Database(path=self.path)
+        await self.db.connect()
+
+        async with self.db._db.execute(
+            """SELECT * FROM access_rules
+               WHERE user_id = ? AND lock_id = ?""",
+            (user_id, lock_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], survivor_id)
+        self.assertEqual(rows[0]["enabled"], 0)
+        self.assertEqual(rows[0]["schedule_enabled"], 0)
+        self.assertIsNone(rows[0]["schedule_days"])
+        with self.assertRaises(sqlite3.IntegrityError):
+            await self.db._db.execute(
+                "INSERT INTO access_rules (user_id, lock_id) VALUES (?, ?)",
+                (user_id, lock_id),
+            )
+
+    async def test_identical_legacy_duplicate_rules_preserve_oldest_policy(
+        self,
+    ) -> None:
+        user_id = await self.db.upsert_user(
+            "identical-rule-person", "Identical Rule Person", None, "ACTIVE"
+        )
+        lock_id = await self.db.add_external_lock(
+            "lock.identical_rule", "Identical Rule", None
+        )
+        survivor_id = await self.db.add_rule(
+            user_id,
+            lock_id,
+            enabled=True,
+            schedule_enabled=True,
+            schedule_days="mon,tue",
+            schedule_start="08:00",
+            schedule_end="17:00",
+        )
+        await self.db._db.execute("DROP INDEX idx_access_rules_user_lock")
+        await self.db._db.execute(
+            """INSERT INTO access_rules
+                   (user_id, lock_id, enabled, schedule_enabled,
+                    schedule_days, schedule_start, schedule_end)
+               VALUES (?, ?, 1, 1, 'mon,tue', '08:00', '17:00')""",
+            (user_id, lock_id),
+        )
+        await self.db.close()
+
+        self.db = Database(path=self.path)
+        await self.db.connect()
+
+        async with self.db._db.execute(
+            """SELECT * FROM access_rules
+               WHERE user_id = ? AND lock_id = ?""",
+            (user_id, lock_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], survivor_id)
+        self.assertEqual(rows[0]["enabled"], 1)
+        self.assertEqual(rows[0]["schedule_enabled"], 1)
+        self.assertEqual(rows[0]["schedule_days"], "mon,tue")
+        self.assertEqual(rows[0]["schedule_start"], "08:00")
+        self.assertEqual(rows[0]["schedule_end"], "17:00")
+
     async def test_legacy_hub_sync_hold_migrates_location_and_override_type(
         self,
     ) -> None:

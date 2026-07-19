@@ -59,7 +59,7 @@ The setup form is available only while the database has no configured admin.
 It is rate limited and cannot be replayed after setup completes.
 
 1. Open the sidebar panel as an HA administrator. In direct mode, choose a
-   separate local dashboard username and password.
+   separate local dashboard username and a password of at least 12 characters.
 2. Enter the primary UNVR/Protect host and credentials. If Access runs on a
    different console, complete all three optional Access host/user/password
    fields; otherwise leave all three blank. Setup tests the primary login,
@@ -148,12 +148,14 @@ database value at runtime and must be protected like a password.
 Without a token, compatibility mode continues to use the historical private
 console-session API. It uses hub device IDs rather than official door/location
 IDs and accepts only known response shapes. `keep_unlock`, `keep_lock`, and
-`lock_now` can be confirmed when the firmware exposes their rule values, but
-some versions cannot expose an unambiguous relay state after `reset`. The app
-reports such work as unconfirmed rather than guessing. Do not rely on native
-schedule synchronization or claim authoritative physical confirmation from a
-tokenless deployment until it has been tested against that exact Access
-version and hardware.
+`lock_now` rule intent can be recognized when the firmware exposes those rule
+values, but a rule echo is not authoritative relay confirmation and cannot
+acknowledge a physical-safety condition. Some versions also cannot expose an
+unambiguous rule or relay state after `reset`. Operator-facing physical command
+results are therefore reported unconfirmed without official relay readback
+rather than guessed. Do not rely on native schedule synchronization or claim
+authoritative physical confirmation from a tokenless deployment until it has
+been tested against that exact Access version and hardware.
 
 ## Secret-key mode
 
@@ -172,10 +174,12 @@ ciphertext unreadable.
 ### Environment-key mode (advanced)
 
 If `ACCESS_CONTROL_SECRET_KEY` is present during first-run setup, the key is
-not stored in the database. The database stores only the source marker and a
-SHA-256 fingerprint. Every later start requires the exact same environment
-value. A missing or mismatched value stops initialization with an explicit
-error; the app does not guess or fall back.
+not stored in the database and must contain at least 32 characters. The
+database stores only the source marker and a salted, versioned PBKDF2 verifier.
+Every later start requires the exact same environment value. A missing or
+mismatched value stops initialization with an explicit error; the app does not
+guess or fall back. Existing raw-SHA verifiers are upgraded after the key
+matches successfully, without rotating the key.
 
 Environment-key mode is intended for a custom/standalone deployment capable of
 injecting secrets. It is not an option in the supplied Supervisor schema.
@@ -332,6 +336,10 @@ Groups provide positive access grants and alarm behavior:
 
 An active group grants a covered lock. An enabled individual rule is a fallback
 grant when no group covers that lock; it does not revoke a group grant.
+The database enforces one individual rule per user/lock pair. On upgrade,
+identical legacy duplicates collapse to the oldest row; conflicting duplicates
+collapse to a disabled, unscheduled row so an administrator must review and
+re-enable the intended policy.
 
 Alarm blocking is deny-first across group memberships. A scheduled, currently
 active `can_disarm` group can override a block only when that group is not also

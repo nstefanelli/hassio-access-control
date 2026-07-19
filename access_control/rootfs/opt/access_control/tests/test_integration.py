@@ -49,9 +49,17 @@ def _reload_access_control_modules():
         "access_control.web_routes",
         "access_control.main",
     ]
+    # Database captures DATA_DIR and main owns the app singleton; only those
+    # modules require rebuilding per temporary integration environment.
+    # Reloading the clients/policy layer would replace exception-class
+    # identities under already-collected tests and make suite order observable.
+    reload_names = {
+        "access_control.database",
+        "access_control.main",
+    }
     loaded = {}
     for name in module_names:
-        if name in sys.modules:
+        if name in reload_names and name in sys.modules:
             loaded[name] = importlib.reload(sys.modules[name])
         else:
             loaded[name] = importlib.import_module(name)

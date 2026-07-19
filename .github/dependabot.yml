@@ -18,7 +18,7 @@ updates:
         patterns:
           - "*"
 
-  # ----- Docker base image (build-args BUILD_FROM) -----
+  # ----- Docker base image -----
   - package-ecosystem: docker
     directory: /access_control
     schedule:
@@ -30,9 +30,7 @@ updates:
     labels:
       - dependencies
       - docker
-    # Dependabot will track the ARG BUILD_FROM default; the actual
-    # multi-arch values are in build.yaml — those need to be bumped
-    # by hand alongside any Dependabot PR.
+    # Dependabot tracks the generic multi-architecture Dockerfile base.
 
   # ----- Python runtime dependencies -----
   - package-ecosystem: pip

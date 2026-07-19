@@ -16,8 +16,9 @@ canonical, versioned guide set starts at the
    supplies the HA URL/token and the form hides long-lived-token fields.
 4. Create a token under **Access → Settings → General → Advanced → API Token**
    with `view:space` and `edit:space`, and enter it during setup or later under
-   Settings. It enables the official local API's schedule-aware commands and
-   authoritative state readback.
+   Settings. It enables the official local API's schedule-aware commands,
+   momentary-grant confirmation, and authoritative relay readback for
+   fail-safe/lockdown decisions.
 5. Add HA-external locks on **Locks**, associate each with the correct Access
    reader/location or Protect doorbell, and verify manual state reads.
 6. Create groups, assign locks and members, then verify schedules/alarm flags
@@ -44,6 +45,12 @@ supplies Access only when the candidate is the same verified site. A different
 Access site requires a fresh initialization so its site-scoped user and door
 IDs cannot inherit existing grants. This is not a TLS certificate pin: UniFi
 TLS peers remain unverified and require a trusted management network.
+
+Protect does not currently persist an equivalent console/site namespace
+binding. Treat a Protect host, DNS/proxy target, or credential change as manual
+re-enrollment, and review every camera/doorbell mapping before allowing those
+events to drive policy. A successful Protect login alone does not prove it is
+the previously mapped site.
 
 ## Authentication and HA connection
 
@@ -100,8 +107,16 @@ Native dashboard actions have distinct rule semantics:
   can be unlocked immediately.
 
 Official-API writes require a strict success response and bounded follow-up
-rule/relay reads. A transport success alone is not logged as a completed door
-state change.
+rule/relay reads. Native momentary buzz uses the private mutation for
+compatibility, then requires official relay `unlocked` readback. If Access
+accepts a native command but readback cannot prove the result, the app records
+`accepted_unconfirmed`, publishes native cache `unknown`, and suppresses
+grant-only HA events and alarm auto-disarm. The command may already be active,
+so inspect Access and the physical opening before retrying.
+
+HA confirmation means the HA entity reported the requested state. Official
+Access confirmation means the controller reported its relay state. Neither is
+an independent door contact, latch, jam, or mechanical-bolt sensor.
 
 Application unlocks, re-locks, hub commands, and lockdown changes share a
 physical-command barrier. Once enabling lockdown completes, an application
@@ -135,33 +150,36 @@ on Access, an Access-only change wins on HA, equal simultaneous changes are
 accepted, and opposing/simultaneous or unreadable changes resolve locked.
 Every commanded side is read back before convergence is persisted.
 
-For bidirectional sync, the app normally records the persistent override type
-and hub/door/location identity before sending `keep_unlock` or `keep_lock`. A
-failed write blocks `keep_unlock`; during active lockdown, the app still
-attempts the safer `keep_lock`, leaves enforcement unresolved, and retries the
-ownership write. After an uncertain restart, either recorded override is first
-replaced with confirmed `keep_lock`; once the incident is over and both sides
-are confirmed locked, `lock_now` replaces it so future native schedules remain
-eligible. An unconfirmed replacement stays queued and observable. On clean
-non-lockdown shutdown, owned overrides and applicable unlocked baselines return
-to native Access ownership; during lockdown, managed ownership remains
-`keep_lock`. Pairing changes close removed hubs before opening replacements. If
-independent HA entities resolve to one physical hub, every
-involved pairing is locked and suppressed with `reason=shared_hub_conflict`
-until the mapping is one-to-one. Backoff and flap damping bound repeated
-commands.
+For bidirectional sync, the app records persistent override type plus
+hub/door/location identity before `keep_unlock` or `keep_lock`. A failed
+ownership write blocks opening; during lockdown the app still attempts the
+safer `keep_lock`, leaves enforcement unresolved, and retries persistence.
+After an uncertain restart, either recorded override is first driven toward
+`keep_lock`. An unconfirmed replacement stays durable and observable.
 
-Complete bidirectional behavior should be operated with the official Access
-API token. Tokenless compatibility mode can parse known private rule shapes,
-but some firmware cannot report an unambiguous physical state after returning
-to native behavior; that limitation is surfaced as an unconfirmed operation.
-This feature makes both HA and Access state part of the physical-door path and
-is off by default.
+Releasing the fail-safe latch requires HA `locked` and every paired hub's raw
+official-API relay `locked`. Lockdown acknowledgement requires `keep_lock` plus
+those relay observations and, when the HA command path is available, HA
+`locked`; during an HA outage the Access relay is the fail-safe boundary. A
+private rule-derived state—even after a successful `keep_lock`—is insufficient.
+When the incident ends, confirmed `lock_now` replaces the owned `keep_lock` so
+future schedules remain eligible. Clean non-lockdown shutdown restores owned
+overrides and applicable unlocked baselines to Access-native ownership;
+lockdown retains `keep_lock`. Pairing changes close removed hubs before opening
+replacements, and shared physical hubs are locked/suppressed until ownership is
+one-to-one.
+
+The official Access token is therefore required for authoritative latch release
+and lockdown acknowledgement. Tokenless compatibility can still parse known
+private rules for conservative convergence, but it remains unresolved rather
+than claiming physical confirmation. This feature is off by default.
 
 ## Groups, alarms, and schedules
 
 An active group grants all or selected locks. An individual rule is a fallback
-grant when no group covers that lock; it is not a deny override.
+grant when no group covers that user/lock pair; it is not a deny override.
+Upgrades collapse identical legacy duplicates to the oldest row and disable
+conflicting duplicates for administrator review.
 
 Group alarm flags can block armed-home/armed-away access or permit auto-disarm.
 Unknown, mixed, triggered, night-armed, pending, and transitional alarm states
@@ -183,11 +201,17 @@ submitted PIN later, so retain it securely if the visitor needs it.
 
 - Dashboard home: connection state, alarms, lockdown, recent activity, locks.
 - `GET /health/live`: unauthenticated process liveness only.
-- `GET /api/health`: authenticated Access/Protect/HA/component state.
+- `GET /api/health`: authenticated Access/Protect/HA/component state with
+  aggregate `ok`, `degraded`, or `critical`.
 - `GET /api/debug`: full-scope reconnect, event-age, circuit, and pending
   re-lock diagnostics.
 - HA events: `access_control_relock_failed` and
   `access_control_hub_sync_failed` are alert-worthy.
+
+Inspect the component fields as well as the aggregate. The current aggregate
+uses `protect_in_use` to distinguish optional Access-only deployments from
+configured Protect doorbell paths. A Protect disconnect is `degraded` only
+when at least one entry-device mapping depends on Protect events.
 
 API keys are created under Settings and shown once. The API has monitoring,
 reporting, diagnostics, confirmed lock/unlock/follow-schedule operations, local
@@ -212,6 +236,12 @@ in the previous five minutes. In direct-host mode, the manual control and its
 available; otherwise Settings explains that restart is unavailable. The
 watchdog's liveness URL checks only the web process, not upstream health.
 
+The manifest permits 60 seconds for shutdown, and the hub-sync and re-lock
+managers each have a 15-second bound. The complete teardown does not have one
+aggregate application deadline, so Supervisor can still force-stop if a later
+event drain, client close, or SQLite close stalls. After an abnormal stop,
+verify durable re-lock and hub-ownership recovery.
+
 Before updating, read the
 [changelog](https://github.com/nstefanelli/hassio-access-control/blob/main/access_control/CHANGELOG.md)
 and create a verified backup.
@@ -223,6 +253,11 @@ database uses SQLite WAL while running; never `cp` only the live
 `access_control.db` file. Outside Supervisor, either stop the app before
 copying a closed database or use SQLite's online `.backup` command, then run
 `PRAGMA integrity_check` on the copy.
+
+Supervisor uses a cold backup for this app, so event intake, re-lock
+actuation, sync/lockdown retries, and health are unavailable until restart.
+Avoid backups during timed unlocks or incidents; after restart, verify health,
+pending re-locks, lockdown enforcement, and affected physical doors.
 
 Treat the database and backups as secrets. In environment-key mode, the exact
 `ACCESS_CONTROL_SECRET_KEY` is not stored in the database and must be backed up
@@ -250,8 +285,10 @@ Repeated WebSocket authentication failures stop rather than replay forever.
 the token is not expired, and it has `view:space` plus `edit:space`. Saving a
 token performs read-only doors/rule validation. A configured token error never
 falls back to compatibility mode; replace or explicitly clear it. Clearing the
-token removes authoritative official-API confirmation, so re-test native Lock,
-Unlock, Follow Schedule, and every bidirectionally synced pair.
+token removes authoritative official-API confirmation, so native momentary
+buzz becomes accepted-unconfirmed and fail-safe/lockdown acknowledgement
+remains unresolved. Re-test native Buzz, Lock, Unlock, Follow Schedule, and
+every bidirectionally synced pair.
 
 **Access site identity mismatch:** the proposed host authenticated as a
 different Access namespace, or UniFi did not expose enough stable identity data
@@ -259,6 +296,10 @@ to verify the persisted binding. Restore the same site/endpoint or reinitialize
 deliberately with a fresh database for a different site; do not copy the old
 grants into the new namespace. Any TLS certificate fingerprint observed
 internally by the client is diagnostic only and is not the site binding.
+
+**Protect endpoint changed:** Protect has no persisted site binding. Verify the
+intended console and manually review every Protect device mapping before
+re-enabling Protect-origin policy.
 
 **Unexpected denial:** inspect the Activity reason, user status, device mapping,
 group/individual grant, schedule and HA timezone, all alarm block flags, and
@@ -268,9 +309,10 @@ conservatively.
 **Hub sync not moving:** confirm the lock is visible, HA-external, opted in,
 mapped to a location with a native hub, and reports exactly `locked` or
 `unlocked`. Confirm the Access API token and port `12445` before relying on
-schedule synchronization. Unknown/unavailable state, Access readback failure,
-HA loss, or simultaneous disagreement resolves locked instead of being
-ignored. Check logs/failure events for
+schedule synchronization, fail-safe-latch release, or lockdown
+acknowledgement. Unknown/unavailable state, private rule-only evidence, Access
+readback failure, HA loss, or simultaneous disagreement resolves locked instead
+of being ignored. Check logs/failure events for
 `no_paired_hub`, `shared_hub_conflict`, backoff, or flapping.
 
 For full recovery steps and a bug-report checklist, use the

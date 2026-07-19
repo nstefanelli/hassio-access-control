@@ -129,13 +129,21 @@ The first setup permanently selects one mode:
   values from casual plaintext inspection but not from an attacker who obtains
   the whole database.
 - **Environment-key mode:** `ACCESS_CONTROL_SECRET_KEY` is supplied during
-  first setup, is not stored in SQLite, and must match a stored fingerprint on
-  every start. Database and external key must be backed up separately.
+  first setup, is not stored in SQLite, and must match a salted, versioned
+  PBKDF2 verifier on every start. New keys require at least 32 characters;
+  matching legacy raw-SHA verifiers migrate without rotating the key. Database
+  and external key must be backed up separately.
 
 A database-mode installation ignores an environment key added later. An
 environment-mode installation refuses to start with a missing/mismatched key.
 This avoids silent decryption under the wrong key. There is no supported
 in-place mode switch or automatic key rotation.
+
+New direct-mode setup requires a 12-character administrator password, and new
+environment-key setup requires a 32-character key. Those are minimums, not
+entropy guarantees. Existing matching environment keys remain usable for
+compatibility; rotate a known-weak legacy key through a deliberate
+backup/re-enrollment procedure rather than editing verifier metadata.
 
 Environment variables can also override decrypted upstream credentials at
 runtime, but the stored database must remain structurally complete and
@@ -165,6 +173,15 @@ Only same-site Access host or single/split-console changes are supported in
 place. A different site requires fresh initialization and a policy/mapping
 review so reused upstream IDs cannot inherit grants, visitor records, or hub
 ownership from the old site.
+
+Protect does not currently have an equivalent persisted namespace binding.
+Its configured endpoint and account remain trusted, and a successful Protect
+login does not prove that the session belongs to the previously mapped site.
+Treat a Protect host, DNS/proxy target, or credential change as a manual
+re-enrollment and review all camera/doorbell mappings. A future binding must be
+based on a verified stable authenticated Protect identity across supported
+firmware; inventing a field from one response shape would create false
+assurance.
 
 ## UniFi TLS trade-off
 
@@ -214,6 +231,14 @@ boundaries:
 - official Access rule writes require strict success envelopes and bounded
   rule/relay readback; a configured-token failure cannot fall back to a less
   authoritative private endpoint;
+- a native momentary unlock is a private compatibility mutation followed by
+  official Open API relay confirmation; acceptance without observed
+  `unlocked` is audited as accepted-unconfirmed, publishes cache `unknown`, and
+  cannot trigger grant-only HA events or alarm auto-disarm;
+- persistent native `keep_unlock`, `lock_now`, or `reset` acceptance without
+  confirming readback is also surfaced as accepted-unconfirmed. The app does
+  not guess state or blindly roll the mutation back: an accepted override or
+  resumed schedule may already be active, so operator inspection is required;
 - native Lock uses `lock_now`, not `reset`; Follow Schedule alone uses `reset`
   and is documented as potentially reopening during an active native schedule;
 - HA or Access states other than a confirmed `locked`/`unlocked` never drive
@@ -233,6 +258,12 @@ boundaries:
   schedule with an unlocked relay can establish an unlocked startup baseline;
 - lockdown uses `keep_lock` to close a hub previously held open by sync rather
   than `reset`, which could reactivate a schedule;
+- releasing the locked-wins fail-safe latch requires HA `locked` plus every
+  paired hub's raw official-API relay `locked`. Lockdown acknowledgement
+  requires `keep_lock` plus those raw relay observations and, when the HA
+  command path is available, HA `locked`; during an HA outage the Access relay
+  is the fail-safe boundary. A private rule-derived state, including a
+  successful `keep_lock`, is not independent physical evidence;
 - after an incident, durable `keep_lock` ownership is cleared only after a
   distinct `lock_now` replacement and locked rule/relay confirmation, so a
   crash cannot silently suppress future schedules;
@@ -255,6 +286,19 @@ boundaries:
   retire every native door; valid disappearance retires a native lock from
   operation without deleting its row/history and later reappearance revives it;
 - duplicate Access/Protect reports are suppressed before issuing a command.
+
+These confirmations have distinct meanings. HA confirms the state of its
+entity; Access confirms the controller's electrical relay state. The app does
+not independently observe a door contact, latch engagement, mechanical bolt,
+jam, wiring fault, or a person/obstruction in the opening. “Confirmed locked”
+in application output must not be interpreted as certified physical closure.
+
+Supervisor cold backup stops the process to protect WAL consistency. During
+that interval none of these software safeguards can receive an event, actuate
+a due re-lock, retry lockdown/sync, or serve health. Manager shutdown work is
+bounded, but the entire teardown is not yet controlled by one aggregate
+application deadline; Supervisor can force-stop after the manifest's 60-second
+timeout.
 
 These properties reduce risk but do not turn the app into a certified life-
 safety or access-control system. Egress, fire-code behavior, fail-safe/fail-
@@ -295,11 +339,13 @@ needed by the HA base image/s6 overlay and limits network families to IPv4/IPv6
 TCP/UDP plus bind capability. It does not claim fine-grained filesystem
 isolation inside the container. Container and host boundaries remain important.
 
-Runtime and development Python dependencies are pinned and audited in CI.
-GitHub Actions are pinned by commit SHA. CI runs tests, Bandit, `pip-audit`,
-shell/YAML/Dockerfile linting, and both supported architecture builds. Release
-image version tags move only during a version bump; ordinary builds use an
-immutable commit-derived tag.
+Direct runtime and development Python dependencies are version-pinned and
+audited in CI. GitHub Actions are pinned by commit SHA. CI runs tests, Bandit,
+`pip-audit`, shell/YAML/Dockerfile linting, and both supported architecture
+builds. Release image version tags move only during a version bump; ordinary
+builds use an immutable commit-derived tag. Transitive Python artifacts are not
+currently hash-locked, and the Home Assistant base image is version-tagged
+rather than digest-pinned.
 
 Container images are not currently signed (`cosign: false` in CI). Consumers
 rely on GHCR/GitHub repository controls and the published tag/commit metadata.

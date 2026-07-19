@@ -1,6 +1,6 @@
 ---
 name: Access Control
-version: "1.5.12"
+version: "1.6.0"
 slug: access_control
 description: >-
   Unified access control bridging UniFi Access + Protect with Home Assistant
@@ -14,6 +14,12 @@ arch:
 init: false
 startup: services
 boot: auto
+# SQLite runs in WAL mode and owns safety-critical relock/lockdown state.
+# Supervisor must stop the process cleanly before copying /data.
+backup: cold
+# Allow bounded event/hub cleanup to finish before Supervisor force-kills the
+# container. The application separately caps upstream shutdown work.
+timeout: 60
 hassio_role: default
 hassio_api: true
 homeassistant_api: true

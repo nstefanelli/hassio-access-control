@@ -87,7 +87,6 @@ Build the image from the app directory:
 ```bash
 cd access_control
 docker build \
-  --build-arg BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.21 \
   --build-arg BUILD_ARCH=amd64 \
   --build-arg BUILD_VERSION=dev \
   -t access-control:dev .
@@ -161,7 +160,7 @@ Pull requests and pushes to `main` run:
 2. A reproducible pinned frontend rebuild, failing if committed CSS has drifted.
 3. The Python test suite on 3.12.
 4. Bandit, failing on medium-or-higher severity and confidence.
-5. `pip-audit` for both runtime and development lock files.
+5. `pip-audit` for both exact direct-dependency requirement files.
 6. Native `amd64` and `aarch64` image builds when app/shared build inputs
    changed.
 7. An aggregation job that fails if any required architecture failed.

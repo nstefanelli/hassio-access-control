@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -13,6 +14,7 @@ from .lock_actions import LockActionResult, execute_lock_action
 from .web_routes import _DAY_NAMES, _schedule_validation_error
 
 router = APIRouter(prefix="/api")
+_LOGGER = logging.getLogger(__name__)
 
 
 class LockModeUpdate(BaseModel):
@@ -47,6 +49,28 @@ def _require_scope(auth: dict, *allowed: str) -> None:
         )
 
 
+def _api_audit_actor(auth: dict) -> str:
+    """Return a stable key identity without retaining the Bearer secret."""
+    return (
+        f"api:{auth.get('name') or 'unnamed-key'}"
+        f"#{auth.get('key_id', 'unknown')}"
+    )
+
+
+async def _audit_best_effort(
+    db, actor: str, action: str, target: str, detail: str
+) -> None:
+    """Record API audit context without obscuring the mutation outcome."""
+    try:
+        await db.log_admin_action(actor, action, target, detail)
+    except Exception:
+        _LOGGER.exception(
+            "Failed to persist API audit action=%s target=%s",
+            action,
+            target,
+        )
+
+
 @router.get("/health")
 async def health(request: Request, auth: dict = Depends(verify_api_key)):
     """System health status."""
@@ -73,37 +97,71 @@ async def health(request: Request, auth: dict = Depends(verify_api_key)):
         "total": len(relock_status),
         "overdue": sum(1 for overdue in relock_status.values() if overdue),
     }
+    lockdown_pending = list(
+        getattr(app.state.hub_sync_manager, "lockdown_unresolved", ())
+        if getattr(app.state, "hub_sync_manager", None)
+        else ()
+    )
+    fail_safe_pending = list(
+        getattr(app.state.hub_sync_manager, "fail_safe_pending", ())
+        if getattr(app.state, "hub_sync_manager", None)
+        else ()
+    )
+    access_connected = bool(access and access.connected)
+    protect_connected = bool(
+        app.state.protect_client and app.state.protect_client.connected
+    )
+    protect_usage_check = getattr(db, "is_protect_in_use", None)
+    protect_in_use = bool(
+        await protect_usage_check()
+        if callable(protect_usage_check)
+        else False
+    )
+    ha_connected = bool(ha and ha.connected)
+    websocket_connected = bool(access and access.ws_connected)
+    open_api_configured = bool(
+        access and getattr(access, "open_api_configured", False)
+    )
+    open_api_ready = bool(
+        getattr(app.state, "access_open_api_ready", False)
+    )
+    circuit_state = ha.circuit_state if ha else "closed"
+    critical = bool(
+        pending_relocks["overdue"]
+        or lockdown_pending
+        or fail_safe_pending
+    )
+    degraded = bool(
+        not access_connected
+        or (protect_in_use and not protect_connected)
+        or not ha_connected
+        or not websocket_connected
+        or circuit_state != "closed"
+        or (open_api_configured and not open_api_ready)
+    )
+    aggregate_status = (
+        "critical" if critical else "degraded" if degraded else "ok"
+    )
 
     return {
-        "status": "ok",
-        "unvr_connected": access.connected if access else False,
-        "access_open_api_configured": bool(
-            access and getattr(access, "open_api_configured", False)
-        ),
-        "access_open_api_ready": bool(
-            getattr(app.state, "access_open_api_ready", False)
-        ),
+        "status": aggregate_status,
+        "unvr_connected": access_connected,
+        "access_open_api_configured": open_api_configured,
+        "access_open_api_ready": open_api_ready,
         "access_open_api_error": getattr(
             app.state, "access_open_api_error", None
         ),
-        "protect_connected": app.state.protect_client.connected if app.state.protect_client else False,
-        "ha_connected": ha.connected if ha else False,
+        "protect_connected": protect_connected,
+        "protect_in_use": protect_in_use,
+        "ha_connected": ha_connected,
         "ha_last_error": ha.last_error if ha else None,
-        "ha_circuit_state": ha.circuit_state if ha else "closed",
-        "websocket_connected": access.ws_connected if access else False,
+        "ha_circuit_state": circuit_state,
+        "websocket_connected": websocket_connected,
         "user_count": user_count,
         "lock_count": lock_count,
         "lockdown": app.state.auth_engine.lockdown if app.state.auth_engine else False,
-        "lockdown_enforcement_pending": list(
-            getattr(app.state.hub_sync_manager, "lockdown_unresolved", ())
-            if getattr(app.state, "hub_sync_manager", None)
-            else ()
-        ),
-        "hub_sync_fail_safe": list(
-            getattr(app.state.hub_sync_manager, "fail_safe_pending", ())
-            if getattr(app.state, "hub_sync_manager", None)
-            else ()
-        ),
+        "lockdown_enforcement_pending": lockdown_pending,
+        "hub_sync_fail_safe": fail_safe_pending,
         "pending_relocks": pending_relocks,
     }
 
@@ -132,13 +190,29 @@ async def set_lockdown(
     engine = request.app.state.auth_engine
     if engine is None:
         raise HTTPException(status_code=503, detail="Authorization engine unavailable")
+    db = request.app.state.db
+    actor = _api_audit_actor(auth)
     try:
         await engine.set_lockdown(enabled)
     except RuntimeError as exc:
         # The engine deliberately retains the requested fail-closed in-memory
         # state; 503 tells automation that durable/physical convergence still
         # needs operator attention or a retry.
+        await _audit_best_effort(
+            db,
+            actor,
+            "api_lockdown_set",
+            "enabled" if enabled else "disabled",
+            "result=error",
+        )
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    await _audit_best_effort(
+        db,
+        actor,
+        "api_lockdown_set",
+        "enabled" if enabled else "disabled",
+        "result=success",
+    )
     return {"lockdown": engine.lockdown}
 
 
@@ -175,7 +249,7 @@ async def set_lock_mode(
         request.app.state,
         lock_id,
         _MODE_ACTION[update.mode],
-        actor=f"api:{auth.get('name') or 'unnamed-key'}",
+        actor=_api_audit_actor(auth),
         source="api",
         # A locks_only credential can operate locks but must not inherit the
         # browser's separate alarm-panel side effect.
@@ -184,6 +258,7 @@ async def set_lock_mode(
     payload = _command_response(result, update.mode)
     status_code = {
         "granted": 200,
+        "accepted_unconfirmed": 202,
         "not_found": 404,
         "denied": 409,
         "error": 503,
@@ -222,18 +297,29 @@ async def set_rule_schedule(
     if schedule_error:
         raise HTTPException(status_code=422, detail=schedule_error)
 
-    await db.update_rule(
+    updated_rule = await db.update_rule_schedule(
         rule_id,
-        enabled=bool(rule["enabled"]),
         schedule_enabled=update.enabled,
         schedule_days=days,
         schedule_start=start,
         schedule_end=end,
     )
+    if updated_rule is None:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    await _audit_best_effort(
+        db,
+        _api_audit_actor(auth),
+        "api_rule_schedule_update",
+        str(rule_id),
+        (
+            f"enabled={bool(update.enabled)} days={days or '-'} "
+            f"start={start or '-'} end={end or '-'}"
+        ),
+    )
     return {
         "rule_id": rule_id,
-        "user_id": rule["user_id"],
-        "enabled": bool(rule["enabled"]),
+        "user_id": updated_rule["user_id"],
+        "enabled": bool(updated_rule["enabled"]),
         "schedule": {
             "enabled": update.enabled,
             "days": [day for day in _DAY_NAMES if day in selected_days],

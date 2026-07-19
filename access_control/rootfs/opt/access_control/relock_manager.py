@@ -22,11 +22,12 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
 
 from .database import Database
+from .ha_client import ha_client_operation
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -76,7 +77,9 @@ class RelockManager:
         db: Database,
         ha_client_getter,
         on_locked=None,
+        on_unknown=None,
         command_lock: asyncio.Lock | None = None,
+        entity_command_locks: dict[str, asyncio.Lock] | None = None,
     ) -> None:
         # ha_client_getter is a zero-arg callable returning the *current*
         # HAClient — needed because the client can be replaced via Settings.
@@ -85,12 +88,26 @@ class RelockManager:
         self._db = db
         self._get_ha = ha_client_getter
         self._on_locked = on_locked
-        # Shared with manual unlocks and lockdown transitions. Physical HA
-        # lock calls take this barrier before their per-entity lock so a
-        # command already in flight has a single, deadlock-free ordering.
+        # Invoked only while the same durable relock generation is still
+        # current after retries exhaust. This prevents an older timer from
+        # overwriting a newer command's cache while ensuring failure never
+        # leaves a stale optimistic state behind.
+        self._on_unknown = on_unknown
+        # Shared with manual unlocks and lockdown transitions. The per-entity
+        # lock remains held through confirmation while the app-wide barrier is
+        # released immediately after the write.
         self._command_lock = command_lock
         self._tasks: dict[str, asyncio.Task] = {}
         self._lock: asyncio.Lock = asyncio.Lock()
+        self._command_entity_locks = (
+            entity_command_locks
+            if entity_command_locks is not None
+            else {}
+        )
+        # Internal generation/persistence serialization is deliberately
+        # separate from the shared physical workflow locks. Manual/AuthEngine
+        # commands hold the shared lock while calling pause/schedule; reusing
+        # it here would make those calls self-deadlock.
         self._entity_locks: dict[str, asyncio.Lock] = {}
         # A paused entity is inside a manual HA command. Recovery skips it
         # until the caller resolves the pause via schedule/cancel/resume.
@@ -483,12 +500,17 @@ class RelockManager:
     # ------------------------------------------------------------------
 
     def _entity_lock(self, entity_id: str) -> asyncio.Lock:
-        """Return the stable physical-command lock for one HA entity."""
+        """Return the stable internal generation lock for one HA entity."""
         lock = self._entity_locks.get(entity_id)
         if lock is None:
             lock = asyncio.Lock()
             self._entity_locks[entity_id] = lock
         return lock
+
+    def _command_entity_lock(self, entity_id: str) -> asyncio.Lock:
+        """Return the app-wide write+confirmation lock for one HA entity."""
+        key = f"ha:{entity_id}"
+        return self._command_entity_locks.setdefault(key, asyncio.Lock())
 
     @asynccontextmanager
     async def _physical_command_barrier(self) -> AsyncIterator[None]:
@@ -555,6 +577,23 @@ class RelockManager:
             # Retain the durable row for the next recovery sweep, and keep the
             # stuck door visible: re-fire the failure event on a bounded cadence
             # instead of letting the silent sweep hide an overdue relock.
+            async with operation_lock:
+                async with self._lock:
+                    current = await self._db.get_pending_relock(entity_id)
+                    if (
+                        not self._shutting_down
+                        and entity_id not in self._paused
+                        and current is not None
+                        and float(current["deadline"]) == deadline
+                        and self._on_unknown is not None
+                    ):
+                        try:
+                            self._on_unknown(entity_id)
+                        except Exception:
+                            _LOGGER.exception(
+                                "on_unknown callback raised for %s",
+                                entity_id,
+                            )
             await self._notify_relock_failed(entity_id, lock_name)
             return False
 
@@ -693,6 +732,14 @@ class RelockManager:
                     else:
                         # All retries exhausted. Leave the DB row so the
                         # periodic sweep can retry while HA stays connected.
+                        if self._on_unknown is not None:
+                            try:
+                                self._on_unknown(entity_id)
+                            except Exception:
+                                _LOGGER.exception(
+                                    "on_unknown callback raised for %s",
+                                    entity_id,
+                                )
                         _LOGGER.error(
                             "Re-lock FAILED for %s after %d retries — DB row "
                             "retained; sweep will retry and an HA event has "
@@ -724,10 +771,10 @@ class RelockManager:
         """
         Call ha_client.lock() with bounded retries. Returns True on success.
 
-        Each individual physical request takes the app barrier and entity lock
-        only for that request. Retry/confirmation sleeps release both, and the
-        durable generation is revalidated before every attempt. This prevents
-        one degraded lock from blocking lockdown or unrelated doors.
+        Each attempt takes the entity lock through exact-state confirmation,
+        but releases the app-wide write barrier immediately after the service
+        call. Different doors remain concurrent while later commands for this
+        entity cannot overtake an older readback.
 
         Does NOT invoke the on_locked callback — that fires from the caller
         only after the "still active" check passes, so a superseded relock
@@ -735,74 +782,88 @@ class RelockManager:
         """
         for attempt in range(1, _LOCK_RETRIES + 1):
             operation_lock = self._entity_lock(entity_id)
-            async with self._physical_command_barrier():
+            command_entity_lock = self._command_entity_lock(entity_id)
+            async with command_entity_lock:
                 async with operation_lock:
-                    async with self._lock:
-                        if self._shutting_down or entity_id in self._paused:
-                            return False
-                        if (
-                            owner_task is not None
-                            and self._tasks.get(entity_id) is not owner_task
-                        ):
-                            return False
-                        current = await self._db.get_pending_relock(entity_id)
-                        if (
-                            current is None
-                            or float(current["deadline"]) != float(deadline)
-                        ):
-                            return False
-                        if owner_task is None:
-                            live = self._tasks.get(entity_id)
-                            if live is not None and not live.done():
-                                return False
+                    async with AsyncExitStack() as ha_lease_stack:
+                        async with self._physical_command_barrier():
+                            async with self._lock:
+                                if self._shutting_down or entity_id in self._paused:
+                                    return False
+                                if (
+                                    owner_task is not None
+                                    and self._tasks.get(entity_id) is not owner_task
+                                ):
+                                    return False
+                                current = await self._db.get_pending_relock(entity_id)
+                                if (
+                                    current is None
+                                    or float(current["deadline"]) != float(deadline)
+                                ):
+                                    return False
+                                if owner_task is None:
+                                    live = self._tasks.get(entity_id)
+                                    if live is not None and not live.done():
+                                        return False
 
-                    ha = self._get_ha()
-                    if not ha:
-                        _LOGGER.error(
-                            "Re-lock skipped for %s — HA client unavailable",
-                            lock_name,
-                        )
-                        ok = False
-                    else:
-                        try:
-                            ok = await ha.lock(entity_id)
-                        except Exception:
-                            _LOGGER.exception(
-                                "Re-lock attempt %d/%d raised for %s",
-                                attempt,
-                                _LOCK_RETRIES,
+                            ha = self._get_ha()
+                            if not ha:
+                                _LOGGER.error(
+                                    "Re-lock skipped for %s — HA client unavailable",
+                                    lock_name,
+                                )
+                                ok = False
+                            else:
+                                # Enter while the publication barrier is held,
+                                # then retain this exact client until readback
+                                # finishes outside the barrier.
+                                await ha_lease_stack.enter_async_context(
+                                    ha_client_operation(ha)
+                                )
+                                try:
+                                    ok = await ha.lock(entity_id)
+                                except Exception:
+                                    _LOGGER.exception(
+                                        "Re-lock attempt %d/%d raised for %s",
+                                        attempt,
+                                        _LOCK_RETRIES,
+                                        lock_name,
+                                    )
+                                    ok = False
+                        if ok:
+                            for confirmation in range(1, _CONFIRM_ATTEMPTS + 1):
+                                try:
+                                    state = (
+                                        await ha.get_entity_state(entity_id)
+                                        if ha is not None
+                                        else None
+                                    )
+                                except Exception:
+                                    _LOGGER.exception(
+                                        "Re-lock confirmation %d/%d raised for %s",
+                                        confirmation,
+                                        _CONFIRM_ATTEMPTS,
+                                        lock_name,
+                                    )
+                                    state = None
+                                if state == "locked":
+                                    _LOGGER.info(
+                                        "Re-lock confirmed for %s%s",
+                                        lock_name,
+                                        (
+                                            f" on retry {attempt}"
+                                            if attempt > 1
+                                            else ""
+                                        ),
+                                    )
+                                    return True
+                                if confirmation < _CONFIRM_ATTEMPTS:
+                                    await asyncio.sleep(_CONFIRM_DELAY)
+                            _LOGGER.warning(
+                                "HA accepted re-lock for %s but state was not "
+                                "confirmed locked",
                                 lock_name,
                             )
-                            ok = False
-            if ok:
-                for confirmation in range(1, _CONFIRM_ATTEMPTS + 1):
-                    try:
-                        state = (
-                            await ha.get_entity_state(entity_id)
-                            if ha is not None
-                            else None
-                        )
-                    except Exception:
-                        _LOGGER.exception(
-                            "Re-lock confirmation %d/%d raised for %s",
-                            confirmation,
-                            _CONFIRM_ATTEMPTS,
-                            lock_name,
-                        )
-                        state = None
-                    if state == "locked":
-                        _LOGGER.info(
-                            "Re-lock confirmed for %s%s",
-                            lock_name,
-                            f" on retry {attempt}" if attempt > 1 else "",
-                        )
-                        return True
-                    if confirmation < _CONFIRM_ATTEMPTS:
-                        await asyncio.sleep(_CONFIRM_DELAY)
-                _LOGGER.warning(
-                    "HA accepted re-lock for %s but state was not confirmed locked",
-                    lock_name,
-                )
             if attempt < _LOCK_RETRIES:
                 await asyncio.sleep(_LOCK_RETRY_DELAY)
         return False

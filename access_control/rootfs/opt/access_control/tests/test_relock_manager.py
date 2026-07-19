@@ -366,7 +366,12 @@ class TestRelockManagerFire(unittest.TestCase):
             ha = MagicMock()
             ha.lock = AsyncMock(return_value=False)
             ha.get_entity_state = AsyncMock(return_value="locked")
-            mgr = RelockManager(db=db, ha_client_getter=lambda: ha)
+            unknown: list[str] = []
+            mgr = RelockManager(
+                db=db,
+                ha_client_getter=lambda: ha,
+                on_unknown=unknown.append,
+            )
             rm_module._LOCK_RETRY_DELAY = 0.01
             try:
                 await mgr.schedule(
@@ -382,6 +387,7 @@ class TestRelockManagerFire(unittest.TestCase):
             db.remove_pending_relock.assert_not_awaited()
             # Task is removed from the in-memory dict regardless
             self.assertNotIn("lock.foo", mgr.tasks)
+            self.assertEqual(unknown, ["lock.foo"])
         _run(go())
 
 

@@ -12,8 +12,8 @@ remediation.
 
 | Version | Status |
 |---|---|
-| Latest `1.5.x` release | Supported until superseded |
-| `1.4.x` and older | Unsupported; upgrade |
+| Latest stable release | Supported |
+| Older releases | Unsupported; upgrade to the latest stable release |
 | Unreleased `main` | Development branch; fixes land here first |
 
 This is a spare-time project with no SLA. The targets below are best-effort,

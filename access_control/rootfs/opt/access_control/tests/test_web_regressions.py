@@ -1,6 +1,7 @@
 """Web-boundary regressions found by the end-to-end review."""
 from __future__ import annotations
 
+import asyncio
 import unittest
 from datetime import timezone
 from types import SimpleNamespace
@@ -221,10 +222,13 @@ class ManualLockActionSafetyTests(unittest.IsolatedAsyncioTestCase):
         )
         relock.resume.assert_awaited_once_with(paused)
         relock.cancel.assert_not_awaited()
-        self.assertNotIn("lock.patio", request.app.state.lock_states)
+        self.assertEqual(
+            request.app.state.lock_states["lock.patio"],
+            "unknown",
+        )
         db.log_access.assert_awaited_once_with(
             method="manual_lock",
-            result="error",
+            result="accepted_unconfirmed",
             lock_id=7,
             lock_name="Patio Door",
             user_name="admin",
@@ -325,6 +329,75 @@ class LocksTemplateRelockBadgeTests(unittest.TestCase):
         self.assertNotIn("re-lock overdue", html)
 
 
+class LocksStateFreshnessTests(unittest.IsolatedAsyncioTestCase):
+    async def _rendered_state(
+        self,
+        *,
+        command_state: str,
+        command_at: float,
+        snapshot_state: str,
+        snapshot_at: float,
+    ) -> str:
+        lock = {
+            "id": 9,
+            "type": "ha_external",
+            "entity_id": "lock.patio",
+            "name": "Patio",
+        }
+        db = SimpleNamespace(
+            get_all_locks=AsyncMock(return_value=[lock]),
+            get_entry_devices_for_locks=AsyncMock(return_value={}),
+            peek_ui_cache=AsyncMock(
+                return_value=(
+                    [
+                        {
+                            "entity_id": "lock.patio",
+                            "state": snapshot_state,
+                        }
+                    ],
+                    True,
+                )
+            ),
+        )
+        ha = SimpleNamespace(
+            connected=True,
+            get_lock_entities=AsyncMock(),
+        )
+        request = _request(db=db, ha=ha)
+        request.query_params = {}
+        request.app.state.protect_client = None
+        request.app.state.lock_states = {"lock.patio": command_state}
+        request.app.state.lock_state_updated_at = {
+            "lock.patio": command_at
+        }
+        request.app.state._ui_cache_updated_at = {
+            "locks_ha_lock_entities": snapshot_at
+        }
+
+        render = AsyncMock(side_effect=lambda _name, _request, context: context)
+        with patch.object(web_routes, "_render", new=render):
+            context = await web_routes.locks_list(request, user="admin")
+        return context["locks"][0]["state"]
+
+    async def test_confirmed_command_beats_pre_command_snapshot(self) -> None:
+        state = await self._rendered_state(
+            command_state="unlocked",
+            command_at=20.0,
+            snapshot_state="locked",
+            snapshot_at=10.0,
+        )
+        self.assertEqual(state, "unlocked")
+
+    async def test_newer_ha_snapshot_beats_old_command_cache(self) -> None:
+        state = await self._rendered_state(
+            command_state="locked",
+            command_at=10.0,
+            snapshot_state="unlocked",
+            snapshot_at=20.0,
+        )
+        self.assertEqual(state, "unlocked")
+
+
 class AssetCacheBustingTests(unittest.TestCase):
     def test_static_asset_links_carry_content_hash(self) -> None:
         # Without a version query, browsers may satisfy static/app.css from
@@ -352,6 +425,59 @@ class AssetCacheBustingTests(unittest.TestCase):
         self.assertRegex(js_v, r"^[0-9a-f]{12}$")
         self.assertIn(f'href="static/app.css?v={css_v}"', html)
         self.assertIn(f'src="static/app.js?v={js_v}"', html)
+
+
+class UiCacheTaskOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_swr_refresh_is_lifespan_owned_and_still_deduplicated(
+        self,
+    ) -> None:
+        db = SimpleNamespace(
+            peek_ui_cache=AsyncMock(return_value=(["stale"], False)),
+            set_ui_cache=AsyncMock(),
+        )
+        request = _request(db=db)
+        owned: set[asyncio.Task] = set()
+
+        def track(task: asyncio.Task) -> None:
+            owned.add(task)
+            task.add_done_callback(owned.discard)
+
+        request.app.state.track_background_task = track
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+
+        async def fetch():
+            refresh_started.set()
+            await release_refresh.wait()
+            return ["fresh"]
+
+        first = await web_routes._cached_device_options(
+            request, "ha-lock-options", 60, fetch
+        )
+        await refresh_started.wait()
+        second = await web_routes._cached_device_options(
+            request, "ha-lock-options", 60, fetch
+        )
+
+        self.assertEqual(first, ["stale"])
+        self.assertEqual(second, ["stale"])
+        self.assertEqual(len(owned), 1)
+        self.assertEqual(
+            list(request.app.state._ui_cache_refresh_inflight),
+            ["ha-lock-options"],
+        )
+
+        refresh_task = next(iter(owned))
+        refresh_task.cancel()
+        await asyncio.gather(refresh_task, return_exceptions=True)
+        await asyncio.sleep(0)
+
+        self.assertEqual(owned, set())
+        self.assertEqual(
+            request.app.state._ui_cache_refresh_inflight,
+            {},
+        )
+        db.set_ui_cache.assert_not_awaited()
 
 
 class RenderAndValidationTests(unittest.IsolatedAsyncioTestCase):

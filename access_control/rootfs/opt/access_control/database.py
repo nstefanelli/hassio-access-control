@@ -569,6 +569,74 @@ class Database:
                     "INTEGER NOT NULL DEFAULT 0"
                 )
 
+            # Migration 26: one individual authorization rule per user/lock.
+            #
+            # The dashboard previously enforced this with a check-then-insert,
+            # which is racy: two concurrent submissions could create duplicate
+            # grants.  Authorization then selected an arbitrary matching row,
+            # so deleting or disabling one duplicate could leave another grant
+            # active.  Reconcile legacy rows before adding the database-owned
+            # invariant. Identical duplicates preserve their oldest row;
+            # conflicting duplicates are disabled fail-closed for an
+            # administrator to review.
+            async with self._db.execute(
+                """SELECT user_id, lock_id
+                     FROM access_rules
+                 GROUP BY user_id, lock_id
+                   HAVING COUNT(*) > 1"""
+            ) as cur:
+                duplicate_pairs = await cur.fetchall()
+            for pair in duplicate_pairs:
+                user_id, lock_id = int(pair[0]), int(pair[1])
+                async with self._db.execute(
+                    """SELECT *
+                         FROM access_rules
+                        WHERE user_id = ? AND lock_id = ?
+                     ORDER BY id""",
+                    (user_id, lock_id),
+                ) as cur:
+                    rows = await cur.fetchall()
+                survivor = rows[0]
+                policy_fields = (
+                    "enabled",
+                    "schedule_enabled",
+                    "schedule_days",
+                    "schedule_start",
+                    "schedule_end",
+                )
+                policies = {
+                    tuple(row[field] for field in policy_fields)
+                    for row in rows
+                }
+                if len(policies) > 1:
+                    await self._db.execute(
+                        """UPDATE access_rules
+                              SET enabled = 0,
+                                  schedule_enabled = 0,
+                                  schedule_days = NULL,
+                                  schedule_start = NULL,
+                                  schedule_end = NULL,
+                                  updated_at = ?
+                            WHERE id = ?""",
+                        (_utc_now_sqlite(), survivor["id"]),
+                    )
+                    _LOGGER.warning(
+                        "Disabled conflicting duplicate access rules for "
+                        "user_id=%s lock_id=%s during migration",
+                        user_id,
+                        lock_id,
+                    )
+                await self._db.execute(
+                    """DELETE FROM access_rules
+                       WHERE user_id = ? AND lock_id = ? AND id != ?""",
+                    (user_id, lock_id, survivor["id"]),
+                )
+            await self._db.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS
+                       idx_access_rules_user_lock
+                     ON access_rules(user_id, lock_id)"""
+            )
+
             await self._db.commit()
         except Exception:
             await self._db.rollback()
@@ -1247,7 +1315,7 @@ class Database:
         now = _utc_now_sqlite()
         cursor = await self._db.execute(
             """
-            INSERT INTO access_rules
+            INSERT OR IGNORE INTO access_rules
                 (user_id, lock_id, enabled, schedule_enabled,
                  schedule_days, schedule_start, schedule_end,
                  created_at, updated_at)
@@ -1265,8 +1333,22 @@ class Database:
                 now,
             ),
         )
+        if cursor.rowcount:
+            rule_id = int(cursor.lastrowid)
+        else:
+            async with self._db.execute(
+                """SELECT id FROM access_rules
+                   WHERE user_id = ? AND lock_id = ?""",
+                (user_id, lock_id),
+            ) as existing:
+                row = await existing.fetchone()
+            if row is None:  # Defensive: the conflict must identify a row.
+                raise RuntimeError(
+                    "Access rule insert was ignored without an existing row"
+                )
+            rule_id = int(row["id"])
         await self._db.commit()
-        return cursor.lastrowid
+        return rule_id
 
     async def update_rule(
         self,
@@ -1300,6 +1382,66 @@ class Database:
             ),
         )
         await self._db.commit()
+
+    async def toggle_rule_enabled(
+        self, rule_id: int
+    ) -> Optional[dict[str, Any]]:
+        """Atomically toggle only a rule's authorization switch.
+
+        The schedule editor and enabled switch are independent policy
+        controls.  Keeping this as one SQLite statement prevents a concurrent
+        schedule save from writing a stale ``enabled`` value back over the
+        toggle.
+        """
+        now = _utc_now_sqlite()
+        async with self._db.execute(
+            """
+            UPDATE access_rules
+               SET enabled = CASE enabled WHEN 0 THEN 1 ELSE 0 END,
+                   updated_at = ?
+             WHERE id = ?
+         RETURNING user_id, enabled
+            """,
+            (now, rule_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        await self._db.commit()
+        return _row_to_dict(row) if row else None
+
+    async def update_rule_schedule(
+        self,
+        rule_id: int,
+        *,
+        schedule_enabled: bool,
+        schedule_days: Optional[str] = None,
+        schedule_start: Optional[str] = None,
+        schedule_end: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Atomically update schedule columns without changing authorization."""
+        now = _utc_now_sqlite()
+        async with self._db.execute(
+            """
+            UPDATE access_rules
+               SET schedule_enabled = ?,
+                   schedule_days = ?,
+                   schedule_start = ?,
+                   schedule_end = ?,
+                   updated_at = ?
+             WHERE id = ?
+         RETURNING user_id, enabled
+            """,
+            (
+                int(schedule_enabled),
+                schedule_days,
+                schedule_start,
+                schedule_end,
+                now,
+                rule_id,
+            ),
+        ) as cursor:
+            row = await cursor.fetchone()
+        await self._db.commit()
+        return _row_to_dict(row) if row else None
 
     async def delete_rule(self, rule_id: int) -> None:
         await self._db.execute(
@@ -1615,6 +1757,16 @@ class Database:
             item = _row_to_dict(row)
             result.setdefault(item["lock_id"], []).append(item)
         return result
+
+    async def is_protect_in_use(self) -> bool:
+        """Return whether a configured entry path depends on Protect events."""
+        async with self._db.execute(
+            """SELECT 1
+                 FROM entry_devices
+                WHERE type = 'protect_doorbell'
+                LIMIT 1"""
+        ) as cursor:
+            return await cursor.fetchone() is not None
 
     async def add_entry_device(
         self, lock_id: int, device_type: str, name: str,

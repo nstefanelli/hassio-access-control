@@ -43,10 +43,13 @@ import inspect
 import json
 import logging
 import time
+from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
 from .access_client import AccessClientError, AccessLegacyEndpointGoneError
 from .database import Database
+from .ha_client import ha_client_operation
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -115,6 +118,14 @@ _ACCESS_STATE_EVENTS = {
 }
 
 
+@dataclass(frozen=True)
+class _HubDriveResult:
+    """Outcome tied to the exact Access client that accepted the write."""
+
+    state: str
+    authoritative_relay: bool
+
+
 class HubSyncManager:
     """
     Polls opted-in HA lock entities and converges their paired Access
@@ -136,6 +147,7 @@ class HubSyncManager:
         camera_map_getter: Optional[Callable[[], dict]] = None,
         command_lock: Optional[asyncio.Lock] = None,
         relock_manager_getter: Optional[Callable[[], Any]] = None,
+        entity_command_locks: dict[str, asyncio.Lock] | None = None,
     ) -> None:
         # Clients are fetched lazily via getters — same rationale as
         # RelockManager: credential updates from Settings swap the client
@@ -156,6 +168,11 @@ class HubSyncManager:
         # synced lock schedules a durable time-bounded re-lock through it.
         self._get_relock_manager = relock_manager_getter
         self._command_lock = command_lock or asyncio.Lock()
+        self._entity_command_locks = (
+            entity_command_locks
+            if entity_command_locks is not None
+            else {}
+        )
         self._poll_lock = asyncio.Lock()
         # ``enforce_lockdown`` sets this before waiting for ``_poll_lock``.
         # A normal pass that already owns the lock observes it between remote
@@ -593,7 +610,21 @@ class HubSyncManager:
                     ha_safe = await self._drive_ha_state(
                         lock, "locked", fail_safe=True
                     )
-                if access_safe and ha_safe:
+                access = self._get_access()
+                pair_confirmed = bool(
+                    access_safe
+                    and ha_safe
+                    and (
+                        # Compatibility-only injected clients do not expose
+                        # readback at all; preserve their acknowledgement
+                        # contract. Production AccessClient always exposes the
+                        # bidirectional methods and must pass the authoritative
+                        # rule/relay re-read below.
+                        not self._supports_bidirectional_access(access)
+                        or await self._lockdown_pair_confirmed(lock, hubs)
+                    )
+                )
+                if pair_confirmed:
                     self._lockdown_reset.add(eid)
                     # Conservative observed baseline: after lockdown lifts, an
                     # HA entity still reporting unlocked must not reopen the
@@ -700,13 +731,19 @@ class HubSyncManager:
                         eid,
                         access_observation,
                     )
-                    access_state, access_rule, schedule_active = (
+                    access_state, access_rule, schedule_active, access_relay_state = (
                         None,
                         f"error:{type(access_observation).__name__}",
                         False,
+                        None,
                     )
                 else:
-                    access_state, access_rule, schedule_active = access_observation
+                    (
+                        access_state,
+                        access_rule,
+                        schedule_active,
+                        access_relay_state,
+                    ) = access_observation
                 safe_ha_state = None if isinstance(state, BaseException) else state
                 applied_count += await self._reconcile_bidirectional(
                     lock,
@@ -714,6 +751,7 @@ class HubSyncManager:
                     access_state,
                     access_rule,
                     schedule_active,
+                    access_relay_state,
                     hubs,
                 )
                 continue
@@ -898,6 +936,24 @@ class HubSyncManager:
         ):
             open_api = bool(access.open_api_configured)
         return connected or open_api
+
+    @staticmethod
+    def _has_authoritative_relay_state(access: Any) -> bool:
+        """Return whether ``get_door_state`` reads a physical Open API relay.
+
+        The legacy/private client implements the same method by deriving state
+        from the persistent rule. That remains useful for normal convergence,
+        but it must never be mistaken for independent physical evidence when
+        releasing a fail-safe latch or acknowledging lockdown safety.
+        """
+        if access is None:
+            return False
+        open_api = bool(vars(access).get("open_api_configured", False))
+        if isinstance(
+            getattr(type(access), "open_api_configured", None), property
+        ):
+            open_api = bool(access.open_api_configured)
+        return open_api
 
     @staticmethod
     def _group_synced_locks(locks: list[dict]) -> list[dict]:
@@ -1137,6 +1193,7 @@ class HubSyncManager:
             not isinstance(item, BaseException)
             and item[0] == "locked"
             and item[1].get("type") == "keep_lock"
+            and item[3] == "locked"
             for item in observations
         )
         if not access_safe:
@@ -1158,8 +1215,8 @@ class HubSyncManager:
 
     async def _observe_access_hub(
         self, access: Any, hub: dict
-    ) -> tuple[str | None, dict, bool]:
-        """Return effective state, normalized rule, and active-schedule flag."""
+    ) -> tuple[str | None, dict, bool, str | None]:
+        """Return effective intent plus separate authoritative relay state."""
         get_rule = self._method(access, "get_lock_rule")
         get_state = self._method(access, "get_door_state")
         if get_rule is None or get_state is None:
@@ -1227,6 +1284,11 @@ class HubSyncManager:
             effective,
             dict(rule_result),
             rule_type == "schedule",
+            (
+                door_state
+                if self._has_authoritative_relay_state(access)
+                else None
+            ),
         )
 
     async def _observe_access_side(
@@ -1235,26 +1297,28 @@ class HubSyncManager:
         hubs: list[dict],
         *,
         entity_id: str,
-    ) -> tuple[str | None, str, bool]:
+    ) -> tuple[str | None, str, bool, str | None]:
         """Observe all hubs as one logical Access side.
 
         Multi-hub disagreement or one malformed/unreadable row is ambiguous
         and therefore returns no state. The caller's locked-wins path handles
-        the fail-safe action.
+        the fail-safe action. The fourth return value is the raw relay state
+        only when every hub provided authoritative, agreeing relay readback.
         """
         if not hubs:
-            return None, "no-hubs", False
+            return None, "no-hubs", False, None
         if not self._access_available(access):
-            return None, "disconnected", False
+            return None, "disconnected", False, None
         results = await asyncio.gather(
             *(self._observe_access_hub(access, hub) for hub in hubs),
             return_exceptions=True,
         )
         states: list[str] = []
+        relay_states: list[str] = []
         fingerprint_rows: list[dict] = []
         schedules: list[bool] = []
         invalid = False
-        ownership_superseded = False
+        all_relays_authoritative = True
         for hub, result in zip(hubs, results):
             if isinstance(result, BaseException):
                 invalid = True
@@ -1285,7 +1349,7 @@ class HubSyncManager:
                         result,
                     )
                 continue
-            state, rule, schedule_active = result
+            state, rule, schedule_active, relay_state = result
             rule_type = str(rule.get("type") or "")
             device_id = hub.get("device_id")
             owns_open = any(
@@ -1305,7 +1369,6 @@ class HubSyncManager:
                 # later restart would incorrectly reassert the old override.
                 try:
                     await self._record_hub_state(entity_id, hub, "locked")
-                    ownership_superseded = True
                 except Exception as exc:
                     invalid = True
                     _LOGGER.warning(
@@ -1320,23 +1383,54 @@ class HubSyncManager:
                 invalid = True
             else:
                 states.append(state)
+            if relay_state is None:
+                all_relays_authoritative = False
+            else:
+                relay_states.append(relay_state)
             schedules.append(schedule_active)
-        if (
-            ownership_superseded
-            and not self._held_open.get(entity_id)
-            and not self._held_locked.get(entity_id)
-        ):
-            self._fail_safe_reset_eids.discard(entity_id)
+        # Clearing superseded durable ownership does not prove the physical
+        # incident is safe. In particular, an external schedule can replace
+        # our keep_lock and immediately open the relay. The fail-safe latch is
+        # released only by the authoritative both-sides-locked gate in
+        # _reconcile_bidirectional.
         fingerprint = json.dumps(
             sorted(fingerprint_rows, key=lambda row: str(row.get("device_id"))),
             sort_keys=True,
             separators=(",", ":"),
         )
         if invalid or len(states) != len(hubs) or len(set(states)) != 1:
-            return None, fingerprint, False
-        return states[0], fingerprint, bool(schedules and all(schedules))
+            return None, fingerprint, False, None
+        authoritative_relay_state = (
+            relay_states[0]
+            if (
+                all_relays_authoritative
+                and len(relay_states) == len(hubs)
+                and len(set(relay_states)) == 1
+            )
+            else None
+        )
+        return (
+            states[0],
+            fingerprint,
+            bool(schedules and all(schedules)),
+            authoritative_relay_state,
+        )
 
     async def _drive_ha_state(
+        self, lock: dict, state: str, *, fail_safe: bool = False
+    ) -> bool:
+        eid = str(lock["entity_id"])
+        entity_lock = self._entity_command_locks.setdefault(
+            f"ha:{eid}", asyncio.Lock()
+        )
+        async with entity_lock:
+            return await self._drive_ha_state_coordinated(
+                lock,
+                state,
+                fail_safe=fail_safe,
+            )
+
+    async def _drive_ha_state_coordinated(
         self, lock: dict, state: str, *, fail_safe: bool = False
     ) -> bool:
         """Command and confirm one HA lock without holding the barrier on reads."""
@@ -1344,6 +1438,8 @@ class HubSyncManager:
         lock_name = lock.get("name", eid)
         accepted = False
         ha = None
+        ha_lease_stack = AsyncExitStack()
+        await ha_lease_stack.__aenter__()
         try:
             async with self._command_lock:
                 ha = self._get_ha()
@@ -1351,6 +1447,9 @@ class HubSyncManager:
                     return False
                 if state == "unlocked" and self._in_lockdown():
                     return False
+                await ha_lease_stack.enter_async_context(
+                    ha_client_operation(ha)
+                )
                 command = ha.unlock if state == "unlocked" else ha.lock
                 accepted = bool(await command(eid))
             if not accepted:
@@ -1366,6 +1465,8 @@ class HubSyncManager:
                 lock_name,
                 state,
             )
+        finally:
+            await ha_lease_stack.aclose()
         if accepted:
             _LOGGER.error(
                 "Hub sync: HA accepted %s for %s but state was not confirmed",
@@ -1383,6 +1484,7 @@ class HubSyncManager:
         access_state: str | None,
         access_rule: str,
         schedule_active: bool,
+        access_relay_state: str | None,
         hubs: list[dict],
     ) -> int:
         """Reconcile one logical pair using source-change detection."""
@@ -1417,6 +1519,7 @@ class HubSyncManager:
             and valid_access
             and ha_state == "locked"
             and access_state == "locked"
+            and access_relay_state == "locked"
         )
 
         previous_ha = self._last_ha_observed.get(eid)
@@ -1480,6 +1583,24 @@ class HubSyncManager:
             self._fail_safe_reset_eids.add(eid)
         if eid in self._fail_safe_reset_eids:
             desired = "locked"
+            fail_safe = True
+
+        if (
+            desired == "unlocked"
+            and source == "ha"
+            and not await self._ensure_ha_origin_relock(lock, now)
+        ):
+            # The opt-in timer is part of the safety contract for a genuine
+            # HA-origin unlock. Refuse the persistent Access hold-open when its
+            # durable owner cannot be established, and converge both sides
+            # closed through the normal locked-wins retry/latch path.
+            self._fail_safe_reset_eids.add(eid)
+            # This is the first and only chance to compensate the external HA
+            # unlock before any durable timer exists. Do not let an older Access
+            # hard-rejection delay the immediate HA-side close.
+            self._backoff_until.pop(eid, None)
+            desired = "locked"
+            source = "ha_origin_relock_unavailable"
             fail_safe = True
 
         # Bounded backoff for a repeatedly hard-rejected locked drive. Once a
@@ -1565,9 +1686,19 @@ class HubSyncManager:
             and desired == "locked"
             and ha_state == "locked"
             and access_state == "locked"
+            and access_relay_state == "locked"
         )
-        if access_state != desired or release_fail_safe_override:
-            if not await self._apply_state(
+        needs_authoritative_fail_safe_lock = bool(
+            eid in self._fail_safe_reset_eids
+            and desired == "locked"
+            and access_relay_state != "locked"
+        )
+        if (
+            access_state != desired
+            or release_fail_safe_override
+            or needs_authoritative_fail_safe_lock
+        ):
+            apply_result = await self._apply_state(
                 lock,
                 desired,
                 hubs=hubs,
@@ -1580,7 +1711,8 @@ class HubSyncManager:
                     if source == "ha" and desired == "unlocked"
                     else None
                 ),
-            ):
+            )
+            if not apply_result:
                 # Observation-driven fail-safe release (1.5.12 wedge fix). When
                 # both sides were independently observed locked this pass, no
                 # drive was needed to converge — the only write was the cosmetic
@@ -1628,6 +1760,15 @@ class HubSyncManager:
                     self._note_locked_drive_failure(eid)
                 return 0
             access_state = desired
+            # Authority belongs to the exact client that accepted and
+            # confirmed the command. Settings may publish a replacement client
+            # after the write barrier is released but before readback finishes;
+            # consulting the current getter here would let that new client's
+            # Open API capability promote an older private-rule result into
+            # fabricated relay evidence.
+            access_relay_state = (
+                desired if apply_result.authoritative_relay else None
+            )
             access_rule = f"command:{desired}"
             changed = True
 
@@ -1659,44 +1800,59 @@ class HubSyncManager:
         # tracking + loud logging for a new incident. The latch is only ever set
         # while desired is forced locked, so this shares one helper with the
         # observation-driven release to keep the bookkeeping consistent.
-        self._release_fail_safe_latch(eid)
+        if (
+            eid not in self._fail_safe_reset_eids
+            or (
+                desired == "locked"
+                and ha_state == "locked"
+                and access_relay_state == "locked"
+            )
+        ):
+            self._release_fail_safe_latch(eid)
 
-        # Opt-in: a genuine HA-origin unlock (thumb-turn / HA automation) on a
-        # synced lock becomes time-bounded. This runs only after the edge is
-        # confirmed and persisted, so it fires exactly once per edge — the next
-        # pass reads both sides unlocked (``already_converged``).
-        await self._maybe_schedule_ha_origin_relock(lock, source, desired, now)
         return 1 if changed else 0
 
-    async def _maybe_schedule_ha_origin_relock(
-        self, lock: dict, source: str, desired: str, now: float
-    ) -> None:
-        """Time-bound a genuine HA-origin unlock when the lock opted in.
+    async def _ensure_ha_origin_relock(self, lock: dict, now: float) -> bool:
+        """Write-ahead a timer before mirroring a genuine HA-origin unlock.
 
         Guarded so it never touches an app-initiated unlock: a manual dashboard
         Unlock (short-TTL marker), a buzz / device-auth / remote unlock (their
         momentary lease marks app-initiated and they already own a durable
         timer), or any entity that already has a live pending re-lock row. The
-        result is that only a real external unlock (thumb-turn / HA automation)
-        earns a new ``ha_origin`` re-lock, scheduled once per edge.
+        caller may issue persistent ``keep_unlock`` only after this returns
+        True. False means the opted-in safety owner could not be established,
+        so the caller must converge locked instead.
         """
-        if source != "ha" or desired != "unlocked":
-            return
         if not lock.get("relock_on_ha_origin"):
-            return
+            return True
         eid = lock["entity_id"]
         if self._app_initiated_until.get(eid, 0.0) > now:
-            return
+            return True
         if self._get_relock_manager is None:
-            return
-        relock_manager = self._get_relock_manager()
+            _LOGGER.error(
+                "Could not schedule ha_origin re-lock for %s: manager unavailable",
+                eid,
+            )
+            return False
+        try:
+            relock_manager = self._get_relock_manager()
+        except Exception:
+            _LOGGER.exception(
+                "Could not schedule ha_origin re-lock for %s: manager getter failed",
+                eid,
+            )
+            return False
         if relock_manager is None:
-            return
+            _LOGGER.error(
+                "Could not schedule ha_origin re-lock for %s: manager unavailable",
+                eid,
+            )
+            return False
         try:
             # A buzz / device-auth / remote unlock already owns a durable timer.
             # Never replace or double it.
             if await self._db.get_pending_relock(eid) is not None:
-                return
+                return True
             await relock_manager.schedule(
                 entity_id=eid,
                 duration=float(lock.get("relock_duration", 30)),
@@ -1704,10 +1860,12 @@ class HubSyncManager:
                 lock_name=lock.get("name", eid),
                 source="ha_origin",
             )
+            return True
         except Exception:
             _LOGGER.exception(
                 "Could not schedule ha_origin re-lock for %s", eid
             )
+            return False
 
     async def _apply_state(
         self,
@@ -1718,8 +1876,8 @@ class HubSyncManager:
         enforcing_lockdown: bool = False,
         fail_safe: bool = False,
         unsafe_expected_access: str | None = None,
-    ) -> bool:
-        """Drive all hubs paired with ``lock`` to ``state``. True on success."""
+    ) -> _HubDriveResult | None:
+        """Drive all paired hubs and retain exact-client relay provenance."""
         eid = lock["entity_id"]
         lock_name = lock.get("name", eid)
 
@@ -1741,10 +1899,11 @@ class HubSyncManager:
                 await self._notify_sync_failed(
                     eid, lock_name, reason="no_paired_hub"
                 )
-            return False
+            return None
 
         ok_all = True
         drove_any = False
+        all_relays_authoritative = True
         expected_rows: dict[str, dict] = {}
         if unsafe_expected_access is not None:
             try:
@@ -1759,7 +1918,7 @@ class HubSyncManager:
                     "Hub sync refused unsafe write for %s: invalid observation guard",
                     lock_name,
                 )
-                return False
+                return None
         for hub in hubs:
             device_id = hub["device_id"]
             hub_name = hub.get("name", device_id)
@@ -1835,7 +1994,7 @@ class HubSyncManager:
                 ):
                     return False
                 try:
-                    current_state, current_rule, _active = (
+                    current_state, current_rule, _active, _relay_state = (
                         await self._observe_access_hub(access, hub_row)
                     )
                 except Exception:
@@ -1868,7 +2027,7 @@ class HubSyncManager:
                 before_command=before_command if state == "unlocked" else None,
             )
             if self._urgent_lockdown.is_set() and not enforcing_lockdown:
-                return False
+                return None
             if (
                 drove
                 and state == "locked"
@@ -1890,11 +2049,23 @@ class HubSyncManager:
                 ok_all = False
                 continue
             drove_any = True
+            all_relays_authoritative = bool(
+                all_relays_authoritative
+                and drove.authoritative_relay
+                and drove.state == state
+            )
             if not durable_state_ok:
                 ok_all = False
             if self._on_hub_state is not None:
                 try:
-                    self._on_hub_state(device_id, state)
+                    self._on_hub_state(
+                        device_id,
+                        (
+                            drove.state
+                            if drove.authoritative_relay
+                            else "unknown"
+                        ),
+                    )
                 except Exception:
                     _LOGGER.exception("on_hub_state callback raised for %s", device_id)
             try:
@@ -1934,7 +2105,14 @@ class HubSyncManager:
         if ok_all:
             self._pairing_signature[eid] = self._hub_signature(hubs)
             self._paired_hubs[eid] = [dict(hub) for hub in hubs]
-        return ok_all
+        if not ok_all:
+            return None
+        return _HubDriveResult(
+            state=state,
+            authoritative_relay=bool(
+                drove_any and all_relays_authoritative
+            ),
+        )
 
     async def _record_hub_state(
         self,
@@ -2280,7 +2458,14 @@ class HubSyncManager:
                 reset_count += 1
                 if self._on_hub_state is not None:
                     try:
-                        self._on_hub_state(device_id, drove)
+                        self._on_hub_state(
+                            device_id,
+                            (
+                                drove.state
+                                if drove.authoritative_relay
+                                else "unknown"
+                            ),
+                        )
                     except Exception:
                         _LOGGER.exception(
                             "on_hub_state callback raised for %s", device_id
@@ -2465,6 +2650,24 @@ class HubSyncManager:
         device_id: str,
         state: str,
         hub_name: str,
+        **kwargs: Any,
+    ) -> _HubDriveResult | None:
+        entity_lock = self._entity_command_locks.setdefault(
+            f"access:{device_id}", asyncio.Lock()
+        )
+        async with entity_lock:
+            return await self._drive_hub_coordinated(
+                device_id,
+                state,
+                hub_name,
+                **kwargs,
+            )
+
+    async def _drive_hub_coordinated(
+        self,
+        device_id: str,
+        state: str,
+        hub_name: str,
         *,
         eid: str | None = None,
         location_id: str | None = None,
@@ -2475,8 +2678,8 @@ class HubSyncManager:
         release_persistent: bool = False,
         guard: Callable[[], Awaitable[bool]] | None = None,
         before_command: Callable[[], Awaitable[None]] | None = None,
-    ) -> str | None:
-        """Call Access with bounded retries and return confirmed relay state.
+    ) -> _HubDriveResult | None:
+        """Call Access with bounded retries and return exact-client evidence.
 
         Incident/shutdown safety passes make one breadth-first attempt per
         hub. Durable ownership keeps failures queued for later convergence;
@@ -2486,7 +2689,7 @@ class HubSyncManager:
         max_attempts = 1 if enforcing_lockdown else _APPLY_RETRIES
         for attempt in range(1, max_attempts + 1):
             if self._urgent_lockdown.is_set() and not enforcing_lockdown:
-                return False
+                return None
             barrier_released = False
 
             def _release_barrier() -> None:
@@ -2508,13 +2711,13 @@ class HubSyncManager:
                 await self._command_lock.acquire()
                 try:
                     if self._urgent_lockdown.is_set() and not enforcing_lockdown:
-                        return False
+                        return None
                     if state == "unlocked" and self._in_lockdown():
                         _LOGGER.warning(
                             "Hub sync refused hold-open for %s during lockdown",
                             hub_name,
                         )
-                        return False
+                        return None
                     # Settings publishes and retires Access clients under this
                     # same barrier. Resolve the getter only now so a waiter can
                     # never re-authenticate or command the object that Settings
@@ -2529,6 +2732,9 @@ class HubSyncManager:
                             hub_name,
                         )
                     else:
+                        authoritative_client = (
+                            self._has_authoritative_relay_state(access)
+                        )
                         if guard is not None and not await guard():
                             return None
                         if before_command is not None:
@@ -2616,8 +2822,19 @@ class HubSyncManager:
                         if isinstance(confirmation, dict):
                             confirmed_state = confirmation.get("state")
                             if confirmed_state in {"locked", "unlocked"}:
-                                return str(confirmed_state)
-                        return state
+                                return _HubDriveResult(
+                                    state=str(confirmed_state),
+                                    authoritative_relay=authoritative_client,
+                                )
+                        # A legacy command may confirm only the private rule,
+                        # and test doubles/older clients may return no relay
+                        # payload. Preserve command success for convergence,
+                        # but never present the requested state as physical
+                        # evidence.
+                        return _HubDriveResult(
+                            state=state,
+                            authoritative_relay=False,
+                        )
                 finally:
                     _release_barrier()
             except Exception as exc:
@@ -2655,8 +2872,8 @@ class HubSyncManager:
                 except asyncio.TimeoutError:
                     pass
                 if self._urgent_lockdown.is_set():
-                    return False
-        return False
+                    return None
+        return None
 
     async def _notify_sync_failed(
         self, entity_id: str, lock_name: str, reason: str = "apply_failed"

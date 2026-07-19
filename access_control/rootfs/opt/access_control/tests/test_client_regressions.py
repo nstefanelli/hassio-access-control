@@ -8,15 +8,27 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from access_control.access_client import (
     AccessClient,
     AccessClientError,
+    AccessCommandAcceptedUnconfirmedError,
+    AccessCommandOutcomeUnknownError,
     AccessLegacyEndpointGoneError,
 )
 
+_MISSING = object()
+
 
 class _Response:
-    def __init__(self, *, status=200, headers=None, payload=None) -> None:
+    def __init__(
+        self,
+        *,
+        status=200,
+        headers=None,
+        payload=_MISSING,
+        body="",
+    ) -> None:
         self.status = status
         self.headers = headers or {}
-        self._payload = payload or {}
+        self._payload = {} if payload is _MISSING else payload
+        self._body = body
         self.connection = None
 
     async def __aenter__(self):
@@ -29,7 +41,21 @@ class _Response:
         return self._payload
 
     async def text(self):
-        return ""
+        return self._body
+
+
+class _RawResponse(_Response):
+    """Response whose body cannot be decoded as JSON."""
+
+    def __init__(self, body: str, *, status=200) -> None:
+        super().__init__(status=status)
+        self._body = body
+
+    async def json(self, **_kwargs):
+        raise ValueError("invalid or empty JSON")
+
+    async def text(self):
+        return self._body
 
 
 class _IdentitySession:
@@ -120,6 +146,25 @@ class AccessClientRequestTests(unittest.IsolatedAsyncioTestCase):
         retry_headers = session.request.await_args_list[1].kwargs["headers"]
         self.assertEqual(retry_headers["X-CSRF-Token"], "new-csrf")
         self.assertEqual(retry_headers["Cookie"], "TOKEN=new-cookie")
+
+    async def test_mutating_transport_timeout_is_outcome_unknown(self) -> None:
+        client = AccessClient("unvr.local", "service", "secret")
+        client._csrf_token = "csrf"
+        client._auth_cookie = "cookie"
+        session = MagicMock()
+        session.closed = False
+        session.request = AsyncMock(side_effect=asyncio.TimeoutError())
+        client._session = session
+
+        with self.assertRaises(AccessCommandOutcomeUnknownError):
+            await client._request("PUT", "/proxy/access/mutate")
+
+        with self.assertRaises(AccessClientError) as read_error:
+            await client._request("GET", "/proxy/access/read")
+        self.assertNotIsInstance(
+            read_error.exception,
+            AccessCommandOutcomeUnknownError,
+        )
 
     async def test_login_publishes_auth_only_after_site_identity_verifies(self) -> None:
         gate = asyncio.Event()
@@ -245,6 +290,372 @@ class AccessClientRequestTests(unittest.IsolatedAsyncioTestCase):
             await client.fetch_users()
 
 
+class AccessClientMutationEnvelopeTests(unittest.IsolatedAsyncioTestCase):
+    _OBJECT_MUTATIONS = (
+        (
+            "visitor create",
+            "create_visitor",
+            ("Ada", "Visitor", 100, 200),
+            {},
+        ),
+        (
+            "visitor update",
+            "update_visitor",
+            ("visitor-1",),
+            {"end_time": 300},
+        ),
+        ("user create", "create_user", ("Ada", "User"), {}),
+        ("PIN update", "set_user_pin", ("user-1", "123456"), {}),
+        ("PIN removal", "remove_user_pin", ("user-1",), {}),
+    )
+    _EMPTY_COMPATIBLE_MUTATIONS = (
+        ("visitor delete", "delete_visitor", ("visitor-1",)),
+        ("momentary unlock", "unlock_momentary", ("door-1",)),
+    )
+
+    async def test_object_mutations_return_only_object_data(self) -> None:
+        expected = {"unique_id": "upstream-1"}
+        for name, method, args, kwargs in self._OBJECT_MUTATIONS:
+            client = AccessClient("unvr.local", "service", "secret")
+            client._request = AsyncMock(
+                return_value=_Response(
+                    payload={
+                        "code": "SUCCESS",
+                        "meta": {"rc": "ok"},
+                        "data": expected,
+                    }
+                )
+            )
+
+            with self.subTest(operation=name):
+                self.assertEqual(
+                    await getattr(client, method)(*args, **kwargs),
+                    expected,
+                )
+
+    async def test_object_mutations_reject_explicit_failure_envelopes(self) -> None:
+        failures = (
+            {"code": "OPERATION_FAILED", "data": {}},
+            {"meta": {"rc": "error"}, "data": {}},
+            {
+                "code": "SUCCESS",
+                "meta": {"rc": "error"},
+                "data": {},
+            },
+            {"success": False, "data": {}},
+        )
+        for payload in failures:
+            for name, method, args, kwargs in self._OBJECT_MUTATIONS:
+                client = AccessClient("unvr.local", "service", "secret")
+                client._request = AsyncMock(
+                    return_value=_Response(payload=payload)
+                )
+                with self.subTest(operation=name, payload=payload):
+                    with self.assertRaisesRegex(
+                        AccessClientError, "rejected"
+                    ):
+                        await getattr(client, method)(*args, **kwargs)
+
+    async def test_object_mutations_reject_missing_or_wrong_data(self) -> None:
+        malformed = (
+            {},
+            {"code": "SUCCESS"},
+            {"data": None},
+            {"data": []},
+            {"data": "success"},
+        )
+        for payload in malformed:
+            for name, method, args, kwargs in self._OBJECT_MUTATIONS:
+                client = AccessClient("unvr.local", "service", "secret")
+                client._request = AsyncMock(
+                    return_value=_Response(payload=payload)
+                )
+                with self.subTest(operation=name, payload=payload):
+                    with self.assertRaisesRegex(
+                        AccessClientError, "invalid data"
+                    ):
+                        await getattr(client, method)(*args, **kwargs)
+
+    async def test_object_mutations_reject_malformed_json_and_non_objects(
+        self,
+    ) -> None:
+        response_factories = (
+            lambda: _RawResponse(""),
+            lambda: _RawResponse("{not-json"),
+            lambda: _Response(payload=None),
+            lambda: _Response(payload=[]),
+        )
+        for response_factory in response_factories:
+            for name, method, args, kwargs in self._OBJECT_MUTATIONS:
+                client = AccessClient("unvr.local", "service", "secret")
+                client._request = AsyncMock(return_value=response_factory())
+                with self.subTest(
+                    operation=name,
+                    response=response_factory,
+                ):
+                    with self.assertRaises(AccessClientError):
+                        await getattr(client, method)(*args, **kwargs)
+
+    async def test_delete_and_momentary_unlock_accept_empty_body(self) -> None:
+        for response_factory in (
+            lambda: _RawResponse(" \r\n"),
+            lambda: _Response(payload=None, body=""),
+        ):
+            for name, method, args in self._EMPTY_COMPATIBLE_MUTATIONS:
+                client = AccessClient("unvr.local", "service", "secret")
+                client._request = AsyncMock(
+                    return_value=response_factory()
+                )
+                with self.subTest(operation=name, response=response_factory):
+                    await getattr(client, method)(*args)
+
+    async def test_delete_and_momentary_unlock_accept_success_envelopes(
+        self,
+    ) -> None:
+        for payload in (
+            {},
+            {"code": "SUCCESS"},
+            {"meta": {"rc": "ok"}},
+        ):
+            for name, method, args in self._EMPTY_COMPATIBLE_MUTATIONS:
+                client = AccessClient("unvr.local", "service", "secret")
+                client._request = AsyncMock(
+                    return_value=_Response(payload=payload)
+                )
+                with self.subTest(operation=name, payload=payload):
+                    await getattr(client, method)(*args)
+
+    async def test_delete_and_momentary_unlock_reject_explicit_failures(
+        self,
+    ) -> None:
+        failures = (
+            {"code": "OPERATION_FAILED"},
+            {"meta": {"rc": "error"}},
+            {"code": "SUCCESS", "meta": {"rc": "error"}},
+            {"success": False},
+        )
+        for payload in failures:
+            for name, method, args in self._EMPTY_COMPATIBLE_MUTATIONS:
+                client = AccessClient("unvr.local", "service", "secret")
+                client._request = AsyncMock(
+                    return_value=_Response(payload=payload)
+                )
+                with self.subTest(operation=name, payload=payload):
+                    with self.assertRaisesRegex(
+                        AccessClientError, "rejected"
+                    ):
+                        await getattr(client, method)(*args)
+
+    async def test_delete_and_momentary_unlock_reject_malformed_body(
+        self,
+    ) -> None:
+        for response_factory in (
+            lambda: _RawResponse("{not-json"),
+            lambda: _Response(payload=None, body="null"),
+            lambda: _Response(payload=[]),
+        ):
+            for name, method, args in self._EMPTY_COMPATIBLE_MUTATIONS:
+                client = AccessClient("unvr.local", "service", "secret")
+                client._request = AsyncMock(return_value=response_factory())
+                with self.subTest(
+                    operation=name,
+                    response=response_factory,
+                ):
+                    with self.assertRaises(AccessClientError):
+                        await getattr(client, method)(*args)
+
+
+class AccessClientMomentaryConfirmationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmed_unlock_polls_relay_after_acceptance_hook(
+        self,
+    ) -> None:
+        client = AccessClient(
+            "unvr.local",
+            "service",
+            "secret",
+            api_token="open-api-secret",
+        )
+        client._request = AsyncMock(return_value=_RawResponse(""))
+        hook = MagicMock()
+
+        states = iter(("locked", "locked", "unlocked"))
+
+        async def read_state(device_id, *, location_id=None):
+            self.assertEqual(device_id, "door-1")
+            self.assertEqual(location_id, "door-1")
+            hook.assert_called_once_with()
+            return next(states)
+
+        client.get_door_state = AsyncMock(side_effect=read_state)
+        sleep = AsyncMock()
+        with patch(
+            "access_control.access_client.asyncio.sleep",
+            new=sleep,
+        ):
+            result = await client.unlock_momentary_confirmed(
+                "door-1",
+                on_written=hook,
+            )
+
+        self.assertEqual(result, {"state": "unlocked"})
+        hook.assert_called_once_with()
+        self.assertEqual(client.get_door_state.await_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in sleep.await_args_list],
+            [0.25, 0.5],
+        )
+
+    async def test_confirmed_unlock_timeout_is_accepted_unconfirmed(
+        self,
+    ) -> None:
+        client = AccessClient(
+            "unvr.local",
+            "service",
+            "secret",
+            api_token="open-api-secret",
+        )
+        client._request = AsyncMock(
+            return_value=_Response(payload={"code": "SUCCESS"})
+        )
+        client.get_door_state = AsyncMock(
+            side_effect=[
+                "locked",
+                AccessClientError("temporary read failure"),
+                "locked",
+                AccessClientError("temporary read failure"),
+                "locked",
+                "locked",
+            ]
+        )
+        hook = MagicMock()
+        sleep = AsyncMock()
+
+        with patch(
+            "access_control.access_client.asyncio.sleep",
+            new=sleep,
+        ):
+            with self.assertRaisesRegex(
+                AccessCommandAcceptedUnconfirmedError,
+                "accepted.*relay did not report unlocked",
+            ):
+                await client.unlock_momentary_confirmed(
+                    "door-2",
+                    on_written=hook,
+                )
+
+        hook.assert_called_once_with()
+        self.assertEqual(client.get_door_state.await_count, 6)
+        self.assertEqual(
+            [call.args[0] for call in sleep.await_args_list],
+            [0.25, 0.5, 1.0, 1.5, 2.0],
+        )
+
+    async def test_momentary_confirmation_has_one_wall_clock_deadline(
+        self,
+    ) -> None:
+        client = AccessClient(
+            "unvr.local",
+            "service",
+            "secret",
+            api_token="open-api-secret",
+        )
+        client._request = AsyncMock(return_value=_RawResponse(""))
+
+        async def hung_read(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        client.get_door_state = AsyncMock(side_effect=hung_read)
+
+        with patch(
+            "access_control.access_client._LOCK_CONFIRM_WINDOW",
+            0.02,
+        ):
+            with self.assertRaises(AccessCommandAcceptedUnconfirmedError):
+                await asyncio.wait_for(
+                    client.unlock_momentary_confirmed("door-deadline"),
+                    timeout=0.2,
+                )
+
+    async def test_rule_confirmation_has_one_wall_clock_deadline(self) -> None:
+        client = AccessClient(
+            "unvr.local",
+            "service",
+            "secret",
+            api_token="open-api-secret",
+        )
+        calls = 0
+
+        async def write_then_hang(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return "success"
+            await asyncio.Event().wait()
+
+        client._open_api_request = AsyncMock(side_effect=write_then_hang)
+
+        with patch(
+            "access_control.access_client._LOCK_CONFIRM_WINDOW",
+            0.02,
+        ):
+            with self.assertRaises(AccessCommandAcceptedUnconfirmedError):
+                await asyncio.wait_for(
+                    client.hold_unlocked(
+                        "hub-deadline",
+                        location_id="door-deadline",
+                    ),
+                    timeout=0.2,
+                )
+
+    async def test_confirmed_unlock_without_token_is_accepted_unconfirmed(
+        self,
+    ) -> None:
+        client = AccessClient("unvr.local", "service", "secret")
+        client._request = AsyncMock(return_value=_RawResponse(""))
+        client.get_door_state = AsyncMock()
+        hook = MagicMock()
+
+        with self.assertRaisesRegex(
+            AccessCommandAcceptedUnconfirmedError,
+            "accepted.*Open API token is required",
+        ):
+            await client.unlock_momentary_confirmed(
+                "door-3",
+                on_written=hook,
+            )
+
+        hook.assert_called_once_with()
+        client.get_door_state.assert_not_awaited()
+
+    async def test_confirmed_unlock_preserves_prewrite_rejection(self) -> None:
+        client = AccessClient(
+            "unvr.local",
+            "service",
+            "secret",
+            api_token="open-api-secret",
+        )
+        client._request = AsyncMock(
+            return_value=_Response(
+                payload={"code": "OPERATION_FAILED"}
+            )
+        )
+        client.get_door_state = AsyncMock()
+        hook = MagicMock()
+
+        with self.assertRaises(AccessClientError) as raised:
+            await client.unlock_momentary_confirmed(
+                "door-4",
+                on_written=hook,
+            )
+
+        self.assertNotIsInstance(
+            raised.exception,
+            AccessCommandAcceptedUnconfirmedError,
+        )
+        hook.assert_not_called()
+        client.get_door_state.assert_not_awaited()
+
+
 class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _official_client(*responses: _Response) -> tuple[AccessClient, MagicMock]:
@@ -302,6 +713,37 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("Cookie", put.kwargs["headers"])
         self.assertNotIn("hub-device-1", put.args[1])
+
+    async def test_official_mutation_missing_code_is_outcome_unknown(self) -> None:
+        client, _session = self._official_client(
+            _Response(payload={"data": "success"})
+        )
+
+        with self.assertRaises(AccessCommandOutcomeUnknownError):
+            await client._open_api_request(
+                "PUT",
+                "/api/v1/developer/doors/door-1/lock_rule",
+                json_body={"type": "keep_lock"},
+            )
+
+        rejected, _session = self._official_client(
+            _Response(
+                payload={
+                    "code": "CODE_OPERATION_FORBIDDEN",
+                    "data": None,
+                }
+            )
+        )
+        with self.assertRaises(AccessClientError) as raised:
+            await rejected._open_api_request(
+                "PUT",
+                "/api/v1/developer/doors/door-1/lock_rule",
+                json_body={"type": "keep_lock"},
+            )
+        self.assertNotIsInstance(
+            raised.exception,
+            AccessCommandOutcomeUnknownError,
+        )
 
     async def test_explicit_official_command_semantics(self) -> None:
         cases = (
@@ -420,6 +862,33 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
         write = client._request.await_args_list[1]
         self.assertEqual(write.kwargs["json"], {"lock_rule": "reset"})
 
+    async def test_legacy_restore_accepts_reset_without_guessing_relay_state(
+        self,
+    ) -> None:
+        client = AccessClient("unvr.local", "service", "secret")
+        client._request = AsyncMock(
+            side_effect=[
+                _Response(
+                    payload={
+                        "meta": {"rc": "ok"},
+                        "data": {"lock_rule": {"type": "keep_unlock"}},
+                    }
+                ),
+                _Response(payload={"meta": {"rc": "ok"}}),
+                _Response(
+                    payload={
+                        "meta": {"rc": "ok"},
+                        "data": {"lock_rule": {"type": "reset"}},
+                    }
+                ),
+            ]
+        )
+
+        result = await client.restore_native_rule("hub-1")
+
+        self.assertEqual(result, {"type": "reset"})
+        self.assertEqual(client._request.await_count, 3)
+
     async def test_restore_rejects_stale_lock_early_as_follow_schedule(self) -> None:
         client = AccessClient(
             "unvr.local", "service", "secret", api_token="token"
@@ -439,6 +908,37 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client._open_api_request.await_count, 8)
 
+    async def test_restore_rejects_changed_closed_override_as_follow_schedule(
+        self,
+    ) -> None:
+        """Changed metadata does not turn lock_early/lock_now into a reset."""
+        for override in ("lock_early", "lock_now"):
+            with self.subTest(override=override):
+                client = AccessClient(
+                    "unvr.local", "service", "secret", api_token="token"
+                )
+                previous = {"type": override, "ended_time": 100}
+                changed = [
+                    {"type": override, "ended_time": ended}
+                    for ended in range(101, 107)
+                ]
+                client._open_api_request = AsyncMock(
+                    side_effect=[previous, "success", *changed]
+                )
+
+                with patch(
+                    "access_control.access_client.asyncio.sleep",
+                    new=AsyncMock(),
+                ):
+                    with self.assertRaises(
+                        AccessCommandAcceptedUnconfirmedError
+                    ):
+                        await client.restore_native_rule(
+                            "hub-1", location_id="door-1"
+                        )
+
+                self.assertEqual(client._open_api_request.await_count, 8)
+
     async def test_confirmation_is_bounded_and_rejects_stale_rule(self) -> None:
         client = AccessClient(
             "unvr.local",
@@ -455,10 +955,28 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("access_control.access_client.asyncio.sleep", new=AsyncMock()):
-            with self.assertRaisesRegex(AccessClientError, "not confirmed"):
+            with self.assertRaisesRegex(
+                AccessCommandAcceptedUnconfirmedError, "not confirmed"
+            ):
                 await client.hold_unlocked("hub-1", location_id="door-1")
 
         self.assertEqual(client._open_api_request.await_count, 7)
+
+    async def test_prewrite_rejection_is_not_accepted_unconfirmed(self) -> None:
+        client = AccessClient(
+            "unvr.local", "service", "secret", api_token="token"
+        )
+        client._open_api_request = AsyncMock(
+            side_effect=AccessClientError("write rejected")
+        )
+
+        with self.assertRaises(AccessClientError) as raised:
+            await client.hold_unlocked("hub-1", location_id="door-1")
+
+        self.assertNotIsInstance(
+            raised.exception, AccessCommandAcceptedUnconfirmedError
+        )
+        self.assertEqual(client._open_api_request.await_count, 1)
 
     async def test_release_persistent_lock_rejects_stale_keep_lock(self) -> None:
         """A relay-locked readback must not prove that keep_lock was removed."""
@@ -488,6 +1006,35 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client._open_api_request.await_count, 8)
 
+    async def test_release_persistent_lock_rejects_changed_keep_lock_metadata(
+        self,
+    ) -> None:
+        client = AccessClient(
+            "unvr.local", "service", "secret", api_token="token"
+        )
+        client.get_lock_rule = AsyncMock(
+            side_effect=[
+                {"type": "keep_lock", "ended_time": 100},
+                *(
+                    {"type": "keep_lock", "ended_time": ended}
+                    for ended in range(101, 107)
+                ),
+            ]
+        )
+        client.get_door_state = AsyncMock(return_value="locked")
+        client._open_api_request = AsyncMock(return_value="success")
+
+        with patch("access_control.access_client.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(AccessCommandAcceptedUnconfirmedError):
+                await client.release_persistent_lock(
+                    "hub-1",
+                    location_id="door-1",
+                )
+
+        self.assertEqual(client.get_lock_rule.await_count, 7)
+        client.get_door_state.assert_not_awaited()
+        client._open_api_request.assert_awaited_once()
+
     async def test_release_persistent_lock_accepts_changed_locked_rule(self) -> None:
         client = AccessClient(
             "unvr.local",
@@ -513,6 +1060,32 @@ class AccessClientLockRuleTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result, {"type": "lock_early", "state": "locked"})
+        self.assertEqual(client._open_api_request.await_count, 4)
+
+    async def test_release_persistent_lock_accepts_reset_with_locked_relay(
+        self,
+    ) -> None:
+        client = AccessClient(
+            "unvr.local", "service", "secret", api_token="token"
+        )
+        client._open_api_request = AsyncMock(
+            side_effect=[
+                {"type": "keep_lock", "ended_time": None},
+                "success",
+                {"type": "reset", "ended_time": 0},
+                {
+                    "id": "door-1",
+                    "door_lock_relay_status": "lock",
+                },
+            ]
+        )
+
+        result = await client.release_persistent_lock(
+            "hub-1",
+            location_id="door-1",
+        )
+
+        self.assertEqual(result, {"type": "reset", "state": "locked"})
         self.assertEqual(client._open_api_request.await_count, 4)
 
     # ------------------------------------------------------------------
@@ -881,6 +1454,90 @@ class _ProtectLoginResponse:
 
     async def text(self):
         return ""
+
+
+class AccessClientLifetimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_close_drains_inflight_command_confirmation(self) -> None:
+        client = AccessClient(
+            "access.local",
+            "service",
+            "secret",
+            api_token="token",
+        )
+        confirmation_started = asyncio.Event()
+        release_confirmation = asyncio.Event()
+
+        async def slow_confirmation(*_args, **_kwargs):
+            confirmation_started.set()
+            await release_confirmation.wait()
+            return {"type": "keep_unlock", "state": "unlocked"}
+
+        client._write_rule_and_confirm_leased = AsyncMock(
+            side_effect=slow_confirmation
+        )
+        command = asyncio.create_task(
+            client.hold_unlocked(
+                "hub-1",
+                location_id="door-1",
+            )
+        )
+        await confirmation_started.wait()
+
+        closing = asyncio.create_task(client.close())
+        await asyncio.sleep(0)
+        self.assertFalse(closing.done())
+        self.assertFalse(client._closed)
+
+        release_confirmation.set()
+        self.assertEqual(
+            await command,
+            {"type": "keep_unlock", "state": "unlocked"},
+        )
+        await closing
+        self.assertTrue(client._closed)
+        self.assertEqual(client._active_operations, 0)
+
+        with self.assertRaisesRegex(AccessClientError, "closing"):
+            await client.hold_unlocked(
+                "hub-1",
+                location_id="door-1",
+            )
+
+    async def test_cancelled_close_still_drains_active_command(self) -> None:
+        client = AccessClient(
+            "access.local",
+            "service",
+            "secret",
+            api_token="token",
+        )
+        confirmation_started = asyncio.Event()
+        release_confirmation = asyncio.Event()
+
+        async def slow_confirmation(*_args, **_kwargs):
+            confirmation_started.set()
+            await release_confirmation.wait()
+            return {"type": "keep_lock", "state": "locked"}
+
+        client._write_rule_and_confirm_leased = AsyncMock(
+            side_effect=slow_confirmation
+        )
+        command = asyncio.create_task(
+            client.hold_locked("hub-1", location_id="door-1")
+        )
+        await confirmation_started.wait()
+        closing = asyncio.create_task(client.close())
+        while not client._closing:
+            await asyncio.sleep(0)
+
+        closing.cancel()
+        release_confirmation.set()
+        await command
+        with self.assertRaises(asyncio.CancelledError):
+            await closing
+
+        self.assertTrue(client._closed)
+        self.assertEqual(client._active_operations, 0)
+        await client.close()
 
 
 class ProtectClientLoginTests(unittest.IsolatedAsyncioTestCase):

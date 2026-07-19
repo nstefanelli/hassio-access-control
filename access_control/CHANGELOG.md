@@ -16,6 +16,109 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Ingress path resolution, the official Open API's empty rule type for idle
   doors, and CSRF-protected sign-out.
 
+## [1.6.0] - 2026-07-18
+
+### Changed
+
+- Access commands now distinguish a controller-accepted write from an
+  authoritatively confirmed relay state. Native momentary unlocks require an
+  unlocked readback from the official Access Open API before authorization is
+  granted or an alarm is automatically disarmed; persistent lock and unlock
+  paths likewise surface `accepted_unconfirmed` (HTTP 202 on API paths) when a
+  write succeeds but its resulting state cannot be proved. The global physical
+  command barrier is released after the write and before bounded readback, so
+  confirmation latency on one door does not block unrelated doors; a shared
+  per-entity lock still preserves write/readback order for the same door.
+- Health reporting now marks unresolved safety states as `critical` and
+  upstream disconnects, open circuit breakers, and an unavailable configured
+  Open API as `degraded`; optional Protect connectivity affects the aggregate
+  only when a configured doorbell path uses it. Lockdown, lock-mode, and
+  individual access-rule mutations now produce attributable admin audit
+  entries without audit-storage failures obscuring the mutation result.
+- Home Assistant packaging now uses the 2026.04+ Dockerfile-first generic
+  multi-architecture builder flow and the Python 3.12 Alpine 3.24 base image;
+  the obsolete `build.yaml` and `BUILD_FROM` build argument are no longer
+  required.
+- Development dependencies now use `httpx2` for compatibility with the current
+  Starlette test client.
+
+### Fixed
+
+- Re-lock intent is persisted before unlock side effects and retained across
+  task cancellation, uncertain confirmation, restart recovery, and retry
+  paths, preventing cancellation from silently dropping a safety-critical
+  re-lock.
+- Hub synchronization now treats only official Open API relay readback as
+  independent Access state evidence. Legacy rule acknowledgements cannot
+  release the locked-wins fail-safe latch or satisfy lockdown confirmation.
+  Relay authority remains attached to the exact client that produced it across
+  live Settings replacement, and external rule supersession cannot clear the
+  fail-safe latch before both sides are authoritatively locked.
+- Mutation timeouts, connection resets, malformed success envelopes, and
+  post-acceptance cancellation now preserve truthful `unknown` state and
+  accepted-unconfirmed audit evidence. Native confirmation has one hard
+  six-second wall-clock budget, while an in-flight accepted operation leases
+  its client through readback so replacement cannot resurrect a retired
+  session.
+- Remote mirroring, durable re-lock failures, and HA disconnects invalidate
+  stale command state. The Locks page orders cached HA snapshots and confirmed
+  command observations by monotonic acquisition time, so a pre-command
+  snapshot cannot overwrite a newer result while later HA observations still
+  capture external changes. Same-entity command flows remain ordered through
+  confirmation.
+- HA physical workflows now lease the exact client that issued the write
+  through state readback. Live Settings replacement publishes the tested new
+  client atomically, drains the retired client outside the global write
+  barrier, and prevents a closed client from recreating an unowned session.
+  Client close cleanup now finishes through caller cancellation before
+  propagating it.
+- Home Assistant connection probes now update circuit-breaker state, stale
+  while-revalidate tasks are lifecycle-owned, and manager teardown is bounded
+  so shutdown can make deterministic progress within the Supervisor grace
+  period.
+- Access rules now have a database-enforced unique `(user_id, lock_id)`
+  invariant, closing concurrent duplicate-creation races. Enabled toggles and
+  schedule edits use separate atomic SQL updates so a stale concurrent
+  schedule save cannot re-enable a disabled grant.
+
+### Security
+
+- Newly created admin accounts require a password of at least 12 characters,
+  and new environment-backed setups require a secret key of at least 32
+  characters.
+- Stored secret-key verifiers now use a salted, versioned PBKDF2-SHA256 format.
+  A matching legacy unsalted fingerprint is migrated only after successful
+  verification.
+- Private Access mutation responses now reject malformed envelopes and explicit
+  controller failure markers instead of treating every HTTP success as an
+  accepted command.
+
+### Compatibility and migration
+
+- An Access Open API token is required for authoritative native relay
+  confirmation. Without one, a controller-accepted native command is reported
+  as unconfirmed and does not trigger authorization-dependent side effects.
+- Database migration 26 deduplicates existing access rules conservatively:
+  identical duplicates keep the oldest row, while conflicting duplicates keep
+  the oldest row disabled with its schedule cleared. Review disabled rules
+  after upgrading if the database previously contained duplicates.
+- Backups are now declared `cold` because SQLite WAL state includes durable
+  re-lock and lockdown ownership. Home Assistant Supervisor stops the app
+  during backup, so access-control automation is unavailable for that interval.
+
+### Known limitations
+
+- Access relay and Home Assistant entity state are controller observations,
+  not independent door-contact, latch, mechanical-bolt, jam, or egress proof.
+- Protect sessions are not yet bound to a persisted site namespace. Review
+  camera mappings after a Protect host change.
+- UniFi TLS uses encryption without peer verification for common self-signed
+  local deployments. Keep the management network isolated until a trusted-CA
+  or reviewed certificate-pinning workflow is available.
+- Controller/firmware response timing, the current Open API port, physical
+  relay behavior, and Supervisor cold-backup restore still require validation
+  on a disposable deployment before broad unattended use.
+
 ## [1.5.12] - 2026-07-14
 
 ### Fixed

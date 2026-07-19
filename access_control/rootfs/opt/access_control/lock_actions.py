@@ -8,16 +8,30 @@ two HTTP surfaces from acquiring subtly different safety semantics.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+import time
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Literal
 
+from .access_client import (
+    AccessCommandAcceptedUnconfirmedError,
+    AccessCommandOutcomeUnknownError,
+)
 from .config import decrypt_value
+from .ha_client import ha_client_operation
 
 logger = logging.getLogger(__name__)
 
 LockAction = Literal["lock", "unlock", "buzz", "restore_schedule"]
-LockOutcome = Literal["granted", "denied", "error", "not_found"]
+LockOutcome = Literal[
+    "granted",
+    "accepted_unconfirmed",
+    "denied",
+    "error",
+    "not_found",
+]
 
 # Restoring an Access schedule can immediately reopen a door when its unlock
 # window is active, so it belongs on the same fail-closed path as unlock/buzz.
@@ -26,6 +40,32 @@ _DANGEROUS_DURING_LOCKDOWN = frozenset(
 )
 _HA_CONFIRM_ATTEMPTS = 3
 _HA_CONFIRM_INTERVAL = 0.25
+
+
+def publish_lock_state(
+    state,
+    entity_id: str,
+    value: str,
+    *,
+    observed_at: float | None = None,
+) -> bool:
+    """Publish state unless a newer observation already owns the cache."""
+    lock_states = getattr(state, "lock_states", None)
+    if lock_states is None:
+        lock_states = {}
+        state.lock_states = lock_states
+    updated_at = getattr(state, "lock_state_updated_at", None)
+    if updated_at is None:
+        updated_at = {}
+        state.lock_state_updated_at = updated_at
+    timestamp = (
+        time.monotonic() if observed_at is None else float(observed_at)
+    )
+    if updated_at.get(entity_id, -1.0) > timestamp:
+        return False
+    lock_states[entity_id] = value
+    updated_at[entity_id] = timestamp
+    return True
 
 
 @dataclass(frozen=True)
@@ -52,6 +92,35 @@ async def _confirm_ha_state(ha, entity_id: str, expected: str) -> bool:
         if attempt < _HA_CONFIRM_ATTEMPTS - 1:
             await asyncio.sleep(_HA_CONFIRM_INTERVAL)
     return False
+
+
+def _has_authoritative_access_relay(access) -> bool:
+    """Whether this exact client can read the official physical relay."""
+    if access is None:
+        return False
+    configured = bool(vars(access).get("open_api_configured", False))
+    if isinstance(
+        getattr(type(access), "open_api_configured", None), property
+    ):
+        configured = bool(access.open_api_configured)
+    return configured
+
+
+async def _complete_safety_cleanup(
+    awaitable, *, name: str
+) -> asyncio.CancelledError | None:
+    """Finish relock ownership cleanup even if the caller is cancelled again."""
+    task = asyncio.create_task(awaitable, name=name)
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            # Relock ownership must be resolved before cancellation escapes.
+            if cancellation is None:
+                cancellation = exc
+    task.result()
+    return cancellation
 
 
 def _lockdown_active(state) -> bool:
@@ -213,31 +282,71 @@ async def execute_lock_action(
     relock_manager = getattr(state, "relock_manager", None)
     command_lock = getattr(state, "physical_command_lock", None)
     command_lock_acquired = False
+    entity_lock_acquired = False
     relock_intent = None
     paused_relock = None
     paused_needs_resolution = False
+    physical_command_attempted = False
+    entity_locks = getattr(state, "physical_entity_locks", None)
+    if entity_locks is None:
+        entity_locks = {}
+        state.physical_entity_locks = entity_locks
+    if lock["type"] == "ha_external":
+        entity_key = f"ha:{lock.get('entity_id') or ''}"
+    else:
+        entity_key = (
+            f"access:{lock.get('device_id') or lock.get('location_id') or ''}"
+        )
+    entity_lock = entity_locks.setdefault(entity_key, asyncio.Lock())
 
-    async def release_barrier() -> None:
+    def release_barrier_now() -> None:
         nonlocal command_lock_acquired
         if command_lock_acquired:
             command_lock.release()
             command_lock_acquired = False
 
+    async def release_barrier() -> None:
+        release_barrier_now()
+
+    async def invoke_access_command(command, *args, **kwargs):
+        """Release the global barrier after write acceptance, before readback."""
+        nonlocal physical_command_attempted
+        physical_command_attempted = True
+        try:
+            supports_hook = (
+                "on_written" in inspect.signature(command).parameters
+            )
+        except (TypeError, ValueError):
+            supports_hook = False
+        if supports_hook:
+            return await command(
+                *args,
+                **kwargs,
+                on_written=release_barrier_now,
+            )
+        result = await command(*args, **kwargs)
+        release_barrier_now()
+        return result
+
     async def retain_intent() -> None:
         nonlocal relock_intent
         intent = relock_intent
-        relock_intent = None
         if relock_manager is not None and intent is not None:
             await relock_manager.retain_after_uncertain_unlock(intent)
+        relock_intent = None
 
     async def resume_paused() -> None:
         nonlocal paused_needs_resolution
         if relock_manager is not None and paused_needs_resolution:
-            paused_needs_resolution = False
             await relock_manager.resume(paused_relock)
+            paused_needs_resolution = False
 
     result: LockActionResult | None = None
+    ha_lease_stack = AsyncExitStack()
+    await ha_lease_stack.__aenter__()
     try:
+        await entity_lock.acquire()
+        entity_lock_acquired = True
         if command_lock is not None:
             await command_lock.acquire()
             command_lock_acquired = True
@@ -246,6 +355,12 @@ async def execute_lock_action(
         # request queued behind a Settings swap must not use the retired client.
         access = getattr(state, "access_client", None)
         ha = getattr(state, "ha_client", None)
+        if lock["type"] == "ha_external" and ha is not None:
+            # Enter while the publication barrier is held, then keep the exact
+            # client alive after releasing that barrier for state readback.
+            await ha_lease_stack.enter_async_context(
+                ha_client_operation(ha)
+            )
 
         # Force-lock is the only fail-safe direction that stays available
         # during lockdown. Restoring an active schedule may open the door.
@@ -257,42 +372,152 @@ async def execute_lock_action(
             location_id = lock.get("location_id")
             if access is None:
                 result = finish("error", reason="Access client unavailable")
-            elif action == "buzz":
-                if not location_id:
-                    result = finish(
-                        "error", reason="Access location is not configured"
-                    )
-                else:
-                    await access.unlock_momentary(location_id)
-                    result = finish("granted", confirmed_state="momentary")
-            elif not device_id:
-                result = finish(
-                    "error", reason="Access device is not configured"
-                )
-            elif action == "unlock":
-                await access.hold_unlocked(
-                    device_id, location_id=location_id
-                )
-                state.lock_states[device_id] = "unlocked"
-                result = finish("granted", confirmed_state="unlocked")
-            elif action == "lock":
-                await access.force_lock(device_id, location_id=location_id)
-                state.lock_states[device_id] = "locked"
-                result = finish("granted", confirmed_state="locked")
             else:
-                confirmation = await access.restore_native_rule(
-                    device_id, location_id=location_id
-                )
-                # Restoring a schedule confirms the control rule, not a single
-                # physical state: the active schedule decides open vs closed.
-                observed_state = (
-                    confirmation.get("state")
-                    if isinstance(confirmation, dict)
-                    else None
-                )
-                if observed_state in {"locked", "unlocked"}:
-                    state.lock_states[device_id] = observed_state
-                result = finish("granted", confirmed_state="scheduled")
+                try:
+                    if action == "buzz":
+                        if not location_id:
+                            result = finish(
+                                "error",
+                                reason="Access location is not configured",
+                            )
+                        else:
+                            confirmed_command = getattr(
+                                access,
+                                "unlock_momentary_confirmed",
+                                None,
+                            )
+                            if callable(confirmed_command):
+                                confirmation = await invoke_access_command(
+                                    confirmed_command,
+                                    location_id,
+                                )
+                                if (
+                                    not isinstance(confirmation, dict)
+                                    or confirmation.get("state") != "unlocked"
+                                ):
+                                    raise AccessCommandAcceptedUnconfirmedError(
+                                        "momentary unlock returned without "
+                                        "exact unlocked relay confirmation"
+                                    )
+                            else:
+                                # Compatibility clients can still issue the
+                                # write, but without official relay readback it
+                                # must remain explicitly unconfirmed.
+                                await invoke_access_command(
+                                    access.unlock_momentary,
+                                    location_id,
+                                )
+                                raise AccessCommandAcceptedUnconfirmedError(
+                                    "momentary unlock accepted without "
+                                    "authoritative relay readback"
+                                )
+                            if device_id:
+                                publish_lock_state(
+                                    state, device_id, "unlocked"
+                                )
+                            result = finish(
+                                "granted", confirmed_state="unlocked"
+                            )
+                    elif not device_id:
+                        result = finish(
+                            "error",
+                            reason="Access device is not configured",
+                        )
+                    elif action == "unlock":
+                        confirmation = await invoke_access_command(
+                            access.hold_unlocked,
+                            device_id,
+                            location_id=location_id,
+                        )
+                        if (
+                            not _has_authoritative_access_relay(access)
+                            or not isinstance(confirmation, dict)
+                            or confirmation.get("state") != "unlocked"
+                        ):
+                            raise AccessCommandAcceptedUnconfirmedError(
+                                "persistent unlock lacks authoritative "
+                                "unlocked relay confirmation"
+                            )
+                        publish_lock_state(state, device_id, "unlocked")
+                        result = finish(
+                            "granted", confirmed_state="unlocked"
+                        )
+                    elif action == "lock":
+                        confirmation = await invoke_access_command(
+                            access.force_lock,
+                            device_id,
+                            location_id=location_id,
+                        )
+                        if (
+                            not _has_authoritative_access_relay(access)
+                            or not isinstance(confirmation, dict)
+                            or confirmation.get("state") != "locked"
+                        ):
+                            raise AccessCommandAcceptedUnconfirmedError(
+                                "immediate lock lacks authoritative locked "
+                                "relay confirmation"
+                            )
+                        publish_lock_state(state, device_id, "locked")
+                        result = finish("granted", confirmed_state="locked")
+                    else:
+                        confirmation = await invoke_access_command(
+                            access.restore_native_rule,
+                            device_id,
+                            location_id=location_id,
+                        )
+                        # Restoring a schedule confirms the control rule, not a
+                        # single physical state: the active schedule decides
+                        # open vs closed.
+                        observed_state = (
+                            confirmation.get("state")
+                            if isinstance(confirmation, dict)
+                            else None
+                        )
+                        if (
+                            not _has_authoritative_access_relay(access)
+                            or observed_state not in {"locked", "unlocked"}
+                        ):
+                            raise AccessCommandAcceptedUnconfirmedError(
+                                "schedule restore lacks authoritative relay "
+                                "confirmation"
+                            )
+                        publish_lock_state(state, device_id, observed_state)
+                        result = finish(
+                            "granted", confirmed_state="scheduled"
+                        )
+                except AccessCommandAcceptedUnconfirmedError:
+                    # The mutation may already be active. Do not publish a
+                    # guessed state or permit the granted-only auto-disarm path.
+                    release_barrier_now()
+                    if device_id:
+                        publish_lock_state(state, device_id, "unknown")
+                    operation = {
+                        "buzz": "momentary unlock",
+                        "unlock": "persistent unlock",
+                        "lock": "immediate lock",
+                        "restore_schedule": "schedule restore",
+                    }[action]
+                    result = finish(
+                        "accepted_unconfirmed",
+                        reason=(
+                            f"UniFi Access accepted the {operation}, "
+                            "but the resulting door state is unconfirmed"
+                        ),
+                    )
+                except AccessCommandOutcomeUnknownError:
+                    # The transport failed after a mutating request began. The
+                    # controller may already have applied it, so neither
+                    # success nor a definite no-op is truthful.
+                    release_barrier_now()
+                    if device_id:
+                        publish_lock_state(state, device_id, "unknown")
+                    result = finish(
+                        "accepted_unconfirmed",
+                        reason=(
+                            "UniFi Access command outcome is unknown; the "
+                            "requested change may already be active"
+                        ),
+                    )
 
         elif lock["type"] == "ha_external":
             entity_id = lock.get("entity_id")
@@ -334,6 +559,7 @@ async def execute_lock_action(
                             hub_sync.mark_access_momentary(
                                 entity_id, float(duration)
                             )
+                    physical_command_attempted = True
                     accepted = await ha.unlock(entity_id)
                     await release_barrier()
                     confirmed = bool(
@@ -341,7 +567,7 @@ async def execute_lock_action(
                         and await _confirm_ha_state(ha, entity_id, "unlocked")
                     )
                     if confirmed:
-                        state.lock_states[entity_id] = "unlocked"
+                        publish_lock_state(state, entity_id, "unlocked")
                         try:
                             await relock_manager.extend_after_success(
                                 relock_intent, duration
@@ -357,8 +583,13 @@ async def execute_lock_action(
                         )
                     else:
                         await retain_intent()
+                        publish_lock_state(state, entity_id, "unknown")
                         result = finish(
-                            "error",
+                            (
+                                "accepted_unconfirmed"
+                                if accepted
+                                else "error"
+                            ),
                             reason=(
                                 "Home Assistant accepted unlock but did not confirm unlocked"
                                 if accepted
@@ -377,6 +608,7 @@ async def execute_lock_action(
                     hub_sync = getattr(state, "hub_sync_manager", None)
                     if hub_sync is not None:
                         hub_sync.mark_app_initiated_unlock(entity_id)
+                physical_command_attempted = True
                 accepted = (
                     await ha.unlock(entity_id)
                     if action == "unlock"
@@ -389,15 +621,20 @@ async def execute_lock_action(
                     and await _confirm_ha_state(ha, entity_id, expected)
                 )
                 if confirmed:
-                    state.lock_states[entity_id] = expected
+                    publish_lock_state(state, entity_id, expected)
                     if relock_manager is not None:
                         await relock_manager.cancel(entity_id)
                         paused_needs_resolution = False
                     result = finish("granted", confirmed_state=expected)
                 else:
                     await resume_paused()
+                    publish_lock_state(state, entity_id, "unknown")
                     result = finish(
-                        "error",
+                        (
+                            "accepted_unconfirmed"
+                            if accepted
+                            else "error"
+                        ),
                         reason=(
                             f"HA accepted {action} command but entity was not confirmed {expected}"
                             if accepted
@@ -408,22 +645,105 @@ async def execute_lock_action(
             result = finish(
                 "denied", reason=f"Unsupported lock type: {lock['type']}"
             )
-    except Exception:
-        logger.exception("Lock action %s failed for lock %s", action, lock_id)
+    except asyncio.CancelledError:
+        # HA may have accepted the command even though the request task was
+        # cancelled. Release the global physical-command barrier promptly, but
+        # do not let cancellation strand a durable relock row in `_paused` (or
+        # abandon a write-ahead timed-unlock intent) before propagating it.
+        await release_barrier()
+        if physical_command_attempted:
+            if lock["type"] == "access_native" and lock.get("device_id"):
+                publish_lock_state(
+                    state, lock["device_id"], "unknown"
+                )
+            elif lock["type"] == "ha_external" and lock.get("entity_id"):
+                publish_lock_state(
+                    state, lock["entity_id"], "unknown"
+                )
         try:
             if relock_intent is not None:
-                await retain_intent()
+                await _complete_safety_cleanup(
+                    retain_intent(),
+                    name=f"retain-relock-after-cancel-{lock_id}",
+                )
             elif paused_needs_resolution:
-                await resume_paused()
+                await _complete_safety_cleanup(
+                    resume_paused(),
+                    name=f"resume-relock-after-cancel-{lock_id}",
+                )
+        except Exception:
+            logger.exception(
+                "Failed to restore relock safety after cancelled %s on lock %s",
+                action,
+                lock_id,
+            )
+        cancelled_result = finish(
+            (
+                "accepted_unconfirmed"
+                if physical_command_attempted
+                else "error"
+            ),
+            reason=(
+                "Request cancelled after the upstream command was attempted; "
+                "the resulting physical state is unknown"
+                if physical_command_attempted
+                else "Request cancelled before the upstream command completed"
+            ),
+        )
+        try:
+            await _complete_safety_cleanup(
+                _audit_result(
+                    db,
+                    cancelled_result,
+                    actor=actor,
+                    source=source,
+                ),
+                name=f"audit-cancelled-lock-action-{lock_id}",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to audit cancelled %s on lock %s",
+                action,
+                lock_id,
+            )
+        raise
+    except Exception:
+        logger.exception("Lock action %s failed for lock %s", action, lock_id)
+        if physical_command_attempted:
+            if lock["type"] == "access_native" and lock.get("device_id"):
+                publish_lock_state(
+                    state, lock["device_id"], "unknown"
+                )
+            elif lock["type"] == "ha_external" and lock.get("entity_id"):
+                publish_lock_state(
+                    state, lock["entity_id"], "unknown"
+                )
+        cancellation = None
+        try:
+            if relock_intent is not None:
+                cancellation = await _complete_safety_cleanup(
+                    retain_intent(),
+                    name=f"retain-relock-after-error-{lock_id}",
+                )
+            elif paused_needs_resolution:
+                cancellation = await _complete_safety_cleanup(
+                    resume_paused(),
+                    name=f"resume-relock-after-error-{lock_id}",
+                )
         except Exception:
             logger.exception(
                 "Failed to restore relock safety after %s on lock %s",
                 action,
                 lock_id,
             )
+        if cancellation is not None:
+            raise cancellation
         result = finish("error", reason="Upstream lock command failed")
     finally:
         await release_barrier()
+        await ha_lease_stack.aclose()
+        if entity_lock_acquired:
+            entity_lock.release()
 
     assert result is not None
     await _audit_result(db, result, actor=actor, source=source)

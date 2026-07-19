@@ -320,6 +320,9 @@ _load_package()
 
 auth_engine_module = importlib.import_module("access_control.auth_engine")
 AuthEngine = auth_engine_module.AuthEngine
+AccessCommandAcceptedUnconfirmedError = (
+    auth_engine_module.AccessCommandAcceptedUnconfirmedError
+)
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +358,11 @@ def make_ha(alarm_state="disarmed"):
     ha.unlock = AsyncMock(return_value=True)
     ha.lock = AsyncMock(return_value=True)
     ha.fire_event = AsyncMock(return_value=True)
-    ha.get_entity_state = AsyncMock(return_value=alarm_state)
+    ha.get_entity_state = AsyncMock(
+        side_effect=lambda entity_id: (
+            "unlocked" if entity_id.startswith("lock.") else alarm_state
+        )
+    )
     ha.alarm_disarm = AsyncMock(return_value=True)
     return ha
 
@@ -590,6 +597,227 @@ class TestAuthEngineCanDisarmTriggersDisarm(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["granted"])
         ha.unlock.assert_awaited_once_with("lock.front")
         ha.alarm_disarm.assert_awaited_once_with("alarm_control_panel.main", code=None)
+
+
+class TestAuthEngineNativeMomentaryConfirmation(
+    unittest.IsolatedAsyncioTestCase
+):
+    @staticmethod
+    def _group(*, can_disarm: bool = False) -> dict:
+        return {
+            "id": 80,
+            "name": "Native access",
+            "all_locks": True,
+            "schedule_enabled": False,
+            "blocked_when_armed_away": False,
+            "blocked_when_armed_home": False,
+            "can_disarm": can_disarm,
+        }
+
+    @staticmethod
+    def _lock() -> dict:
+        return {
+            "id": 81,
+            "type": "access_native",
+            "device_id": "hub-native",
+            "location_id": "door-native",
+            "name": "Native Door",
+        }
+
+    async def test_accepted_unconfirmed_native_unlock_is_not_granted(
+        self,
+    ) -> None:
+        panel = {
+            "entity_id": "alarm_control_panel.main",
+            "disarm_code_encrypted": None,
+        }
+        db = make_db(
+            user=make_active_user(),
+            groups=[self._group(can_disarm=True)],
+            locks=[self._lock()],
+            alarm_panels=[panel],
+        )
+        ha = make_ha(alarm_state="armed_home")
+        access = SimpleNamespace(
+            unlock_momentary_confirmed=AsyncMock(
+                side_effect=AccessCommandAcceptedUnconfirmedError(
+                    "bounded relay readback expired"
+                )
+            )
+        )
+        cache_update = MagicMock()
+        engine = AuthEngine(
+            db=db,
+            access_client=access,
+            ha_client=ha,
+            on_lock_state=cache_update,
+        )
+
+        result = await engine.process_event(
+            "ulp-native",
+            "door-native",
+            method="nfc",
+        )
+
+        self.assertFalse(result["granted"])
+        self.assertEqual(result["locks"], [])
+        self.assertIn("did not confirm unlocked", result["reason"])
+        access.unlock_momentary_confirmed.assert_awaited_once()
+        cache_update.assert_called_once_with("hub-native", "unknown")
+        ha.fire_event.assert_not_awaited()
+        ha.alarm_disarm.assert_not_awaited()
+        db.log_access.assert_awaited_once_with(
+            method="nfc",
+            result="accepted_unconfirmed",
+            user_id=1,
+            user_name="Nick",
+            lock_id=81,
+            lock_name="Native Door",
+            reason=result["reason"],
+        )
+
+    async def test_confirmed_native_unlock_is_granted_and_cached(
+        self,
+    ) -> None:
+        db = make_db(
+            user=make_active_user(),
+            groups=[self._group()],
+            locks=[self._lock()],
+        )
+        ha = make_ha()
+        access = SimpleNamespace(
+            unlock_momentary_confirmed=AsyncMock(
+                return_value={"state": "unlocked"}
+            )
+        )
+        cache_update = MagicMock()
+        engine = AuthEngine(
+            db=db,
+            access_client=access,
+            ha_client=ha,
+            on_lock_state=cache_update,
+        )
+
+        result = await engine.process_event(
+            "ulp-native",
+            "door-native",
+            method="face",
+        )
+
+        self.assertTrue(result["granted"])
+        self.assertEqual(result["locks"], ["Native Door"])
+        cache_update.assert_called_once_with("hub-native", "unlocked")
+        ha.fire_event.assert_awaited_once()
+        db.log_access.assert_awaited_once_with(
+            method="face",
+            result="granted",
+            user_id=1,
+            user_name="Nick",
+            lock_id=81,
+            lock_name="Native Door",
+            reason=None,
+        )
+
+    async def test_cancel_after_native_write_marks_unknown_and_audits(
+        self,
+    ) -> None:
+        wrote = asyncio.Event()
+
+        async def accepted_then_wait(location_id, *, on_written=None):
+            self.assertEqual(location_id, "door-native")
+            if on_written is not None:
+                on_written()
+            wrote.set()
+            await asyncio.Event().wait()
+
+        db = make_db(
+            user=make_active_user(),
+            groups=[self._group()],
+            locks=[self._lock()],
+        )
+        cache_update = MagicMock()
+        engine = AuthEngine(
+            db=db,
+            access_client=SimpleNamespace(
+                unlock_momentary_confirmed=accepted_then_wait
+            ),
+            ha_client=make_ha(),
+            on_lock_state=cache_update,
+        )
+
+        task = asyncio.create_task(
+            engine.process_event(
+                "ulp-native",
+                "door-native",
+                method="nfc",
+            )
+        )
+        await wrote.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        cache_update.assert_called_once_with("hub-native", "unknown")
+        self.assertTrue(
+            any(
+                call.kwargs.get("result") == "accepted_unconfirmed"
+                and call.kwargs.get("lock_id") == 81
+                for call in db.log_access.await_args_list
+            )
+        )
+
+    async def test_native_confirmation_does_not_hold_command_barrier(
+        self,
+    ) -> None:
+        confirmation_started = asyncio.Event()
+        release_confirmation = asyncio.Event()
+
+        async def confirm_after_write(
+            location_id: str,
+            *,
+            on_written=None,
+        ) -> dict:
+            self.assertEqual(location_id, "door-native")
+            self.assertIsNotNone(on_written)
+            on_written()
+            confirmation_started.set()
+            await release_confirmation.wait()
+            return {"state": "unlocked"}
+
+        db = make_db(
+            user=make_active_user(),
+            groups=[self._group()],
+            locks=[self._lock()],
+        )
+        command_lock = asyncio.Lock()
+        engine = AuthEngine(
+            db=db,
+            access_client=SimpleNamespace(
+                unlock_momentary_confirmed=confirm_after_write
+            ),
+            ha_client=make_ha(),
+            command_lock=command_lock,
+        )
+        task = asyncio.create_task(
+            engine.process_event(
+                "ulp-native",
+                "door-native",
+                method="nfc",
+            )
+        )
+
+        acquired = False
+        try:
+            await asyncio.wait_for(confirmation_started.wait(), timeout=1)
+            await asyncio.wait_for(command_lock.acquire(), timeout=0.25)
+            acquired = True
+        finally:
+            if acquired:
+                command_lock.release()
+            release_confirmation.set()
+
+        result = await asyncio.wait_for(task, timeout=1)
+        self.assertTrue(result["granted"])
 
 
 class TestAuthEngineRestrictiveAlarmStates(unittest.IsolatedAsyncioTestCase):
@@ -914,6 +1142,177 @@ class TestScheduleTimezone(unittest.TestCase):
         # line is on a different weekday, so the schedule must deny.
         self.assertTrue(engine.set_timezone(west))
         self.assertFalse(engine._check_schedule(rule))
+
+
+class TestCredentialHaUnlockSafety(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _lock(**overrides):
+        lock = {
+            "id": 30,
+            "type": "ha_external",
+            "entity_id": "lock.credential",
+            "name": "Credential Door",
+            "relock_on_device_auth": 1,
+            "relock_duration": 30,
+        }
+        lock.update(overrides)
+        return lock
+
+    @staticmethod
+    def _db(lock):
+        return make_db(
+            user=make_active_user(),
+            groups=[
+                {
+                    "id": 1,
+                    "all_locks": True,
+                    "schedule_enabled": False,
+                }
+            ],
+            locks=[lock],
+        )
+
+    @staticmethod
+    def _manager(intent):
+        return SimpleNamespace(
+            schedule=AsyncMock(return_value=intent),
+            retain_after_uncertain_unlock=AsyncMock(return_value=True),
+            extend_after_success=AsyncMock(return_value=True),
+            pause=AsyncMock(return_value=None),
+            resume=AsyncMock(return_value=True),
+            cancel=AsyncMock(),
+        )
+
+    async def test_releases_barrier_then_confirms_and_updates_cache_callback(
+        self,
+    ) -> None:
+        lock = self._lock()
+        db = self._db(lock)
+        intent = object()
+        manager = self._manager(intent)
+        barrier = asyncio.Lock()
+        confirmation_started = asyncio.Event()
+        confirmation_release = asyncio.Event()
+        cache_update = MagicMock()
+        ha = make_ha()
+
+        async def confirm(entity_id):
+            self.assertEqual(entity_id, "lock.credential")
+            confirmation_started.set()
+            await confirmation_release.wait()
+            return "unlocked"
+
+        ha.get_entity_state = AsyncMock(side_effect=confirm)
+        engine = AuthEngine(
+            db=db,
+            access_client=None,
+            ha_client=ha,
+            relock_manager=manager,
+            command_lock=barrier,
+            on_lock_state=cache_update,
+        )
+
+        task = asyncio.create_task(
+            engine.process_event("ulp-1", "door-1", method="nfc")
+        )
+        await confirmation_started.wait()
+
+        # The HA write has returned, so confirmation must not own the app-wide
+        # physical-command barrier and the credential is not granted yet.
+        await asyncio.wait_for(barrier.acquire(), timeout=0.2)
+        barrier.release()
+        self.assertFalse(task.done())
+        cache_update.assert_not_called()
+
+        confirmation_release.set()
+        result = await task
+
+        self.assertTrue(result["granted"])
+        cache_update.assert_called_once_with("lock.credential", "unlocked")
+        manager.extend_after_success.assert_awaited_once_with(intent, 30)
+        manager.retain_after_uncertain_unlock.assert_not_awaited()
+
+    async def test_unconfirmed_unlock_is_not_granted_and_retains_intent(
+        self,
+    ) -> None:
+        lock = self._lock()
+        db = self._db(lock)
+        intent = object()
+        manager = self._manager(intent)
+        cache_update = MagicMock()
+        ha = make_ha()
+        ha.get_entity_state = AsyncMock(return_value="locked")
+        engine = AuthEngine(
+            db=db,
+            access_client=None,
+            ha_client=ha,
+            relock_manager=manager,
+            on_lock_state=cache_update,
+        )
+
+        with patch.object(auth_engine_module, "_HA_CONFIRM_INTERVAL", 0):
+            result = await engine.process_event(
+                "ulp-1", "door-1", method="nfc"
+            )
+
+        self.assertFalse(result["granted"])
+        self.assertEqual(ha.get_entity_state.await_count, 3)
+        cache_update.assert_called_once_with("lock.credential", "unknown")
+        manager.retain_after_uncertain_unlock.assert_awaited_once_with(intent)
+        manager.extend_after_success.assert_not_awaited()
+        self.assertTrue(
+            any(
+                call.kwargs.get("result") == "accepted_unconfirmed"
+                and call.kwargs.get("lock_id") == 30
+                for call in db.log_access.await_args_list
+            )
+        )
+
+    async def test_cancelled_confirmation_retains_intent_before_propagating(
+        self,
+    ) -> None:
+        lock = self._lock()
+        db = self._db(lock)
+        intent = object()
+        confirmation_started = asyncio.Event()
+        retain_started = asyncio.Event()
+        retain_release = asyncio.Event()
+
+        async def confirm(_entity_id):
+            confirmation_started.set()
+            await asyncio.Event().wait()
+
+        async def retain(received_intent):
+            self.assertIs(received_intent, intent)
+            retain_started.set()
+            await retain_release.wait()
+            return True
+
+        manager = self._manager(intent)
+        manager.retain_after_uncertain_unlock = AsyncMock(side_effect=retain)
+        ha = make_ha()
+        ha.get_entity_state = AsyncMock(side_effect=confirm)
+        engine = AuthEngine(
+            db=db,
+            access_client=None,
+            ha_client=ha,
+            relock_manager=manager,
+        )
+
+        task = asyncio.create_task(
+            engine.process_event("ulp-1", "door-1", method="nfc")
+        )
+        await confirmation_started.wait()
+        task.cancel()
+        await retain_started.wait()
+        self.assertFalse(task.done())
+
+        retain_release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        manager.retain_after_uncertain_unlock.assert_awaited_once_with(intent)
+        manager.extend_after_success.assert_not_awaited()
 
 
 class TestDeviceAuthMomentaryLease(unittest.IsolatedAsyncioTestCase):

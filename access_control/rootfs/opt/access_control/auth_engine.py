@@ -8,14 +8,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from contextlib import AsyncExitStack
 from datetime import datetime, time, timezone, tzinfo
 from typing import Any, Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
 
-from .access_client import AccessClient
+from .access_client import (
+    AccessClient,
+    AccessCommandAcceptedUnconfirmedError,
+    AccessCommandOutcomeUnknownError,
+)
 from .config import decrypt_value
 from .database import Database
-from .ha_client import HAClient
+from .ha_client import HAClient, ha_client_operation
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -34,6 +39,41 @@ DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _FULLY_RESTRICTIVE_ALARM_STATES = frozenset(
     {"triggered", "unknown", "armed_night", "arming", "pending"}
 )
+_HA_CONFIRM_ATTEMPTS = 3
+_HA_CONFIRM_INTERVAL = 0.25
+
+
+class HACommandAcceptedUnconfirmedError(RuntimeError):
+    """HA accepted a lock mutation but exact state readback did not converge."""
+
+
+async def _confirm_ha_state(ha, entity_id: str, expected: str) -> bool:
+    """Boundedly confirm the exact state using the client that wrote it."""
+    for attempt in range(_HA_CONFIRM_ATTEMPTS):
+        if await ha.get_entity_state(entity_id) == expected:
+            return True
+        if attempt < _HA_CONFIRM_ATTEMPTS - 1:
+            await asyncio.sleep(_HA_CONFIRM_INTERVAL)
+    return False
+
+
+async def _complete_safety_operation(
+    awaitable,
+    *,
+    name: str,
+) -> tuple[Any, asyncio.CancelledError | None]:
+    """Run relock ownership work to completion despite caller cancellation."""
+    task = asyncio.create_task(awaitable, name=name)
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            # Record cancellation for the caller, but do not allow it to strand
+            # a paused durable row or interrupt the only live relock intent.
+            if cancellation is None:
+                cancellation = exc
+    return task.result(), cancellation
 
 
 def _default_timezone() -> tzinfo:
@@ -79,6 +119,8 @@ class AuthEngine:
         command_lock: asyncio.Lock | None = None,
         on_lockdown_enabled: Callable[[], Awaitable[None]] | None = None,
         hub_sync_getter: Callable[[], Any] | None = None,
+        on_lock_state: Callable[[str, str], None] | None = None,
+        entity_command_locks: dict[str, asyncio.Lock] | None = None,
     ) -> None:
         self._db = db
         self._access_client = access_client
@@ -95,6 +137,12 @@ class AuthEngine:
         self._command_lock = command_lock or asyncio.Lock()
         self._lockdown_transition_lock = asyncio.Lock()
         self._on_lockdown_enabled = on_lockdown_enabled
+        self._on_lock_state = on_lock_state
+        self._entity_command_locks = (
+            entity_command_locks
+            if entity_command_locks is not None
+            else {}
+        )
         # Tiny in-memory cache for alarm state to avoid hammering HA on each event
         self._alarm_cache_value: str | None = None
         self._alarm_cache_expires: float = 0.0
@@ -420,16 +468,119 @@ class AuthEngine:
                         last_denied_reason = reason
                         continue
 
-            # Step 6: Authorized — unlock under the same barrier used by
-            # set_lockdown(). Once enabling lockdown returns, no command that
-            # began under the old state can still issue afterward.
+            # Step 6: Authorized — issue the physical unlock under the same
+            # barrier used by set_lockdown(). HA state confirmation deliberately
+            # happens after releasing it so an eventually-consistent readback
+            # cannot block unrelated physical commands or a lockdown transition.
             lockdown_won = False
             try:
-                async with self._command_lock:
-                    if self._lockdown:
-                        lockdown_won = True
-                    else:
-                        await self._unlock(lock)
+                if lock.get("type") == "ha_external":
+                    issued = await self._unlock_ha_external(
+                        lock,
+                        command_lock=self._command_lock,
+                        recheck_lockdown=True,
+                    )
+                    lockdown_won = not issued
+                elif lock.get("type") == "access_native":
+                    issued = await self._unlock_access_native(
+                        lock,
+                        command_lock=self._command_lock,
+                        recheck_lockdown=True,
+                    )
+                    lockdown_won = not issued
+                else:
+                    async with self._command_lock:
+                        if self._lockdown:
+                            lockdown_won = True
+                        else:
+                            await self._unlock(lock)
+            except asyncio.CancelledError:
+                reason = (
+                    "Unlock workflow was cancelled before physical state "
+                    "confirmation completed"
+                )
+                try:
+                    await _complete_safety_operation(
+                        self._log(
+                            method=method,
+                            result="accepted_unconfirmed",
+                            user_id=user_id,
+                            user_name=user_name,
+                            lock_id=lock_id,
+                            lock_name=lock_name,
+                            reason=reason,
+                        ),
+                        name=f"audit-cancelled-auth-unlock-{lock_id}",
+                    )
+                except Exception:
+                    _LOGGER.exception(
+                        "Failed to audit cancelled unlock for %s",
+                        lock_name,
+                    )
+                raise
+            except HACommandAcceptedUnconfirmedError as exc:
+                reason = (
+                    "Home Assistant accepted the unlock, but the lock entity "
+                    "did not confirm unlocked"
+                )
+                _LOGGER.warning(
+                    "Authorized HA unlock for %s remains unconfirmed: %s",
+                    lock_name,
+                    exc,
+                )
+                await self._log(
+                    method=method,
+                    result="accepted_unconfirmed",
+                    user_id=user_id,
+                    user_name=user_name,
+                    lock_id=lock_id,
+                    lock_name=lock_name,
+                    reason=reason,
+                )
+                last_denied_reason = reason
+                continue
+            except AccessCommandAcceptedUnconfirmedError as exc:
+                reason = (
+                    "UniFi Access accepted the momentary unlock, but the "
+                    "door relay did not confirm unlocked"
+                )
+                _LOGGER.warning(
+                    "Authorized unlock for %s remains unconfirmed: %s",
+                    lock_name,
+                    exc,
+                )
+                await self._log(
+                    method=method,
+                    result="accepted_unconfirmed",
+                    user_id=user_id,
+                    user_name=user_name,
+                    lock_id=lock_id,
+                    lock_name=lock_name,
+                    reason=reason,
+                )
+                last_denied_reason = reason
+                continue
+            except AccessCommandOutcomeUnknownError as exc:
+                reason = (
+                    "UniFi Access command outcome is unknown; the momentary "
+                    "unlock may already have occurred"
+                )
+                _LOGGER.warning(
+                    "Authorized unlock outcome for %s is unknown: %s",
+                    lock_name,
+                    exc,
+                )
+                await self._log(
+                    method=method,
+                    result="accepted_unconfirmed",
+                    user_id=user_id,
+                    user_name=user_name,
+                    lock_id=lock_id,
+                    lock_name=lock_name,
+                    reason=reason,
+                )
+                last_denied_reason = reason
+                continue
             except Exception as exc:
                 _LOGGER.error("Unlock failed for lock %s: %s", lock_name, exc)
                 await self._log(
@@ -560,94 +711,308 @@ class AuthEngine:
     # Unlock dispatch
     # ------------------------------------------------------------------
 
+    def _entity_command_lock(self, key: str) -> asyncio.Lock:
+        """Serialize write+readback workflows for one physical endpoint."""
+        return self._entity_command_locks.setdefault(key, asyncio.Lock())
+
     async def _unlock(self, lock: dict) -> None:
         """Dispatch unlock to the appropriate client based on lock type."""
         lock_type = lock.get("type", "")
 
         if lock_type == "access_native":
-            location_id = lock.get("location_id")
-            if not location_id:
-                raise ValueError(f"Native lock {lock.get('name')} has no location_id")
-            await self._access_client.unlock_momentary(location_id)
-            _LOGGER.info("Momentary unlock via Access API: lock=%s location=%s",
-                         lock.get("name"), location_id)
+            await self._unlock_access_native(lock)
 
         elif lock_type == "ha_external":
-            entity_id = lock.get("entity_id")
-            if not entity_id:
-                raise ValueError(f"HA external lock {lock.get('name')} has no entity_id")
-            relock_enabled = bool(lock.get("relock_on_device_auth"))
-            if relock_enabled and self._relock_manager is None:
-                raise RuntimeError(
-                    "Automatic relock is enabled but the relock manager is unavailable"
-                )
-            paused_relock = None
-            relock_intent = None
+            await self._unlock_ha_external(lock)
+
+        else:
+            raise ValueError(f"Unknown lock type: {lock_type!r}")
+
+    async def _unlock_access_native(
+        self,
+        lock: dict,
+        *,
+        command_lock: asyncio.Lock | None = None,
+        recheck_lockdown: bool = False,
+    ) -> bool:
+        key = str(lock.get("device_id") or lock.get("location_id") or "")
+        async with self._entity_command_lock(f"access:{key}"):
+            return await self._unlock_access_native_coordinated(
+                lock,
+                command_lock=command_lock,
+                recheck_lockdown=recheck_lockdown,
+            )
+
+    async def _unlock_access_native_coordinated(
+        self,
+        lock: dict,
+        *,
+        command_lock: asyncio.Lock | None = None,
+        recheck_lockdown: bool = False,
+    ) -> bool:
+        """Issue a native momentary write, then confirm official relay state."""
+        location_id = lock.get("location_id")
+        if not location_id:
+            raise ValueError(
+                f"Native lock {lock.get('name')} has no location_id"
+            )
+
+        access = None
+        barrier_acquired = False
+        device_id = lock.get("device_id")
+
+        def mark_unknown() -> None:
+            if device_id and self._on_lock_state is not None:
+                self._on_lock_state(device_id, "unknown")
+
+        def release_barrier() -> None:
+            nonlocal barrier_acquired
+            if barrier_acquired:
+                command_lock.release()
+                barrier_acquired = False
+
+        async def issue_and_confirm() -> bool:
+            nonlocal access
+            if recheck_lockdown and self._lockdown:
+                return False
+            access = self._access_client
+            if access is None:
+                raise RuntimeError("UniFi Access client is unavailable")
+            confirmed_command = getattr(
+                access, "unlock_momentary_confirmed", None
+            )
+            try:
+                if callable(confirmed_command):
+                    confirmation = await confirmed_command(
+                        location_id,
+                        on_written=release_barrier,
+                    )
+                    if (
+                        not isinstance(confirmation, dict)
+                        or confirmation.get("state") != "unlocked"
+                    ):
+                        raise AccessCommandAcceptedUnconfirmedError(
+                            "momentary unlock returned without exact unlocked "
+                            "relay confirmation"
+                        )
+                else:
+                    # Compatibility clients can issue the private mutation, but
+                    # cannot promote acceptance into a physical relay result.
+                    await access.unlock_momentary(location_id)
+                    release_barrier()
+                    raise AccessCommandAcceptedUnconfirmedError(
+                        "momentary unlock accepted without authoritative readback"
+                    )
+            except BaseException:
+                # Cancellation, transport loss, and bounded readback failure
+                # can all occur after the controller observed the write.
+                mark_unknown()
+                raise
+            return True
+
+        try:
+            if command_lock is None:
+                issued = await issue_and_confirm()
+            else:
+                await command_lock.acquire()
+                barrier_acquired = True
+                if recheck_lockdown and self._lockdown:
+                    return False
+                issued = await issue_and_confirm()
+        finally:
+            release_barrier()
+
+        if not issued:
+            return False
+        if self._on_lock_state is not None:
+            if device_id:
+                self._on_lock_state(device_id, "unlocked")
+        _LOGGER.info(
+            "Confirmed momentary unlock via Access API: lock=%s location=%s",
+            lock.get("name"),
+            location_id,
+        )
+        return True
+
+    async def _unlock_ha_external(
+        self,
+        lock: dict,
+        *,
+        command_lock: asyncio.Lock | None = None,
+        recheck_lockdown: bool = False,
+    ) -> bool:
+        entity_id = str(lock.get("entity_id") or "")
+        async with self._entity_command_lock(f"ha:{entity_id}"):
+            return await self._unlock_ha_external_coordinated(
+                lock,
+                command_lock=command_lock,
+                recheck_lockdown=recheck_lockdown,
+            )
+
+    async def _unlock_ha_external_coordinated(
+        self,
+        lock: dict,
+        *,
+        command_lock: asyncio.Lock | None = None,
+        recheck_lockdown: bool = False,
+    ) -> bool:
+        """Write, release the global barrier, then confirm a credential unlock.
+
+        Returns False only when a last-moment lockdown recheck prevents the
+        physical write. Every accepted HA write must be observed as exactly
+        ``unlocked`` before the credential is reported as granted.
+        """
+        entity_id = lock.get("entity_id")
+        if not entity_id:
+            raise ValueError(f"HA external lock {lock.get('name')} has no entity_id")
+
+        relock_manager = self._relock_manager
+        relock_enabled = bool(lock.get("relock_on_device_auth"))
+        if relock_enabled and relock_manager is None:
+            raise RuntimeError(
+                "Automatic relock is enabled but the relock manager is unavailable"
+            )
+
+        duration = lock.get("relock_duration", 30)
+        ha = None
+        accepted = False
+        relock_intent = None
+        paused_relock = None
+        paused_needs_resolution = False
+        physical_command_attempted = False
+        state_confirmed = False
+        ha_lease_stack = AsyncExitStack()
+        await ha_lease_stack.__aenter__()
+
+        async def issue_unlock() -> bool:
+            nonlocal ha
+            nonlocal accepted
+            nonlocal relock_intent
+            nonlocal paused_relock
+            nonlocal paused_needs_resolution
+            nonlocal physical_command_attempted
+
+            if recheck_lockdown and self._lockdown:
+                return False
+
+            # Capture the currently-published client while holding the same
+            # barrier used by settings swaps. Confirmation below intentionally
+            # keeps using this client after the barrier is released.
+            ha = self._ha_client
+            if ha is None:
+                raise RuntimeError("Home Assistant client is unavailable")
+            # Acquire the lease while the client-publication barrier is held.
+            # It then keeps this exact writer alive through readback after the
+            # barrier is released.
+            await ha_lease_stack.enter_async_context(
+                ha_client_operation(ha)
+            )
+
             if relock_enabled:
-                # Write the new deadline before the physical unlock. A crash
-                # after HA accepts the command can therefore never leave the
-                # door without a durable relock owner.
-                relock_intent = await self._relock_manager.schedule(
+                # Persist the safety deadline before the physical unlock.
+                relock_intent = await relock_manager.schedule(
                     entity_id=entity_id,
-                    duration=lock.get("relock_duration", 30),
+                    duration=duration,
                     lock_id=lock.get("id"),
                     lock_name=lock.get("name", entity_id),
                     source="device_auth",
                 )
-                # For a bidirectionally synced lock, this timed credential
-                # unlock is momentary and app-owned: lease it so the hub poller
-                # does not turn HA's temporary unlocked state into a persistent
-                # Access keep_unlock override. Same duration semantics as the
-                # remote path; set before the physical unlock below. The lease
-                # also marks the unlock app-initiated for relock_on_ha_origin.
                 if lock.get("sync_hub_state") and self._get_hub_sync is not None:
                     hub_sync = self._get_hub_sync()
                     if hub_sync is not None:
                         hub_sync.mark_access_momentary(
-                            entity_id, float(lock.get("relock_duration", 30))
+                            entity_id, float(duration)
                         )
-            elif self._relock_manager is not None:
-                paused_relock = await self._relock_manager.pause(entity_id)
-                # relock_on_device_auth is OFF: an authorized tap is a chosen
-                # hold-open (this branch cancels any pending timer on success).
-                # Mark it app-initiated so relock_on_ha_origin cannot silently
-                # re-time it — that toggle covers external unlocks only, and
-                # this exclusion mirrors the manual dashboard Unlock.
+            elif relock_manager is not None:
+                paused_relock = await relock_manager.pause(entity_id)
+                paused_needs_resolution = True
+                # With credential relocking disabled, this is a deliberate
+                # hold-open. Exclude its edge from HA-origin relock policy.
                 if lock.get("sync_hub_state") and self._get_hub_sync is not None:
                     hub_sync = self._get_hub_sync()
                     if hub_sync is not None:
                         hub_sync.mark_app_initiated_unlock(entity_id)
-            try:
-                success = await self._ha_client.unlock(entity_id)
-                if not success:
-                    raise RuntimeError(
-                        f"HA unlock call returned failure for {entity_id}"
-                    )
-            except BaseException:
-                if relock_intent is not None:
-                    try:
-                        await self._relock_manager.retain_after_uncertain_unlock(
-                            relock_intent
-                        )
-                    except Exception:
-                        _LOGGER.exception(
-                            "Failed to retain fail-safe relock intent for %s",
-                            entity_id,
-                        )
-                elif self._relock_manager is not None:
-                    try:
-                        await self._relock_manager.resume(paused_relock)
-                    except Exception:
-                        _LOGGER.exception(
-                            "Failed to resume prior relock for %s", entity_id
-                        )
-                raise
-            _LOGGER.info("Unlock via HA API: lock=%s entity=%s", lock.get("name"), entity_id)
 
+            physical_command_attempted = True
+            accepted = bool(await ha.unlock(entity_id))
+            return True
+
+        async def retain_intent() -> asyncio.CancelledError | None:
+            nonlocal relock_intent
+            intent = relock_intent
+            cancellation = None
+            if relock_manager is not None and intent is not None:
+                _, cancellation = await _complete_safety_operation(
+                    relock_manager.retain_after_uncertain_unlock(intent),
+                    name=f"retain-device-relock-{entity_id}",
+                )
+            relock_intent = None
+            return cancellation
+
+        async def resume_paused() -> asyncio.CancelledError | None:
+            nonlocal paused_needs_resolution
+            cancellation = None
+            if relock_manager is not None and paused_needs_resolution:
+                _, cancellation = await _complete_safety_operation(
+                    relock_manager.resume(paused_relock),
+                    name=f"resume-device-relock-{entity_id}",
+                )
+            paused_needs_resolution = False
+            return cancellation
+
+        async def resolve_relock_safety() -> asyncio.CancelledError | None:
+            if relock_intent is not None:
+                return await retain_intent()
+            if paused_needs_resolution:
+                return await resume_paused()
+            return None
+
+        def mark_unknown_if_needed() -> None:
+            if (
+                physical_command_attempted
+                and not state_confirmed
+                and self._on_lock_state is not None
+            ):
+                self._on_lock_state(entity_id, "unknown")
+
+        try:
+            if command_lock is None:
+                issued = await issue_unlock()
+            else:
+                async with command_lock:
+                    issued = await issue_unlock()
+
+            # The global physical-command barrier is no longer held from this
+            # point onward. HA readback is bounded, but may be eventually
+            # consistent and must not serialize unrelated door commands.
+            if not issued:
+                return False
+            if not accepted:
+                raise RuntimeError(
+                    f"HA unlock call returned failure for {entity_id}"
+                )
+            if not await _confirm_ha_state(ha, entity_id, "unlocked"):
+                raise HACommandAcceptedUnconfirmedError(
+                    f"HA accepted unlock but {entity_id} was not confirmed unlocked"
+                )
+
+            state_confirmed = True
+            if self._on_lock_state is not None:
+                self._on_lock_state(entity_id, "unlocked")
+            _LOGGER.info(
+                "Confirmed unlock via HA API: lock=%s entity=%s",
+                lock.get("name"),
+                entity_id,
+            )
+
+            cancellation = None
             if relock_intent is not None:
                 try:
-                    await self._relock_manager.extend_after_success(
-                        relock_intent, lock.get("relock_duration", 30)
+                    _, cancellation = await _complete_safety_operation(
+                        relock_manager.extend_after_success(
+                            relock_intent, duration
+                        ),
+                        name=f"extend-device-relock-{entity_id}",
                     )
                 except Exception:
                     # The original pre-unlock deadline remains durable/live.
@@ -656,23 +1021,43 @@ class AuthEngine:
                         "retaining earlier fail-safe deadline",
                         entity_id,
                     )
+                relock_intent = None
+            elif relock_manager is not None:
+                # A confirmed hold-open supersedes the paused older timer.
+                _, cancellation = await _complete_safety_operation(
+                    relock_manager.cancel(entity_id),
+                    name=f"cancel-device-relock-{entity_id}",
+                )
+                paused_needs_resolution = False
 
-            if self._relock_manager is not None and not relock_enabled:
-                try:
-                    # A successful fresh unlock supersedes any older pending
-                    # relock when device-auth relocking is disabled.
-                    await self._relock_manager.cancel(entity_id)
-                except Exception:
-                    try:
-                        await self._relock_manager.resume(paused_relock)
-                    except Exception:
-                        _LOGGER.exception(
-                            "Failed to resume prior relock for %s", entity_id
-                        )
-                    raise
-
-        else:
-            raise ValueError(f"Unknown lock type: {lock_type!r}")
+            if cancellation is not None:
+                raise cancellation
+            return True
+        except asyncio.CancelledError:
+            mark_unknown_if_needed()
+            try:
+                await resolve_relock_safety()
+            except Exception:
+                _LOGGER.exception(
+                    "Failed to restore relock safety after cancelled unlock for %s",
+                    entity_id,
+                )
+            raise
+        except Exception:
+            mark_unknown_if_needed()
+            cancellation = None
+            try:
+                cancellation = await resolve_relock_safety()
+            except Exception:
+                _LOGGER.exception(
+                    "Failed to restore relock safety after unlock failure for %s",
+                    entity_id,
+                )
+            if cancellation is not None:
+                raise cancellation
+            raise
+        finally:
+            await ha_lease_stack.aclose()
 
     # ------------------------------------------------------------------
     # Schedule evaluation
