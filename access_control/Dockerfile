@@ -1,6 +1,4 @@
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.21
-# hadolint ignore=DL3006
-FROM ${BUILD_FROM}
+FROM ghcr.io/home-assistant/base-python:3.12-alpine3.24
 
 ENV LANG=C.UTF-8 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -10,14 +8,14 @@ ENV LANG=C.UTF-8 \
 
 WORKDIR /opt
 
-# Install Python deps. Most have prebuilt wheels on alpine 3.21 / py3.12
+# Install Python deps. Most have prebuilt wheels on Alpine / Python 3.12
 # (cryptography, aiohttp, pydantic-core). Keep build deps available only
 # if a wheel is missing; pip will fall through to source build.
 COPY rootfs/opt/access_control/requirements.txt /tmp/requirements.txt
 # Build-deps are installed in a virtual package and purged in the same layer
 # so they never reach the final image. hadolint DL3018 (pin versions) is
 # muted because these are ephemeral and tracked by the base-image's Alpine
-# version pin (build.yaml).
+# version pin in the multi-architecture base image above.
 # hadolint ignore=DL3018
 RUN apk add --no-cache --virtual .build-deps \
         gcc musl-dev libffi-dev openssl-dev \
@@ -41,8 +39,9 @@ ARG BUILD_VERSION
 LABEL \
     io.hass.name="${BUILD_NAME}" \
     io.hass.description="${BUILD_DESCRIPTION}" \
+    io.hass.url="https://github.com/nstefanelli/hassio-access-control" \
     io.hass.arch="${BUILD_ARCH}" \
-    io.hass.type="addon" \
+    io.hass.type="app" \
     io.hass.version="${BUILD_VERSION}" \
     maintainer="Nick Stefanelli" \
     org.opencontainers.image.title="${BUILD_NAME}" \

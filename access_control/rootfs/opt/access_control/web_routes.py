@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
@@ -149,6 +150,8 @@ _LOGIN_RATE_LIMIT = {"max_attempts": 5, "window": 300, "lockout": 60}
 # live UNVR + HA connection test — attacker brute-forces upstream creds
 # through us if we don't cap. Audit 2026-05-24, C2.
 _SETUP_RATE_LIMIT = {"max_attempts": 3, "window": 300, "lockout": 300}
+_MIN_DIRECT_ADMIN_PASSWORD_LENGTH = 12
+_MIN_ENVIRONMENT_SECRET_KEY_LENGTH = 32
 _API_KEY_SCOPES = frozenset({"full", "read_only", "locks_only"})
 _ENTRY_DEVICE_TYPES = frozenset(
     {"access_reader", "protect_doorbell"}
@@ -179,6 +182,15 @@ def _ui_cache_refresh_inflight(request: Request) -> dict:
     return inflight
 
 
+def _ui_cache_updated_at(request: Request) -> dict[str, float]:
+    """Track when each in-process upstream snapshot was actually fetched."""
+    observed = getattr(request.app.state, "_ui_cache_updated_at", None)
+    if observed is None:
+        observed = {}
+        request.app.state._ui_cache_updated_at = observed
+    return observed
+
+
 async def _cached_device_options(request: Request, key: str, ttl: int, fetch):
     """Return cached dashboard data for `key` without blocking on the upstream.
 
@@ -204,11 +216,13 @@ async def _cached_device_options(request: Request, key: str, ttl: int, fetch):
         if value is not None:
             return value
         try:
+            refresh_started_at = time.monotonic()
             value = await fetch()
         except Exception:
             logger.exception("Failed to refresh UI cache %r", key)
             return None
         await db.set_ui_cache(key, value, ttl)
+        _ui_cache_updated_at(request)[key] = refresh_started_at
         return value
 
     value, fresh = await peek(key)
@@ -219,14 +233,24 @@ async def _cached_device_options(request: Request, key: str, ttl: int, fetch):
     if key not in inflight:
         async def _refresh() -> None:
             try:
+                refresh_started_at = time.monotonic()
                 fresh_value = await fetch()
                 await db.set_ui_cache(key, fresh_value, ttl)
+                _ui_cache_updated_at(request)[key] = refresh_started_at
             finally:
                 inflight.pop(key, None)
 
         task = asyncio.create_task(_refresh(), name=f"ui-cache-refresh:{key}")
         inflight[key] = task
-        task.add_done_callback(_log_task_exception)
+        tracker = getattr(request.app.state, "track_background_task", None)
+        if callable(tracker):
+            # The lifespan owns and drains this task before closing clients or
+            # SQLite. The tracker also logs unhandled task exceptions.
+            tracker(task)
+        else:
+            # Keep helpers and independently mounted routers backward
+            # compatible when no application lifespan installed a tracker.
+            task.add_done_callback(_log_task_exception)
     # Serve whatever we have (possibly stale, or None on first-ever load); the
     # background refresh makes the next render fresh.
     return value
@@ -310,6 +334,20 @@ def _redirect(request: Request, url: str, *, delete_cookie: bool = False) -> Red
     if delete_cookie:
         clear_session_cookie(resp, request)
     return resp
+
+
+async def _audit_policy_change(
+    db, username: str, action: str, target: str, detail: str
+) -> None:
+    """Best-effort policy audit that cannot hide a committed mutation."""
+    try:
+        await db.log_admin_action(username, action, target, detail)
+    except Exception:
+        logger.exception(
+            "Failed to persist dashboard policy audit action=%s target=%s",
+            action,
+            target,
+        )
 
 
 _LOGGED_PARTIAL_ENV_INJECTION = False
@@ -689,8 +727,25 @@ async def _setup_post_impl(
             or f"ha-unknown-{_secrets.token_hex(4)}"
         )
         admin_password = _secrets.token_urlsafe(48)
-    elif not admin_username or not admin_password:
+    elif not admin_username.strip() or not admin_password:
         return await _render_error("Admin username and password are required.")
+    elif len(admin_password) < _MIN_DIRECT_ADMIN_PASSWORD_LENGTH:
+        return await _render_error(
+            "Admin password must be at least "
+            f"{_MIN_DIRECT_ADMIN_PASSWORD_LENGTH} characters."
+        )
+    else:
+        admin_username = admin_username.strip()
+
+    environment_secret_key = os.environ.get("ACCESS_CONTROL_SECRET_KEY")
+    if (
+        environment_secret_key
+        and len(environment_secret_key) < _MIN_ENVIRONMENT_SECRET_KEY_LENGTH
+    ):
+        return await _render_error(
+            "ACCESS_CONTROL_SECRET_KEY must be at least "
+            f"{_MIN_ENVIRONMENT_SECRET_KEY_LENGTH} characters."
+        )
 
     separate_access_values = (access_host, access_username, access_password)
     if any(separate_access_values) and not all(separate_access_values):
@@ -797,7 +852,6 @@ async def _setup_post_impl(
     # default and ignores an env var injected later, avoiding silent credential
     # decryption failure.
     import secrets
-    environment_secret_key = os.environ.get("ACCESS_CONTROL_SECRET_KEY")
     if environment_secret_key:
         secret_key = environment_secret_key
         secret_key_source = SECRET_KEY_SOURCE_ENVIRONMENT
@@ -1026,7 +1080,14 @@ async def add_rule(
     # Prevent duplicate rules
     existing = await db.get_rules_for_user_and_lock(user_id, lock_id)
     if existing is None:
-        await db.add_rule(user_id, lock_id)
+        rule_id = await db.add_rule(user_id, lock_id)
+        await _audit_policy_change(
+            db,
+            user,
+            "access_rule_add",
+            str(rule_id),
+            f"user_id={user_id} lock_id={lock_id}",
+        )
 
     return _redirect(request, f"/users/{user_id}")
 
@@ -1043,20 +1104,17 @@ async def toggle_rule(
         return limited
     db = request.app.state.db
 
-    rule = await db.get_rule(rule_id)
-    if rule is None:
+    updated_rule = await db.toggle_rule_enabled(rule_id)
+    if updated_rule is None:
         return _redirect(request, "/users")
 
-    user_id = rule["user_id"]
-    new_enabled = not bool(rule["enabled"])
-
-    await db.update_rule(
-        rule_id,
-        enabled=new_enabled,
-        schedule_enabled=bool(rule["schedule_enabled"]),
-        schedule_days=rule["schedule_days"],
-        schedule_start=rule["schedule_start"],
-        schedule_end=rule["schedule_end"],
+    user_id = updated_rule["user_id"]
+    await _audit_policy_change(
+        db,
+        user,
+        "access_rule_toggle",
+        str(rule_id),
+        f"enabled={bool(updated_rule['enabled'])}",
     )
 
     return _redirect(request, f"/users/{user_id}")
@@ -1077,6 +1135,14 @@ async def delete_rule(
     rule = await db.get_rule(rule_id)
     user_id = rule["user_id"] if rule else None
     await db.delete_rule(rule_id)
+    if rule is not None:
+        await _audit_policy_change(
+            db,
+            user,
+            "access_rule_delete",
+            str(rule_id),
+            f"user_id={rule['user_id']} lock_id={rule['lock_id']}",
+        )
 
     if user_id:
         return _redirect(request, f"/users/{user_id}")
@@ -1129,13 +1195,25 @@ async def update_schedule(
             request, f"/users/{user_id}?error={quote_plus(schedule_error)}"
         )
 
-    await db.update_rule(
+    updated_rule = await db.update_rule_schedule(
         rule_id,
-        enabled=bool(rule["enabled"]),
         schedule_enabled=enabled_flag,
         schedule_days=days_str,
         schedule_start=schedule_start or None,
         schedule_end=schedule_end or None,
+    )
+    if updated_rule is None:
+        return _redirect(request, "/users")
+    user_id = updated_rule["user_id"]
+    await _audit_policy_change(
+        db,
+        user,
+        "access_rule_schedule_update",
+        str(rule_id),
+        (
+            f"enabled={enabled_flag} days={days_str or '-'} "
+            f"start={schedule_start or '-'} end={schedule_end or '-'}"
+        ),
     )
 
     return _redirect(request, f"/users/{user_id}")
@@ -1149,10 +1227,16 @@ async def locks_list(request: Request, user: str = Depends(require_login)):
     locks = await db.get_all_locks(include_hidden=True)
     entry_devices_by_lock = await db.get_entry_devices_for_locks([lock["id"] for lock in locks])
 
-    # Fetch live state for all locks — prefer in-memory cache, fall back to HA API
+    # Compare observation times: a confirmed command must beat a pre-command
+    # /api/states snapshot, while a later snapshot must beat an older command
+    # cache and capture external thumb-turn/integration changes.
     lock_states = getattr(request.app.state, "lock_states", {})
+    lock_state_updated_at = getattr(
+        request.app.state, "lock_state_updated_at", {}
+    )
     all_ha_locks = []
     ha_states = {}
+    ha_snapshot_updated_at = 0.0
     if ha and ha.connected:
         # get_lock_entities() downloads HA's ENTIRE /api/states payload
         # (1-5 MB on a mid-sized install). Serve it stale-while-revalidate so
@@ -1163,6 +1247,9 @@ async def locks_list(request: Request, user: str = Depends(require_login)):
             request, "locks_ha_lock_entities", _LOCKS_CACHE_TTL, ha.get_lock_entities
         ) or []
         ha_states = {l["entity_id"]: l["state"] for l in all_ha_locks}
+        ha_snapshot_updated_at = _ui_cache_updated_at(request).get(
+            "locks_ha_lock_entities", 0.0
+        )
 
     # Per-lock pending/overdue re-lock status for the "re-lock pending/overdue"
     # card badge. One read; annotate each affected lock below.
@@ -1173,7 +1260,22 @@ async def locks_list(request: Request, user: str = Depends(require_login)):
 
     for lock in locks:
         if lock["type"] == "ha_external" and lock.get("entity_id"):
-            lock["state"] = lock_states.get(lock["entity_id"], ha_states.get(lock["entity_id"], "unknown"))
+            entity_id = lock["entity_id"]
+            command_state = lock_states.get(entity_id)
+            snapshot_state = ha_states.get(entity_id)
+            command_updated_at = lock_state_updated_at.get(
+                entity_id, -1.0
+            )
+            if (
+                command_state is not None
+                and (
+                    snapshot_state is None
+                    or command_updated_at > ha_snapshot_updated_at
+                )
+            ):
+                lock["state"] = command_state
+            else:
+                lock["state"] = snapshot_state or "unknown"
         elif lock["type"] == "access_native" and lock.get("device_id"):
             lock["state"] = lock_states.get(lock["device_id"], "unknown")
         else:
@@ -1224,6 +1326,7 @@ async def locks_list(request: Request, user: str = Depends(require_login)):
             "locks": locks, "ha_locks": ha_locks,
             "access_locations": access_locations,
             "protect_doorbells": protect_doorbells, "protect_cameras": protect_cameras,
+            "command_notice": getattr(request, "query_params", {}).get("notice"),
         },
     )
 
@@ -1427,6 +1530,11 @@ async def _lock_action(lock_id: int, action: str, user: str, request):
     )
     if result.outcome == "not_found":
         return _redirect(request, "/locks")
+    if result.outcome == "accepted_unconfirmed":
+        return _redirect(
+            request,
+            f"/locks?notice={quote_plus(result.reason or 'Command accepted; state unconfirmed')}",
+        )
     if not result.granted:
         return _redirect(
             request,
@@ -2591,8 +2699,12 @@ async def _update_ha_impl(
             request.app.state.auth_engine._ha_client = test_client
             if new_timezone:
                 request.app.state.auth_engine.set_timezone(new_timezone)
-        if old_client and old_client is not test_client:
-            await old_client.close()
+    if old_client and old_client is not test_client:
+        # The old client may still own an accepted write's exact-state
+        # confirmation lease. Publication is already atomic; drain/close the
+        # retired client outside the global write barrier so an unrelated door
+        # can begin using the new client while that readback finishes.
+        await old_client.close()
 
     # Re-seed lock_states and re-attempt pending relocks against the new
     # client. The HA recovery loop won't fire on this swap (no

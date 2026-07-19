@@ -7,6 +7,7 @@ must resolve the token env-first on every call.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.util
 import os
@@ -32,7 +33,8 @@ def _load_package() -> None:
 
 
 _load_package()
-HAClient = importlib.import_module("access_control.ha_client").HAClient
+HA_CLIENT_MODULE = importlib.import_module("access_control.ha_client")
+HAClient = HA_CLIENT_MODULE.HAClient
 
 _ENV = "ACCESS_CONTROL_HA_TOKEN"
 
@@ -65,6 +67,96 @@ class TestHAClientTokenResolution(unittest.TestCase):
         self.assertEqual(client._headers()["Authorization"], "Bearer token-v1")
         os.environ[_ENV] = "token-v2"  # Supervisor rotated it mid-run
         self.assertEqual(client._headers()["Authorization"], "Bearer token-v2")
+
+
+class TestHAClientHealthCircuitRecovery(unittest.IsolatedAsyncioTestCase):
+    async def test_successful_health_probe_closes_open_circuit(self) -> None:
+        class Response:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class Session:
+            closed = False
+
+            def get(self, *args, **kwargs):
+                return Response()
+
+        client = HAClient("http://supervisor/core", "token")
+        client._session = Session()
+        for _ in range(3):
+            client._circuit.record_failure()
+        self.assertEqual(client.circuit_state, "open")
+
+        self.assertTrue(await client.test_connection())
+
+        self.assertTrue(client.connected)
+        self.assertEqual(client.circuit_state, "closed")
+
+
+class TestHAClientLifetime(unittest.IsolatedAsyncioTestCase):
+    async def test_close_drains_operation_lease_and_prevents_reopen(self) -> None:
+        client = HAClient("http://ha.local", "token")
+        lease_started = asyncio.Event()
+        release_lease = asyncio.Event()
+
+        async def use_exact_client() -> None:
+            async with client.operation_lease():
+                lease_started.set()
+                await release_lease.wait()
+
+        operation = asyncio.create_task(use_exact_client())
+        await lease_started.wait()
+        closing = asyncio.create_task(client.close())
+        await asyncio.sleep(0)
+
+        self.assertFalse(closing.done())
+        self.assertFalse(client._closed)
+
+        release_lease.set()
+        await operation
+        await closing
+        self.assertTrue(client._closed)
+        self.assertEqual(client._active_operations, 0)
+
+        # Some full-suite regressions reload this module to isolate environment
+        # state. Resolve the current exception class from the shared module
+        # object so the assertion is not coupled to a pre-reload class identity.
+        with self.assertRaisesRegex(HA_CLIENT_MODULE.HAClientError, "closed"):
+            await client._ensure_session()
+        with self.assertRaisesRegex(HA_CLIENT_MODULE.HAClientError, "closing"):
+            async with client.operation_lease():
+                pass
+
+    async def test_cancelled_close_still_drains_active_lease(self) -> None:
+        client = HAClient("http://ha.local", "token")
+        lease_started = asyncio.Event()
+        release_lease = asyncio.Event()
+
+        async def use_exact_client() -> None:
+            async with client.operation_lease():
+                lease_started.set()
+                await release_lease.wait()
+
+        operation = asyncio.create_task(use_exact_client())
+        await lease_started.wait()
+        closing = asyncio.create_task(client.close())
+        while not client._closing:
+            await asyncio.sleep(0)
+
+        closing.cancel()
+        release_lease.set()
+        await operation
+        with self.assertRaises(asyncio.CancelledError):
+            await closing
+
+        self.assertTrue(client._closed)
+        self.assertEqual(client._active_operations, 0)
+        await client.close()
 
 
 if __name__ == "__main__":

@@ -92,10 +92,15 @@ def _make_access(connected: bool = True) -> MagicMock:
 
 
 def _make_bidirectional_access(
-    rules: dict[str, dict], states: dict[str, str], connected: bool = True
+    rules: dict[str, dict],
+    states: dict[str, str],
+    connected: bool = True,
+    *,
+    authoritative_relay: bool = True,
 ) -> MagicMock:
     """Access fixture exposing the confirmed rule/state primitives."""
     access = _make_access(connected=connected)
+    access.open_api_configured = authoritative_relay
     access.get_lock_rule = AsyncMock(
         side_effect=lambda device_id, location_id=None: dict(rules[device_id])
     )
@@ -106,18 +111,22 @@ def _make_bidirectional_access(
     async def hold_unlocked(device_id, location_id=None):
         rules[device_id] = {"type": "keep_unlock"}
         states[device_id] = "unlocked"
+        return {"type": "keep_unlock", "state": "unlocked"}
 
     async def force_lock(device_id, location_id=None):
         rules[device_id] = {"type": "lock_early"}
         states[device_id] = "locked"
+        return {"type": "lock_early", "state": "locked"}
 
     async def hold_locked(device_id, location_id=None):
         rules[device_id] = {"type": "keep_lock"}
         states[device_id] = "locked"
+        return {"type": "keep_lock", "state": "locked"}
 
     async def restore_native_rule(device_id, location_id=None):
         rules[device_id] = {"type": "reset"}
         states[device_id] = "locked"
+        return {"type": "reset", "state": "locked"}
 
     access.hold_unlocked = AsyncMock(side_effect=hold_unlocked)
     access.force_lock = AsyncMock(side_effect=force_lock)
@@ -191,7 +200,8 @@ class TestConvergence(unittest.TestCase):
             self.assertEqual(applied, 1)
             access.unlock_persistent.assert_awaited_once_with("dev-hub-1")
             access.lock.assert_not_awaited()
-            self.assertEqual(cache, {"dev-hub-1": "unlocked"})
+            # The legacy command confirms intent only, not relay position.
+            self.assertEqual(cache, {"dev-hub-1": "unknown"})
             db.log_access.assert_awaited_once()
         _run(go())
 
@@ -1994,6 +2004,7 @@ class TestPersistentOverrideLifecycleRegressions(unittest.TestCase):
         async def go():
             db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
             access = _make_access()
+            access.open_api_configured = True
             access.hold_unlocked = AsyncMock(
                 return_value={"type": "keep_unlock", "state": "unlocked"}
             )
@@ -2107,13 +2118,24 @@ class TestFailSafeObservationRelease(unittest.TestCase):
     confirm fails forever (the ``reset`` self-clear wedge). It must NOT release
     on a partial/invalid observation, and lockdown is on a separate path."""
 
-    def _fixture(self, *, ha_state="locked", rule="keep_lock", door_state="locked"):
+    def _fixture(
+        self,
+        *,
+        ha_state="locked",
+        rule="keep_lock",
+        door_state="locked",
+        authoritative_relay=True,
+    ):
         ha_states = {"lock.front": ha_state}
         access_rules = {"dev-hub-1": {"type": rule}}
         access_states = {"dev-hub-1": door_state}
         db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
         ha = _make_bidirectional_ha(ha_states)
-        access = _make_bidirectional_access(access_rules, access_states)
+        access = _make_bidirectional_access(
+            access_rules,
+            access_states,
+            authoritative_relay=authoritative_relay,
+        )
         mgr = _make_mgr(db, ha, access)
         return mgr, ha, access, ha_states, access_rules, access_states
 
@@ -2204,6 +2226,149 @@ class TestFailSafeObservationRelease(unittest.TestCase):
             self.assertIn("lock.front", mgr._fail_safe_reset_eids)
         _run(go())
 
+    def test_closed_rule_with_unlocked_relay_keeps_latch(self) -> None:
+        """Closed intent still suppresses credential-pulse mirroring, but an
+        authoritative unlocked relay cannot release the safety latch."""
+        async def go():
+            mgr, _ha, access, _ha_states, _rules, _access_states = self._fixture(
+                rule="keep_lock",
+                door_state="unlocked",
+            )
+            mgr._fail_safe_reset_eids.add("lock.front")
+
+            async def failing_lock(device_id, location_id=None, on_written=None):
+                raise AccessClientError("keep_lock was not confirmed")
+
+            access.hold_locked = AsyncMock(side_effect=failing_lock)
+
+            with patch(
+                "access_control.hub_sync.asyncio.sleep", new=AsyncMock()
+            ):
+                await mgr.poll_once()
+
+            self.assertGreaterEqual(access.hold_locked.await_count, 1)
+            self.assertIn("lock.front", mgr._fail_safe_reset_eids)
+        _run(go())
+
+    def test_legacy_rule_derived_locked_state_cannot_release_latch(self) -> None:
+        """Without Open API relay readback, a keep_lock rule is intent only."""
+        async def go():
+            mgr, _ha, access, _ha_states, _rules, _access_states = self._fixture(
+                authoritative_relay=False,
+            )
+            mgr._fail_safe_reset_eids.add("lock.front")
+
+            async def failing_lock(device_id, location_id=None, on_written=None):
+                raise AccessClientError("keep_lock was not confirmed")
+
+            access.hold_locked = AsyncMock(side_effect=failing_lock)
+
+            with patch(
+                "access_control.hub_sync.asyncio.sleep", new=AsyncMock()
+            ):
+                await mgr.poll_once()
+
+            self.assertGreaterEqual(access.hold_locked.await_count, 1)
+            self.assertIn("lock.front", mgr._fail_safe_reset_eids)
+        _run(go())
+
+    def test_successful_legacy_keep_lock_still_cannot_release_latch(self) -> None:
+        """A confirmed private rule write is not physical relay evidence."""
+        async def go():
+            mgr, _ha, access, _ha_states, _rules, _access_states = self._fixture(
+                authoritative_relay=False,
+            )
+            mgr._fail_safe_reset_eids.add("lock.front")
+
+            with patch(
+                "access_control.hub_sync.asyncio.sleep", new=AsyncMock()
+            ):
+                await mgr.poll_once()
+
+            access.hold_locked.assert_awaited()
+            self.assertIn("lock.front", mgr._fail_safe_reset_eids)
+        _run(go())
+
+    def test_client_swap_cannot_promote_legacy_confirmation(self) -> None:
+        """Relay authority follows the writer, not a later published client."""
+        async def go():
+            mgr, _ha, legacy, _ha_states, _rules, _access_states = self._fixture(
+                authoritative_relay=False,
+            )
+            current = {"client": legacy}
+            mgr._get_access = lambda: current["client"]
+            mgr._fail_safe_reset_eids.add("lock.front")
+
+            replacement = _make_bidirectional_access(
+                {"dev-hub-1": {"type": "keep_unlock"}},
+                {"dev-hub-1": "unlocked"},
+                authoritative_relay=True,
+            )
+
+            async def legacy_hold_locked(
+                device_id,
+                location_id=None,
+                on_written=None,
+            ):
+                # Settings can publish a replacement client as soon as the
+                # command's write hook releases the shared barrier. The
+                # private client then returns only its rule-derived result.
+                if on_written is not None:
+                    on_written()
+                current["client"] = replacement
+                return {"type": "keep_lock", "state": "locked"}
+
+            legacy.hold_locked = legacy_hold_locked
+
+            with patch(
+                "access_control.hub_sync.asyncio.sleep", new=AsyncMock()
+            ):
+                await mgr.poll_once()
+
+            self.assertIs(current["client"], replacement)
+            self.assertEqual(
+                await replacement.get_door_state(
+                    "dev-hub-1", location_id="loc-1"
+                ),
+                "unlocked",
+            )
+            self.assertIn("lock.front", mgr._fail_safe_reset_eids)
+        _run(go())
+
+    def test_external_rule_supersession_cannot_bypass_latch(self) -> None:
+        """Losing keep_lock ownership is not proof that the relay is safe."""
+        async def go():
+            mgr, ha, access, ha_states, rules, access_states = self._fixture()
+            mgr._held_locked["lock.front"] = [
+                {
+                    "device_id": "dev-hub-1",
+                    "hub_lock_id": 1,
+                    "hub_location_id": "loc-1",
+                    "hub_name": "Front Door Hub",
+                }
+            ]
+            mgr._fail_safe_reset_eids.add("lock.front")
+
+            # An external Access action replaces the app's keep_lock with an
+            # active schedule and the authoritative relay opens.
+            rules["dev-hub-1"] = {"type": "schedule"}
+            access_states["dev-hub-1"] = "unlocked"
+            access.hold_locked = AsyncMock(
+                side_effect=AccessClientError("keep_lock did not confirm")
+            )
+
+            with patch(
+                "access_control.hub_sync.asyncio.sleep", new=AsyncMock()
+            ):
+                self.assertEqual(await mgr.poll_once(), 0)
+
+            self.assertIn("lock.front", mgr._fail_safe_reset_eids)
+            self.assertEqual(ha_states["lock.front"], "locked")
+            ha.unlock.assert_not_awaited()
+            access.hold_locked.assert_awaited()
+            self.assertEqual(access_states["dev-hub-1"], "unlocked")
+        _run(go())
+
     def test_latch_not_released_when_access_is_unreadable(self) -> None:
         """(vi) An unreadable Access side (observation invalid → None) keeps the
         latch even though HA reads locked."""
@@ -2225,6 +2390,40 @@ class TestFailSafeObservationRelease(unittest.TestCase):
                 await mgr.poll_once()
 
             self.assertIn("lock.front", mgr._fail_safe_reset_eids)
+        _run(go())
+
+    def test_lockdown_reasserts_keep_lock_when_raw_relay_is_unlocked(self) -> None:
+        async def go():
+            mgr, _ha, access, _ha_states, _rules, access_states = self._fixture(
+                rule="keep_lock",
+                door_state="unlocked",
+            )
+            mgr._lockdown_getter = lambda: True
+            mgr._lockdown_reset.add("lock.front")
+
+            self.assertEqual(await mgr.poll_once(), 1)
+
+            access.hold_locked.assert_awaited_once_with(
+                "dev-hub-1", location_id="loc-1"
+            )
+            self.assertEqual(access_states["dev-hub-1"], "locked")
+            self.assertIn("lock.front", mgr._lockdown_reset)
+        _run(go())
+
+    def test_legacy_keep_lock_cannot_acknowledge_lockdown_safety(self) -> None:
+        async def go():
+            mgr, _ha, access, _ha_states, _rules, _access_states = self._fixture(
+                authoritative_relay=False,
+            )
+            mgr._lockdown_getter = lambda: True
+
+            self.assertEqual(await mgr.poll_once(), 0)
+
+            access.hold_locked.assert_awaited_once_with(
+                "dev-hub-1", location_id="loc-1"
+            )
+            self.assertNotIn("lock.front", mgr._lockdown_reset)
+            self.assertEqual(mgr.lockdown_unresolved, ("lock.front",))
         _run(go())
 
     def test_lockdown_enforcement_unaffected(self) -> None:
@@ -2292,8 +2491,24 @@ class TestRelockOnHaOrigin(unittest.TestCase):
             await mgr.poll_once()  # confirmed locked baseline
             ha_states["lock.front"] = "unlocked"  # external thumb-turn
             _clear_damping(mgr)
+            order: list[str] = []
+
+            async def schedule(**kwargs):
+                order.append("schedule")
+
+            relock.schedule.side_effect = schedule
+            original_hold_unlocked = access.hold_unlocked.side_effect
+
+            async def ordered_hold_unlocked(device_id, location_id=None):
+                order.append("hold_unlocked")
+                return await original_hold_unlocked(
+                    device_id, location_id=location_id
+                )
+
+            access.hold_unlocked.side_effect = ordered_hold_unlocked
 
             self.assertEqual(await mgr.poll_once(), 1)
+            self.assertEqual(order, ["schedule", "hold_unlocked"])
             # The external unlock still propagates to Access as keep_unlock ...
             access.hold_unlocked.assert_awaited_once_with(
                 "dev-hub-1", location_id="loc-1"
@@ -2309,6 +2524,43 @@ class TestRelockOnHaOrigin(unittest.TestCase):
             # re-schedule for the same edge.
             await mgr.poll_once()
             relock.schedule.assert_awaited_once()
+        _run(go())
+
+    def test_schedule_failure_refuses_hold_open_and_compensates_locked(self) -> None:
+        async def go():
+            mgr, ha, access, relock, db, ha_states = self._fixture()
+            await mgr.poll_once()
+            ha_states["lock.front"] = "unlocked"
+            _clear_damping(mgr)
+            relock.schedule.side_effect = OSError("database unavailable")
+            mgr._hard_reject_state["lock.front"] = ("legacy_rule_rejected", 3)
+            mgr._backoff_until["lock.front"] = _time.monotonic() + 30
+
+            self.assertEqual(await mgr.poll_once(), 1)
+
+            access.hold_unlocked.assert_not_awaited()
+            ha.lock.assert_awaited_once_with("lock.front")
+            self.assertEqual(ha_states["lock.front"], "locked")
+            self.assertEqual(mgr._last_converged["lock.front"], "locked")
+        _run(go())
+
+    def test_schedule_failure_retains_latch_when_compensation_fails(self) -> None:
+        async def go():
+            mgr, ha, access, relock, db, ha_states = self._fixture()
+            await mgr.poll_once()
+            ha_states["lock.front"] = "unlocked"
+            _clear_damping(mgr)
+            relock.schedule.side_effect = OSError("database unavailable")
+            ha.lock = AsyncMock(return_value=False)
+
+            self.assertEqual(await mgr.poll_once(), 0)
+
+            access.hold_unlocked.assert_not_awaited()
+            self.assertEqual(ha_states["lock.front"], "unlocked")
+            self.assertIn("lock.front", mgr._fail_safe_reset_eids)
+            self.assertNotEqual(
+                mgr._last_converged.get("lock.front"), "unlocked"
+            )
         _run(go())
 
     def test_manual_app_initiated_unlock_is_not_relocked(self) -> None:

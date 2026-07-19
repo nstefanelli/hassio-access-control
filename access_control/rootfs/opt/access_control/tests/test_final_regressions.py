@@ -625,9 +625,13 @@ class ExplicitLockdownApiTests(unittest.TestCase):
                 self.lockdown = enabled
 
         engine = Engine()
+        db = SimpleNamespace(log_admin_action=AsyncMock())
         app.state.auth_engine = engine
+        app.state.db = db
         app.dependency_overrides[api_routes.verify_api_key] = lambda: {
-            "scope": "full"
+            "key_id": 7,
+            "name": "incident-automation",
+            "scope": "full",
         }
 
         with TestClient(app) as client:
@@ -640,6 +644,19 @@ class ExplicitLockdownApiTests(unittest.TestCase):
         self.assertEqual(repeated.json(), {"lockdown": True})
         self.assertEqual(disabled.json(), {"lockdown": False})
         self.assertEqual(engine.values, [True, True, False])
+        self.assertEqual(db.log_admin_action.await_count, 3)
+        db.log_admin_action.assert_any_await(
+            "api:incident-automation#7",
+            "api_lockdown_set",
+            "enabled",
+            "result=success",
+        )
+        db.log_admin_action.assert_any_await(
+            "api:incident-automation#7",
+            "api_lockdown_set",
+            "disabled",
+            "result=success",
+        )
 
 
 class _CandidateConsole:
@@ -694,7 +711,7 @@ class AtomicConfigBundleTests(unittest.IsolatedAsyncioTestCase):
             response = await web_routes.setup_post(
                 request,
                 admin_username="admin",
-                admin_password="password",
+                admin_password="correct horse battery staple",
                 unvr_host="unvr.local",
                 unvr_username="unvr-user",
                 unvr_password="unvr-pass",
@@ -744,7 +761,7 @@ class AtomicConfigBundleTests(unittest.IsolatedAsyncioTestCase):
             response = await web_routes.setup_post(
                 request,
                 admin_username="admin",
-                admin_password="password",
+                admin_password="correct horse battery staple",
                 unvr_host="unvr.local",
                 unvr_username="unvr-user",
                 unvr_password="unvr-pass",
@@ -882,6 +899,92 @@ class FailedStartupCleanupTests(unittest.IsolatedAsyncioTestCase):
         ha.close.assert_awaited_once()
         db.close.assert_awaited_once()
         self.assertTrue(app.state.lifecycle_cleanup_complete)
+
+    async def test_manager_timeout_does_not_block_remaining_cleanup(
+        self,
+    ) -> None:
+        blocked_started = asyncio.Event()
+        blocked_cancelled = asyncio.Event()
+
+        async def blocked_shutdown() -> None:
+            blocked_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                blocked_cancelled.set()
+
+        db = SimpleNamespace(close=AsyncMock())
+        relock = SimpleNamespace(shutdown=AsyncMock())
+        app = SimpleNamespace(
+            state=SimpleNamespace(
+                lifecycle_cleanup_complete=False,
+                db=db,
+                access_client=None,
+                protect_client=None,
+                ha_client=None,
+                hub_sync_manager=SimpleNamespace(shutdown=blocked_shutdown),
+                relock_manager=relock,
+                drain_event_tasks=AsyncMock(),
+            )
+        )
+
+        with patch.object(
+            main_module, "_MANAGER_SHUTDOWN_TIMEOUT_SECONDS", 0.01
+        ):
+            await asyncio.wait_for(
+                main_module._cleanup_failed_startup(app),
+                timeout=0.5,
+            )
+
+        self.assertTrue(blocked_started.is_set())
+        self.assertTrue(blocked_cancelled.is_set())
+        relock.shutdown.assert_awaited_once()
+        db.close.assert_awaited_once()
+        self.assertTrue(app.state.lifecycle_cleanup_complete)
+
+
+class SecretFingerprintMigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_environment_verifier_is_replaced_without_key_write(
+        self,
+    ) -> None:
+        db = SimpleNamespace(set_config=AsyncMock())
+
+        with patch.object(
+            main_module,
+            "secret_key_fingerprint",
+            return_value="pbkdf2_sha256$480000$salt$verifier",
+        ):
+            await main_module._persist_resolved_secret_key_metadata(
+                db,
+                original_source="environment",
+                normalized_source="environment",
+                stored_fingerprint="a" * 64,
+                secret_key="unchanged-environment-key",
+            )
+
+        db.set_config.assert_awaited_once_with(
+            "secret_key_fingerprint",
+            "pbkdf2_sha256$480000$salt$verifier",
+        )
+        self.assertTrue(
+            all(
+                call_args.args[0] != "secret_key"
+                for call_args in db.set_config.await_args_list
+            )
+        )
+
+    async def test_versioned_environment_verifier_is_not_rewritten(self) -> None:
+        db = SimpleNamespace(set_config=AsyncMock())
+
+        await main_module._persist_resolved_secret_key_metadata(
+            db,
+            original_source="environment",
+            normalized_source="environment",
+            stored_fingerprint="pbkdf2_sha256$480000$salt$verifier",
+            secret_key="environment-key",
+        )
+
+        db.set_config.assert_not_awaited()
 
 
 class TopologyGenerationTests(unittest.IsolatedAsyncioTestCase):

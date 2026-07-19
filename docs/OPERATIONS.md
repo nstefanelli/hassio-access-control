@@ -20,8 +20,12 @@ For automation and monitoring:
   for API compatibility; enforcement now uses a safe locked override).
   `hub_sync_fail_safe` lists any HA entity IDs whose bidirectionally synced pair
   is currently held by the locked-wins fail-safe latch: while listed, unlocks on
-  that lock are reverted until both sides confirm locked, so a persistently
-  non-empty entry is a stuck sync that needs attention.
+  that lock are reverted until HA reports locked and every paired Access hub's
+  raw official-API relay reports locked. A private rule-derived state cannot
+  release this latch, so a persistently non-empty entry needs attention.
+  `protect_in_use` is true when a configured doorbell mapping depends on
+  Protect; a Protect disconnect degrades the aggregate only in that case, so
+  an intentional Access-only deployment can remain `ok`.
 - `GET /api/debug` requires `full` and reports reconnect counters, last-event
   ages, and live-versus-durable pending re-lock counts.
 
@@ -41,8 +45,9 @@ Useful Home Assistant events are:
 Build alerts around the two failure events and around prolonged degraded health.
 
 Under **Settings → Access API Token**, confirm the status is **Configured** for
-deployments that use native schedules or bidirectional hub sync. This token is
-an upstream UniFi credential, not one of this app's `/api/*` monitoring keys.
+deployments that use native momentary grants, native schedules, bidirectional
+hub sync, or lockdown enforcement on paired hubs. This token is an upstream
+UniFi credential, not one of this app's `/api/*` monitoring keys.
 
 ## Logs and retention
 
@@ -98,6 +103,14 @@ is treated as uncertain and first driven to confirmed `keep_lock`. Failed
 confirmation remains durable and retries rather than being reported as
 converged.
 
+The manifest gives shutdown 60 seconds. The hub-sync and re-lock managers each
+have a 15-second application bound so cleanup continues if either one stalls,
+and UI refresh tasks are lifecycle-owned. The whole teardown does not yet have
+one aggregate application deadline: if event draining, a client close, or
+SQLite close stalls, Supervisor can still force-stop at 60 seconds. After an
+abnormal stop, treat durable ownership and pending re-lock state as the source
+of truth and complete the same post-restart checks used after a cold backup.
+
 ## Updates
 
 Before a significant update:
@@ -141,6 +154,16 @@ and—in database-key mode—the key material needed to decrypt them.
 Use Home Assistant's backup UI to create a full backup or a partial backup that
 includes Access Control. Supervisor captures the app's `/data` volume as a
 coherent unit and restores it with the app.
+
+The manifest requests a **cold** backup because safety state lives in SQLite
+WAL. Supervisor therefore stops Access Control while copying `/data`. During
+that interval the app cannot receive door events, actuate a re-lock whose
+deadline expires, retry hub-sync/lockdown enforcement, or serve its watchdog.
+Do not start a backup during a timed unlock, an overdue re-lock, lockdown, or
+another unresolved physical-safety incident. After Supervisor restarts the
+app, verify `/api/health`, pending re-lock badges, lockdown enforcement, and
+the intended state of every affected door before treating the backup as
+operationally complete.
 
 After creation:
 
@@ -268,8 +291,8 @@ the console UI/session endpoint.
 3. Save it under this app's **Settings → Access API Token**. Saving performs
    read-only doors and rule validation; the first write also proves
    `edit:space`.
-4. Re-test a native **Lock**, **Unlock**, and **Follow Schedule** while watching
-   the physical door and Activity/log result.
+4. Re-test a native **Buzz**, **Lock**, **Unlock**, and **Follow Schedule**
+   while watching the physical door and Activity/log result.
 
 A configured-token error never falls back to the private session API. This is
 intentional: silent downgrade could change schedule semantics and turn an
@@ -277,16 +300,40 @@ unconfirmed operation into a false success. Explicitly clearing the token
 enables compatibility mode, but that is a capability reduction, not a repair.
 Some Access firmware cannot expose an unambiguous rule/relay state after
 `reset` through the private API, so Follow Schedule or reverse synchronization
-may remain unconfirmed without a token. On the official Open API, a door with
-no active override reports an empty rule type, which the client normalizes to
-`reset`; this is native behavior, and state is always confirmed through relay
-readback rather than inferred from the rule. Legacy (private-API) rule parsing
-stays strict and does not accept an empty type.
+may remain unconfirmed without a token. A native momentary buzz also uses the
+private mutation for compatibility, but only an official relay observation can
+promote its acceptance to a confirmed grant. Without the token it is always
+reported accepted-unconfirmed. Likewise, tokenless rule-derived `locked` state
+cannot release a hub-sync fail-safe latch or acknowledge lockdown enforcement.
+On the official Open API, a door with no active override reports an empty rule
+type, which the client normalizes to `reset`; this is native behavior, and state
+is always confirmed through relay readback rather than inferred from the rule.
+Legacy (private-API) rule parsing stays strict and does not accept an empty
+type.
 
 `ACCESS_CONTROL_ACCESS_API_TOKEN`, when non-empty in a custom deployment,
 overrides the encrypted database value. If replacing the Settings token appears
 to have no effect, inspect the runtime environment without printing the secret.
 Never include the token or an upstream error body in a bug report.
+
+### A native command says accepted but state unconfirmed
+
+The mutation returned HTTP success without a recognized failure marker, so it
+may already have taken effect, but bounded official relay/rule readback did not
+prove the result. Private fire-and-forget momentary responses can be empty or
+neutral for firmware compatibility; relay readback is the stronger evidence.
+The dashboard shows an operator notice; an API native lock-mode request returns
+HTTP `202` with `result: "accepted_unconfirmed"`. A credential-driven native
+momentary unlock is audited with the same result and is not returned as a
+grant.
+
+The app publishes `unknown` to its native-door cache and does not run
+grant-only alarm auto-disarm or the HA granted-event path. This prevents a
+guessed success but cannot undo a pulse or persistent rule that Access already
+accepted. Do not blindly repeat an unlock. Inspect the Access application,
+official relay state, and physical opening; then issue a deliberate safe
+desired-state command if needed. A momentary pulse shorter than the polling
+window can legitimately produce this conservative false-negative.
 
 ### Access reports a site identity mismatch
 
@@ -315,6 +362,13 @@ primary console and that the primary credentials can log in to it. Access can
 remain operational through a separately configured Access console while
 Protect is unavailable.
 
+Unlike Access, Protect does not currently persist and enforce a stable
+console/site namespace binding. Treat a Protect host, DNS, proxy target, or
+credential change as a manual re-enrollment: verify the intended console and
+review every Protect camera/doorbell mapping before allowing those events to
+drive policy. Do not assume that a successful login alone proves it is the
+previous Protect site.
+
 ### A credential is denied unexpectedly
 
 Check the Activity reason, then verify:
@@ -335,8 +389,13 @@ The desired in-memory incident state remains fail-closed when persistence or
 immediate safe hub lock reports an error. Startup also treats an unreadable
 persisted lockdown value as enabled. Inspect the process log and
 `lockdown_enforcement_pending` from `GET /api/health`; a non-empty list contains
-HA entity IDs whose paired hubs are not yet confirmed locked. Restore Access/DB
-availability, correct pairing conflicts, and retry the idempotent
+HA entity IDs whose paired hubs are not yet confirmed locked. Confirmation
+requires the Access `keep_lock` rule and each paired hub's raw official-API
+relay `locked`; when the HA command path is available, HA must also report
+`locked`. During an HA outage the confirmed Access relay is the fail-safe
+boundary. A tokenless rule-derived state deliberately cannot acknowledge this
+safety condition. Restore Access/DB availability, configure or repair the
+official token, correct pairing conflicts, and retry the idempotent
 `POST /api/lockdown?enabled=true`. Do not clear lockdown merely to hide the
 error. A failed `enabled=false` persistence write likewise leaves lockdown on.
 
@@ -391,9 +450,9 @@ reusing the old policy.
 - The lock must be an HA-external `lock.*`, visible, and opted in.
 - It needs a resolvable Access reader/location or Protect doorbell mapping and
   a native hub at that location.
-- For authoritative schedule/reverse behavior, the Access API token must be
-  configured, valid, and able to reach port `12445` with `view:space` and
-  `edit:space`.
+- For authoritative schedule/reverse behavior, fail-safe-latch release, and
+  lockdown acknowledgement, the Access API token must be configured, valid,
+  and able to reach port `12445` with `view:space` and `edit:space`.
 - HA must report exactly `locked` or `unlocked`, and Access must return a known
   rule plus `locked`/`unlocked` relay state. A disconnect, malformed read, or
   disagreement that cannot be attributed resolves locked and never opens.
@@ -407,7 +466,9 @@ reusing the old policy.
   least one poll interval before diagnosing a missed event.
 - During lockdown, an unlocked value on either side cannot hold the hub open;
   fail-safe control uses `keep_lock`, not `reset`, so an active native schedule
-  cannot reopen it.
+  cannot reopen it. The pair stays in `lockdown_enforcement_pending` until every
+  authoritative raw Access relay reports locked and, when the HA command path
+  is available, HA also reports locked.
 - Bidirectional-sync ownership of persistent `keep_unlock` and `keep_lock`,
   including the hub/door/location identity, is normally written before the
   command. Failure blocks opening; during active lockdown, the app still
@@ -415,8 +476,10 @@ reusing the old policy.
   On startup, either recorded override is driven to confirmed `keep_lock`
   before live convergence; an unconfirmed result remains durable and retries.
 - After lockdown or another fail-safe incident, reconciliation first confirms
-  both sides locked, then replaces app-owned `keep_lock` with confirmed
-  `lock_now` so future native schedules remain eligible.
+  HA locked and every official raw relay locked, then replaces app-owned
+  `keep_lock` with confirmed `lock_now` so future native schedules remain
+  eligible. A private rule echo, even after a successful `keep_lock`, cannot
+  clear the latch.
 - A pairing change makes removed hubs safe before applying hold-open to a new hub.
   If multiple HA entities resolve to one physical hub, all involved pairings
   are locked/suppressed until the mapping is one-to-one.
@@ -430,7 +493,8 @@ endpoint not found", HTTP 404 on the legacy `lock_rule` readback
 (`/proxy/access/api/v2/device/{id}/lock_rule`), and — most visibly — a
 bidirectionally synced lock that re-locks itself seconds after every physical
 or HA-side unlock. The Access side cannot be read, so the locked-wins
-fail-safe latches the hub closed until both sides confirm locked.
+fail-safe latches the hub closed until HA and the official raw Access relay
+confirm locked.
 
 Cause: recent UniFi Access firmware removed the private per-device
 `lock_rule` API. A deployment without a configured Access API token is pinned
@@ -464,10 +528,13 @@ entity appears in `hub_sync_fail_safe` in `GET /api/health`. The fix widened
 the rule-write confirmation and relay observation to a bounded progressive
 window (~5 s), taught the confirmation that a post-`lock_now` `reset` rule is
 the documented momentary state (with the relay reading providing the positive
-evidence), and made the fail-safe latch release as soon as a poll observes both
-sides locked. If you see a lock listed in `hub_sync_fail_safe` for more than a
-few minutes, confirm the console is reachable and current; a restart clears a
-latch immediately but the 1.5.12 changes stop it from re-wedging.
+evidence), and made the fail-safe latch release as soon as a poll observes HA
+locked and every official raw Access relay locked. Current behavior never uses
+a private rule-derived state for that release. If you see a lock listed in
+`hub_sync_fail_safe` for more than a few minutes, confirm the official token,
+port `12445`, and console health. A restart is not a substitute for restoring
+authoritative evidence: tokenless mode deliberately keeps the safety condition
+unresolved and continues the locked-direction retry.
 
 ### Rate limit responses appear
 

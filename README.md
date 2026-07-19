@@ -7,7 +7,7 @@
 [![Latest release](https://img.shields.io/github/v/release/nstefanelli/hassio-access-control?style=flat-square&color=3b82f6)](https://github.com/nstefanelli/hassio-access-control/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/nstefanelli/hassio-access-control/ci.yaml?style=flat-square&label=ci)](https://github.com/nstefanelli/hassio-access-control/actions/workflows/ci.yaml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![amd64 + aarch64](https://img.shields.io/badge/arch-amd64%20%7C%20aarch64-2dd4a0?style=flat-square)](access_control/build.yaml)
+[![amd64 + aarch64](https://img.shields.io/badge/arch-amd64%20%7C%20aarch64-2dd4a0?style=flat-square)](access_control/config.yaml)
 
 [Install](#install) · [Configure](docs/CONFIGURATION.md) · [Operate](docs/OPERATIONS.md) · [API](docs/API.md) · [Security](docs/SECURITY-MODEL.md)
 
@@ -61,7 +61,7 @@ or long-lived HA token.
 | Requirement | Notes |
 |---|---|
 | Home Assistant OS or Supervised | Supervisor, app store, Ingress, and auth support are required. HA Container is not a supported app host. |
-| UniFi Access | A console with an Access deployment and a dedicated local account able to perform the enabled workflows. An official local API token with `view:space` and `edit:space` is strongly recommended for schedule-aware commands and authoritative readback. |
+| UniFi Access | A console with an Access deployment and a dedicated local account able to perform the enabled workflows. An official local API token with `view:space` and `edit:space` is required for confirmed native momentary grants, authoritative fail-safe/lockdown acknowledgement, and relay readback. |
 | UniFi Protect | Optional for Access-only use; required for G6 Entry/Protect doorbell events. It may run on a separate console. |
 | HA administrator | The dashboard is admin-only. |
 | HA lock/alarm entities | Required only for the HA-external lock and alarm features you configure. UniFi-native doors can be used directly. |
@@ -177,7 +177,9 @@ be supplied at runtime with `ACCESS_CONTROL_ACCESS_API_TOKEN`; a configured but
 invalid token fails the command and never silently falls back to the private
 session API. Without a token, compatibility mode retains the existing private
 console path, but firmware-dependent readback—especially after `reset`—cannot
-provide the same schedule/physical-state assurance.
+provide the same schedule/physical-state assurance. A native momentary pulse
+may be accepted in that mode, but it remains `accepted_unconfirmed`: the app
+does not publish a grant, fire the granted HA event, or auto-disarm an alarm.
 
 For bidirectional hub sync, ownership of persistent `keep_unlock` and
 `keep_lock`, including door/location metadata, is normally written before the

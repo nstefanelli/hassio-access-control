@@ -386,6 +386,86 @@ def _authenticated_console_client() -> SimpleNamespace:
 
 
 class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_setup_rejects_short_admin_password_before_probes(
+        self,
+    ) -> None:
+        db = FakeDB()
+        db.get_config = AsyncMock(return_value=None)
+        request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
+            client=SimpleNamespace(host="127.0.0.1"),
+            app=SimpleNamespace(
+                state=SimpleNamespace(db=db, configured=False)
+            ),
+        )
+        response = web_routes.HTMLResponse("invalid", status_code=422)
+
+        with patch.object(
+            web_routes.templates, "TemplateResponse", return_value=response
+        ), patch.object(web_routes, "AccessClient") as access_factory, patch.object(
+            web_routes, "ProtectClient"
+        ) as protect_factory:
+            result = await web_routes.setup_post(
+                request,
+                admin_username="admin",
+                admin_password="short",
+                unvr_host="unvr.local",
+                unvr_username="service",
+                unvr_password="upstream-secret",
+                access_host="",
+                access_username="",
+                access_password="",
+                ha_url="http://ha.local",
+                ha_token="ha-token",
+            )
+
+        self.assertIs(result, response)
+        access_factory.assert_not_called()
+        protect_factory.assert_not_called()
+        self.assertEqual(db.config_values, [])
+
+    async def test_setup_rejects_weak_environment_key_before_probes(
+        self,
+    ) -> None:
+        db = FakeDB()
+        db.get_config = AsyncMock(return_value=None)
+        request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(),
+            client=SimpleNamespace(host="127.0.0.1"),
+            app=SimpleNamespace(
+                state=SimpleNamespace(db=db, configured=False)
+            ),
+        )
+        response = web_routes.HTMLResponse("invalid", status_code=422)
+
+        with patch.dict(
+            "os.environ", {"ACCESS_CONTROL_SECRET_KEY": "too-short"}
+        ), patch.object(
+            web_routes.templates, "TemplateResponse", return_value=response
+        ), patch.object(web_routes, "AccessClient") as access_factory, patch.object(
+            web_routes, "ProtectClient"
+        ) as protect_factory:
+            result = await web_routes.setup_post(
+                request,
+                admin_username="admin",
+                admin_password="correct horse battery staple",
+                unvr_host="unvr.local",
+                unvr_username="service",
+                unvr_password="upstream-secret",
+                access_host="",
+                access_username="",
+                access_password="",
+                ha_url="http://ha.local",
+                ha_token="ha-token",
+            )
+
+        self.assertIs(result, response)
+        access_factory.assert_not_called()
+        protect_factory.assert_not_called()
+        self.assertEqual(db.config_values, [])
+
     async def test_setup_initializes_runtime(self) -> None:
         db = FakeDB()
         # First-run setup: admin_username must be unset so the C1 guard
@@ -416,7 +496,7 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
             response = await web_routes.setup_post(
                 request,
                 admin_username="admin",
-                admin_password="password",
+                admin_password="correct horse battery staple",
                 unvr_host="unvr.local",
                 unvr_username="unvr-user",
                 unvr_password="unvr-pass",
@@ -468,7 +548,7 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
             response = await web_routes.setup_post(
                 request,
                 admin_username="admin",
-                admin_password="password",
+                admin_password="correct horse battery staple",
                 unvr_host="protect.local",
                 unvr_username="protect-user",
                 unvr_password="protect-pass",
@@ -510,7 +590,7 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
             response = await web_routes.setup_post(
                 request,
                 admin_username="admin",
-                admin_password="password",
+                admin_password="correct horse battery staple",
                 unvr_host="protect.local",
                 unvr_username="protect-user",
                 unvr_password="protect-pass",
@@ -550,7 +630,7 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
                 await web_routes.setup_post(
                     request,
                     admin_username="admin",
-                    admin_password="password",
+                    admin_password="correct horse battery staple",
                     unvr_host="protect.local",
                     unvr_username="protect-user",
                     unvr_password="protect-pass",
@@ -810,7 +890,7 @@ class SetupAndAuthTests(unittest.IsolatedAsyncioTestCase):
             response = await web_routes.setup_post(
                 request,
                 admin_username="admin",
-                admin_password="password",
+                admin_password="correct horse battery staple",
                 unvr_host="unvr.local",
                 unvr_username="unvr-user",
                 unvr_password="unvr-pass",
@@ -1063,6 +1143,57 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         access_client.get_bootstrap.assert_not_called()
         protect_client.get_cameras.assert_not_called()
+
+    async def test_locks_list_prefers_bounded_ha_snapshot_over_command_cache(
+        self,
+    ) -> None:
+        db = FakeDB()
+        db.get_all_locks = AsyncMock(return_value=[{
+            "id": 2,
+            "type": "ha_external",
+            "entity_id": "lock.changed_elsewhere",
+            "name": "Changed Elsewhere",
+        }])
+        db.get_entry_devices_for_locks = AsyncMock(return_value={2: []})
+        ha = SimpleNamespace(
+            connected=True,
+            get_lock_entities=AsyncMock(return_value=[{
+                "entity_id": "lock.changed_elsewhere",
+                "state": "unlocked",
+                "name": "Changed Elsewhere",
+            }]),
+        )
+        request = SimpleNamespace(
+            scope={},
+            state=SimpleNamespace(ingress_user=None),
+            headers={},
+            query_params={},
+            cookies={},
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    db=db,
+                    ha_client=ha,
+                    access_client=None,
+                    protect_client=None,
+                    lock_states={"lock.changed_elsewhere": "locked"},
+                    relock_manager=None,
+                )
+            ),
+        )
+        response = web_routes.HTMLResponse("ok")
+
+        with patch.object(
+            web_routes,
+            "_render",
+            new=AsyncMock(return_value=response),
+        ) as render:
+            self.assertIs(
+                await web_routes.locks_list(request, user="admin"),
+                response,
+            )
+
+        rendered_locks = render.await_args.args[2]["locks"]
+        self.assertEqual(rendered_locks[0]["state"], "unlocked")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import logging
 import re
 import secrets
 import ssl
+from contextlib import asynccontextmanager
 from typing import Callable, List, Optional
 from urllib.parse import urlsplit
 
@@ -61,7 +62,11 @@ _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 # these waits by the caller (see hub_sync `_drive_hub`), so the extended window
 # does not stall unrelated doors.
 _LOCK_CONFIRM_DELAYS = (0.25, 0.5, 1.0, 1.5, 2.0)
-_LOCK_CONFIRM_WINDOW = round(sum(_LOCK_CONFIRM_DELAYS), 1)
+# One hard wall-clock budget, including HTTP latency and retry sleeps. The
+# nominal progressive reads land through t≈5.25s; 6s leaves a small allowance
+# for successful local-controller responses without permitting each GET's
+# independent 15s timeout to multiply the confirmation into minutes.
+_LOCK_CONFIRM_WINDOW = 6.0
 
 _LOCK_RULE_TYPES = frozenset(
     {
@@ -94,6 +99,19 @@ class AccessClientError(Exception):
     def __init__(self, *args: object, status: int | None = None) -> None:
         super().__init__(*args)
         self.status = status
+
+
+class AccessCommandOutcomeUnknownError(AccessClientError):
+    """A mutating transport may have reached Access before failing locally."""
+
+
+class AccessCommandAcceptedUnconfirmedError(AccessCommandOutcomeUnknownError):
+    """Raised when Access accepted a mutation but readback stayed uncertain.
+
+    This is deliberately distinct from a transport or upstream rejection that
+    happened before the mutating write was accepted. Callers must not report
+    the command as either confirmed success or a definite no-op.
+    """
 
 
 class AccessLegacyEndpointGoneError(AccessClientError):
@@ -147,6 +165,16 @@ class AccessClient:
         # are scoped to a host rather than a port, so reusing the console
         # session would unnecessarily send its TOKEN cookie to port 12445.
         self._api_session: Optional[aiohttp.ClientSession] = None
+        # High-level lock commands may release the app-wide write barrier while
+        # they continue official relay readback. Client swaps call close() in
+        # that interval, so close must drain those leased confirmations before
+        # retiring sessions; otherwise a readback can recreate a session on an
+        # already-retired client.
+        self._lifecycle = asyncio.Condition()
+        self._active_operations = 0
+        self._closing = False
+        self._closed = False
+        self._close_task: asyncio.Task | None = None
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_connected = False
         self._running = False
@@ -221,6 +249,8 @@ class AccessClient:
 
     def _get_session(self) -> aiohttp.ClientSession:
         """Return (or lazily create) the underlying aiohttp session."""
+        if self._closed:
+            raise AccessClientError("UniFi Access client is closed")
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(ssl=self._ssl_ctx)
             jar = aiohttp.CookieJar(unsafe=True)
@@ -229,6 +259,8 @@ class AccessClient:
 
     def _get_api_session(self) -> aiohttp.ClientSession:
         """Return the isolated, cookieless Open API HTTP session."""
+        if self._closed:
+            raise AccessClientError("UniFi Access client is closed")
         if self._api_session is None or self._api_session.closed:
             connector = aiohttp.TCPConnector(ssl=self._ssl_ctx)
             self._api_session = aiohttp.ClientSession(
@@ -571,7 +603,14 @@ class AccessClient:
                     **kwargs,
                 )
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                raise AccessClientError(f"Network error for {method} {path}: {exc}") from exc
+                error_type = (
+                    AccessCommandOutcomeUnknownError
+                    if method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+                    else AccessClientError
+                )
+                raise error_type(
+                    f"Network error for {method} {path}: {exc}"
+                ) from exc
 
             if resp.status == 401 and attempt == 0:
                 logger.warning("Got 401 from %s — re-authenticating", path)
@@ -617,6 +656,100 @@ class AccessClient:
             )
         return payload
 
+    @staticmethod
+    def _validate_legacy_mutation_payload(
+        payload: object,
+        *,
+        operation: str,
+        require_data_object: bool,
+    ) -> dict:
+        """Validate the semantic envelope of a private API mutation.
+
+        Several private Access endpoints return HTTP 2xx even when their JSON
+        envelope reports a rejected operation. Only success markers already
+        observed elsewhere in this client are recognized; an explicit unknown
+        or failure marker must not be treated as success.
+        """
+        if not isinstance(payload, dict):
+            raise AccessCommandOutcomeUnknownError(
+                f"UniFi Access returned an invalid envelope for {operation}"
+            )
+
+        if "code" in payload and payload.get("code") != "SUCCESS":
+            raise AccessClientError(f"UniFi Access rejected {operation}")
+
+        if "meta" in payload:
+            meta = payload.get("meta")
+            if not isinstance(meta, dict):
+                raise AccessCommandOutcomeUnknownError(
+                    f"UniFi Access returned invalid metadata for {operation}"
+                )
+            if meta.get("rc") not in {"ok", "success"}:
+                raise AccessClientError(f"UniFi Access rejected {operation}")
+
+        if "success" in payload and payload.get("success") is not True:
+            raise AccessClientError(f"UniFi Access rejected {operation}")
+
+        if require_data_object:
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                raise AccessCommandOutcomeUnknownError(
+                    f"UniFi Access returned invalid data for {operation}"
+                )
+            return data
+
+        return payload
+
+    @classmethod
+    async def _legacy_mutation_response(
+        cls,
+        response: aiohttp.ClientResponse,
+        *,
+        operation: str,
+        require_data_object: bool = False,
+        allow_empty: bool = False,
+    ) -> dict | None:
+        """Decode and validate a private API mutation response.
+
+        Empty HTTP bodies are compatible only with the two observed fire-and-
+        forget operations (delete and momentary unlock). A non-empty malformed
+        body, non-object JSON, or explicit failure envelope always fails.
+        """
+        try:
+            payload = await response.json(content_type=None)
+        except (aiohttp.ClientError, TypeError, ValueError) as exc:
+            if allow_empty:
+                try:
+                    raw_body = await response.text()
+                except (aiohttp.ClientError, TypeError, ValueError) as text_exc:
+                    raise AccessCommandOutcomeUnknownError(
+                        f"UniFi Access returned invalid JSON for {operation}"
+                    ) from text_exc
+                if not raw_body.strip():
+                    return None
+            raise AccessCommandOutcomeUnknownError(
+                f"UniFi Access returned invalid JSON for {operation}"
+            ) from exc
+
+        # aiohttp returns None (rather than raising) for a truly empty body.
+        # Distinguish that compatibility case from a JSON `null` body, which
+        # is still a malformed mutation envelope.
+        if allow_empty and payload is None:
+            try:
+                raw_body = await response.text()
+            except (aiohttp.ClientError, TypeError, ValueError) as exc:
+                raise AccessClientError(
+                    f"UniFi Access returned invalid JSON for {operation}"
+                ) from exc
+            if not raw_body.strip():
+                return None
+
+        return cls._validate_legacy_mutation_payload(
+            payload,
+            operation=operation,
+            require_data_object=require_data_object,
+        )
+
     async def _open_api_request(
         self,
         method: str,
@@ -653,7 +786,12 @@ class AccessClient:
                 **kwargs,
             )
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            raise AccessClientError(
+            error_type = (
+                AccessCommandOutcomeUnknownError
+                if method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+                else AccessClientError
+            )
+            raise error_type(
                 f"Network error for UniFi Access Open API {method} {path}"
             ) from exc
 
@@ -664,14 +802,39 @@ class AccessClient:
                     f"HTTP {response.status} from UniFi Access Open API "
                     f"{method} {path}"
                 )
-            payload = await self._json_object_response(
-                response,
-                operation=f"Open API {method} {path}",
-            )
+            try:
+                payload = await self._json_object_response(
+                    response,
+                    operation=f"Open API {method} {path}",
+                )
+            except AccessClientError as exc:
+                if method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+                    raise AccessCommandOutcomeUnknownError(str(exc)) from exc
+                raise
 
-        if payload.get("code") != "SUCCESS" or "data" not in payload:
+        if "code" not in payload:
+            error_type = (
+                AccessCommandOutcomeUnknownError
+                if method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+                else AccessClientError
+            )
+            raise error_type(
+                f"UniFi Access Open API returned a malformed envelope for "
+                f"{method} {path}"
+            )
+        if payload.get("code") != "SUCCESS":
             raise AccessClientError(
-                f"UniFi Access Open API rejected or malformed {method} {path}"
+                f"UniFi Access Open API rejected {method} {path}"
+            )
+        if "data" not in payload:
+            error_type = (
+                AccessCommandOutcomeUnknownError
+                if method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+                else AccessClientError
+            )
+            raise error_type(
+                f"UniFi Access Open API returned malformed success for "
+                f"{method} {path}"
             )
         return payload["data"]
 
@@ -686,10 +849,15 @@ class AccessClient:
         kwargs = {"json": json_body} if json_body is not None else {}
         response = await self._request(method, path, **kwargs)
         async with response:
-            return await self._json_object_response(
-                response,
-                operation=f"legacy API {method} {path}",
-            )
+            try:
+                return await self._json_object_response(
+                    response,
+                    operation=f"legacy API {method} {path}",
+                )
+            except AccessClientError as exc:
+                if method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+                    raise AccessCommandOutcomeUnknownError(str(exc)) from exc
+                raise
 
     async def validate_open_api(self) -> bool:
         """Validate a configured Open API token without changing door state.
@@ -997,19 +1165,24 @@ class AccessClient:
             "UniFi Access returned an invalid legacy lock-rule envelope"
         )
 
-    @staticmethod
-    def _validate_legacy_rule_write(payload: dict, requested_type: str) -> None:
+    @classmethod
+    def _validate_legacy_rule_write(
+        cls,
+        payload: dict,
+        requested_type: str,
+    ) -> None:
         """Accept only explicit success shapes observed across Access releases."""
+        cls._validate_legacy_mutation_payload(
+            payload,
+            operation="legacy lock rule",
+            require_data_object=False,
+        )
+
         if "code" in payload:
-            if payload.get("code") == "SUCCESS":
-                return
-            raise AccessClientError("UniFi Access rejected the legacy lock rule")
+            return
 
         if "meta" in payload:
-            meta = payload.get("meta")
-            if isinstance(meta, dict) and meta.get("rc") in {"ok", "success"}:
-                return
-            raise AccessClientError("UniFi Access rejected the legacy lock rule")
+            return
 
         if payload.get("success") is True or payload.get("data") == "success":
             return
@@ -1020,7 +1193,7 @@ class AccessClient:
         try:
             echoed = AccessClient._parse_legacy_lock_rule(payload)
         except AccessClientError as exc:
-            raise AccessClientError(
+            raise AccessCommandOutcomeUnknownError(
                 "UniFi Access returned an invalid legacy rule-write envelope"
             ) from exc
         if echoed["type"] != requested_type:
@@ -1145,6 +1318,17 @@ class AccessClient:
                     rule_matches = False
                 if rule_matches:
                     rule_ever_matched = True
+                    if expected_state is None and not self.open_api_configured:
+                        # Legacy `reset` is positive confirmation that Access
+                        # resumed native behavior, but that endpoint exposes no
+                        # relay state for reset. Preserve a derived state for
+                        # schedule readbacks when possible; do not turn the
+                        # absence of one into a false reset failure.
+                        try:
+                            last_state = self._legacy_state_from_rule(rule)
+                        except AccessClientError:
+                            return {"type": last_rule}
+                        return {"type": last_rule, "state": last_state}
                     if self.open_api_configured:
                         last_state = await self.get_door_state(
                             device_id,
@@ -1189,7 +1373,48 @@ class AccessClient:
             raise error from last_error
         raise error
 
+    @asynccontextmanager
+    async def _operation_lease(self):
+        """Prevent close() from retiring sessions during command readback."""
+        async with self._lifecycle:
+            if self._closing or self._closed:
+                raise AccessClientError("UniFi Access client is closing")
+            self._active_operations += 1
+        try:
+            yield
+        finally:
+            async with self._lifecycle:
+                self._active_operations -= 1
+                if self._active_operations == 0:
+                    self._lifecycle.notify_all()
+
     async def _write_rule_and_confirm(
+        self,
+        device_id: str,
+        location_id: str | None,
+        *,
+        rule_type: str,
+        accepted_types: frozenset[str] | None,
+        rejected_types: frozenset[str] = frozenset(),
+        expected_state: str | None,
+        must_change_from: dict[str, object] | None = None,
+        momentary_reset_ok: bool = False,
+        on_written: Callable[[], None] | None = None,
+    ) -> dict[str, str]:
+        async with self._operation_lease():
+            return await self._write_rule_and_confirm_leased(
+                device_id,
+                location_id,
+                rule_type=rule_type,
+                accepted_types=accepted_types,
+                rejected_types=rejected_types,
+                expected_state=expected_state,
+                must_change_from=must_change_from,
+                momentary_reset_ok=momentary_reset_ok,
+                on_written=on_written,
+            )
+
+    async def _write_rule_and_confirm_leased(
         self,
         device_id: str,
         location_id: str | None,
@@ -1249,16 +1474,23 @@ class AccessClient:
         if on_written is not None:
             on_written()
 
-        return await self._confirm_rule_command(
-            device_id,
-            location_id,
-            requested_type=rule_type,
-            accepted_types=accepted_types,
-            rejected_types=rejected_types,
-            expected_state=expected_state,
-            must_change_from=must_change_from,
-            momentary_reset_ok=momentary_reset_ok,
-        )
+        try:
+            async with asyncio.timeout(_LOCK_CONFIRM_WINDOW):
+                return await self._confirm_rule_command(
+                    device_id,
+                    location_id,
+                    requested_type=rule_type,
+                    accepted_types=accepted_types,
+                    rejected_types=rejected_types,
+                    expected_state=expected_state,
+                    must_change_from=must_change_from,
+                    momentary_reset_ok=momentary_reset_ok,
+                )
+        except (AccessClientError, TimeoutError) as exc:
+            # The write passed its strict success-envelope check above. A
+            # bounded readback failure is therefore an uncertain mutation, not
+            # equivalent to a transport/upstream rejection before the write.
+            raise AccessCommandAcceptedUnconfirmedError(str(exc)) from exc
 
     async def hold_unlocked(
         self,
@@ -1347,7 +1579,11 @@ class AccessClient:
             device_id,
             location_id,
             rule_type="lock_now",
-            accepted_types=_LOCKED_RULE_TYPES,
+            # A changed keep_lock (including only changed metadata) is still the
+            # persistent override this method is meant to release. Confirm only
+            # a non-persistent closed rule; momentary_reset_ok separately accepts
+            # reset when the relay positively reports locked.
+            accepted_types=frozenset({"lock_early", "lock_now"}),
             expected_state="locked",
             must_change_from=must_change_from,
             # Same momentary self-clear as force_lock: `reset` after the write
@@ -1387,8 +1623,9 @@ class AccessClient:
             device_id,
             location_id,
             rule_type="reset",
-            accepted_types=None,
-            rejected_types=frozenset({"keep_lock", "keep_unlock", "custom"}),
+            # Follow Schedule is confirmed only by native/schedule behavior.
+            # A changed lock_early/lock_now override is not a successful reset.
+            accepted_types=frozenset({"schedule", "reset"}),
             expected_state=None,
             must_change_from=must_change_from,
             on_written=on_written,
@@ -1424,14 +1661,100 @@ class AccessClient:
         """
         Trigger a momentary (timed) unlock for a location/door.
 
+        This compatibility method confirms only that the private Access API
+        accepted the request. Call :meth:`unlock_momentary_confirmed` when the
+        caller needs authoritative relay-state confirmation.
+
         Args:
             location_id: ID of the location to unlock momentarily.
         """
         path = API_LOCATION_UNLOCK.format(location_id=location_id)
         resp = await self._request("POST", path, json={})
         async with resp:
-            pass
+            await self._legacy_mutation_response(
+                resp,
+                operation="momentary unlock",
+                allow_empty=True,
+            )
         logger.info("Momentary unlock sent to location %s", location_id)
+
+    async def unlock_momentary_confirmed(
+        self,
+        location_id: str,
+        *,
+        on_written: Callable[[], None] | None = None,
+    ) -> dict[str, str]:
+        async with self._operation_lease():
+            return await self._unlock_momentary_confirmed_leased(
+                location_id,
+                on_written=on_written,
+            )
+
+    async def _unlock_momentary_confirmed_leased(
+        self,
+        location_id: str,
+        *,
+        on_written: Callable[[], None] | None = None,
+    ) -> dict[str, str]:
+        """Trigger a momentary unlock and confirm the official relay state.
+
+        The momentary write remains on the private console-session endpoint for
+        firmware compatibility. Once that endpoint has explicitly accepted the
+        mutation, ``on_written`` releases any caller-owned command barrier and
+        official Open API reads boundedly wait for the matching door relay to
+        report ``unlocked``.
+
+        A missing Open API token or an exhausted readback window is an accepted
+        but unconfirmed mutation, not a pre-write failure.
+        """
+        await self.unlock_momentary(location_id)
+
+        if on_written is not None:
+            on_written()
+
+        if not self.open_api_configured:
+            raise AccessCommandAcceptedUnconfirmedError(
+                "UniFi Access accepted the momentary unlock, but an Open API "
+                "token is required to confirm the door relay state"
+            )
+
+        last_state: str | None = None
+        last_error: BaseException | None = None
+        attempts = len(_LOCK_CONFIRM_DELAYS) + 1
+        try:
+            async with asyncio.timeout(_LOCK_CONFIRM_WINDOW):
+                for attempt in range(attempts):
+                    try:
+                        last_state = await self.get_door_state(
+                            location_id,
+                            location_id=location_id,
+                        )
+                        if last_state == "unlocked":
+                            logger.info(
+                                "Momentary unlock relay confirmed for location %s",
+                                location_id,
+                            )
+                            return {"state": "unlocked"}
+                    except AccessClientError as exc:
+                        last_error = exc
+
+                    if attempt + 1 < attempts:
+                        await asyncio.sleep(_LOCK_CONFIRM_DELAYS[attempt])
+        except TimeoutError as exc:
+            last_error = exc
+
+        detail = (
+            f" (observed state={last_state})"
+            if last_state is not None
+            else ""
+        )
+        error = AccessCommandAcceptedUnconfirmedError(
+            "UniFi Access accepted the momentary unlock, but the relay did "
+            f"not report unlocked within {_LOCK_CONFIRM_WINDOW:g}s{detail}"
+        )
+        if last_error is not None:
+            raise error from last_error
+        raise error
 
     # ------------------------------------------------------------------
     # Visitor management
@@ -1457,8 +1780,13 @@ class AccessClient:
             },
         )
         async with resp:
-            data = await resp.json(content_type=None)
-            return data.get("data", {})
+            result = await self._legacy_mutation_response(
+                resp,
+                operation="visitor create",
+                require_data_object=True,
+            )
+        assert result is not None
+        return result
 
     async def update_visitor(self, visitor_id: str, **fields) -> dict:
         """Update a visitor (PIN, location, time window). Returns updated data."""
@@ -1468,14 +1796,23 @@ class AccessClient:
             json=fields,
         )
         async with resp:
-            data = await resp.json(content_type=None)
-            return data.get("data", {})
+            result = await self._legacy_mutation_response(
+                resp,
+                operation="visitor update",
+                require_data_object=True,
+            )
+        assert result is not None
+        return result
 
     async def delete_visitor(self, visitor_id: str) -> None:
         """Delete a visitor from UniFi Access."""
         resp = await self._request("DELETE", f"/proxy/access/api/v2/visitor/{visitor_id}")
         async with resp:
-            pass
+            await self._legacy_mutation_response(
+                resp,
+                operation="visitor delete",
+                allow_empty=True,
+            )
         logger.info("Deleted visitor %s", visitor_id)
 
     async def list_visitors(self) -> list[dict]:
@@ -1497,8 +1834,13 @@ class AccessClient:
             json={"first_name": first_name, "last_name": last_name, "status": "ACTIVE"},
         )
         async with resp:
-            data = await resp.json(content_type=None)
-            return data.get("data", {})
+            result = await self._legacy_mutation_response(
+                resp,
+                operation="user create",
+                require_data_object=True,
+            )
+        assert result is not None
+        return result
 
     # ------------------------------------------------------------------
     # User PIN management
@@ -1512,8 +1854,13 @@ class AccessClient:
             json={"pin_code": pin_code},
         )
         async with resp:
-            data = await resp.json(content_type=None)
-            return data.get("data", {})
+            result = await self._legacy_mutation_response(
+                resp,
+                operation="user PIN update",
+                require_data_object=True,
+            )
+        assert result is not None
+        return result
 
     async def remove_user_pin(self, user_id: str) -> dict:
         """Remove a user's PIN code."""
@@ -1523,8 +1870,13 @@ class AccessClient:
             json={"pin_code": ""},
         )
         async with resp:
-            data = await resp.json(content_type=None)
-            return data.get("data", {})
+            result = await self._legacy_mutation_response(
+                resp,
+                operation="user PIN removal",
+                require_data_object=True,
+            )
+        assert result is not None
+        return result
 
     # ------------------------------------------------------------------
     # WebSocket callbacks
@@ -1735,12 +2087,16 @@ class AccessClient:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def close(self) -> None:
-        """
-        Shut down the WebSocket listener and close the HTTP session.
+    async def _close_impl(self) -> None:
+        """Drain operation leases, then retire WebSocket and HTTP resources."""
+        async with self._lifecycle:
+            if self._closed:
+                return
+            self._closing = True
+            while self._active_operations:
+                await self._lifecycle.wait()
+            self._closed = True
 
-        Safe to call multiple times.
-        """
         await self.stop_websocket()
         if self._session is not None and not self._session.closed:
             await self._session.close()
@@ -1750,3 +2106,24 @@ class AccessClient:
             self._api_session = None
         self._csrf_token = None
         logger.info("AccessClient closed")
+
+    async def close(self) -> None:
+        """Close completely before propagating caller cancellation."""
+        async with self._lifecycle:
+            task = self._close_task
+            if task is None:
+                task = asyncio.create_task(
+                    self._close_impl(),
+                    name="access-client-close",
+                )
+                self._close_task = task
+
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+        task.result()
+        if cancellation is not None:
+            raise cancellation

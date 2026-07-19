@@ -12,11 +12,57 @@ import base64
 
 SECRET_KEY_SOURCE_DATABASE = "database"
 SECRET_KEY_SOURCE_ENVIRONMENT = "environment"
+_SECRET_FINGERPRINT_PREFIX = "pbkdf2_sha256"
+_SECRET_FINGERPRINT_ITERATIONS = 480_000
 
 
 def secret_key_fingerprint(secret_key: str) -> str:
-    """Return a non-secret identifier used to detect key mismatches."""
-    return hashlib.sha256(secret_key.encode()).hexdigest()
+    """Return a slow, salted verifier used to detect key mismatches.
+
+    A raw SHA-256 digest would let someone holding only SQLite test weak
+    environment-key guesses at hashing speed.  This verifier deliberately costs
+    the same order of work as deriving the application's Fernet key.
+    """
+    salt = os.urandom(16)
+    verifier = hashlib.pbkdf2_hmac(
+        "sha256",
+        secret_key.encode(),
+        salt,
+        iterations=_SECRET_FINGERPRINT_ITERATIONS,
+    )
+    return (
+        f"{_SECRET_FINGERPRINT_PREFIX}$"
+        f"{_SECRET_FINGERPRINT_ITERATIONS}$"
+        f"{salt.hex()}${verifier.hex()}"
+    )
+
+
+def _matches_secret_key_fingerprint(secret_key: str, stored: str) -> bool:
+    """Verify current fingerprints and the legacy raw-SHA format."""
+    try:
+        algorithm, iterations_raw, salt_hex, verifier_hex = stored.split("$", 3)
+    except ValueError:
+        # Backward compatibility only. Runtime initialization replaces this
+        # legacy fast verifier after the supplied key has matched once.
+        legacy = hashlib.sha256(secret_key.encode()).hexdigest()
+        return secrets.compare_digest(legacy, stored)
+    if algorithm != _SECRET_FINGERPRINT_PREFIX:
+        return False
+    try:
+        iterations = int(iterations_raw)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(verifier_hex)
+    except (ValueError, TypeError):
+        return False
+    if iterations != _SECRET_FINGERPRINT_ITERATIONS or len(salt) != 16:
+        return False
+    actual = hashlib.pbkdf2_hmac(
+        "sha256",
+        secret_key.encode(),
+        salt,
+        iterations=iterations,
+    )
+    return secrets.compare_digest(actual, expected)
 
 
 def resolve_secret_key(
@@ -56,8 +102,9 @@ def resolve_secret_key(
                 "Environment-key fingerprint is missing from the database; restore "
                 "a consistent database/key backup."
             )
-        actual = secret_key_fingerprint(environment_key)
-        if not secrets.compare_digest(actual, stored_fingerprint):
+        if not _matches_secret_key_fingerprint(
+            environment_key, stored_fingerprint
+        ):
             raise RuntimeError(
                 "ACCESS_CONTROL_SECRET_KEY does not match the key used during "
                 "first-run setup."

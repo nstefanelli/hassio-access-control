@@ -347,14 +347,6 @@ jobs:
             exit 1
           fi
 
-          # Per-arch base image for the BUILD_FROM build-arg (the legacy
-          # builder read build.yaml itself; build-image does not).
-          BUILD_FROM=$(yq ".build_from.${{ matrix.arch }}" "${{ matrix.addon }}/build.yaml")
-          if [[ -z "${BUILD_FROM}" || "${BUILD_FROM}" == "null" ]]; then
-            echo "::error::build.yaml has no build_from entry for arch '${{ matrix.arch }}'"
-            exit 1
-          fi
-
           PUSH_IMAGE=false
           if [ "${EVENT_NAME}" != "pull_request" ]; then
             PUSH_IMAGE=true
@@ -387,7 +379,6 @@ jobs:
             echo "description=${DESCRIPTION}"
             echo "image_name=${IMAGE_NAME}"
             echo "docker_hub=${DOCKER_HUB}"
-            echo "build_from=${BUILD_FROM}"
             echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "push_image=${PUSH_IMAGE}"
             echo "image_tags<<EOF"
@@ -401,8 +392,7 @@ jobs:
       # org.opencontainers.image.{created,source,version} labels are
       # injected by the action; the remaining BUILD_* args below populate
       # the Dockerfile's LABEL block (io.hass.name, OCI title/description/
-      # revision/licenses), which covers everything build.yaml's `labels:`
-      # key used to add. PRs build both arches but never push.
+      # revision/licenses). PRs build both arches but never push.
       - name: Build image (release or immutable snapshot)
         uses: home-assistant/builder/actions/build-image@4de35182ce1e329181bffcbcc84d33db5e2c7e10 # 2026.06.0
         with:
@@ -413,7 +403,6 @@ jobs:
           context: ${{ matrix.addon }}
           file: ${{ matrix.addon }}/Dockerfile
           build-args: |
-            BUILD_FROM=${{ steps.meta.outputs.build_from }}
             BUILD_NAME=${{ steps.meta.outputs.name }}
             BUILD_DESCRIPTION=${{ steps.meta.outputs.description }}
             BUILD_REF=${{ github.sha }}

@@ -8,7 +8,7 @@ import mimetypes
 import os
 import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,6 +44,7 @@ from .api_routes import router as api_router
 from .auth_engine import AuthEngine
 from .config import (
     SECRET_KEY_SOURCE_DATABASE,
+    SECRET_KEY_SOURCE_ENVIRONMENT,
     decrypt_value,
     derive_key,
     resolve_secret_key,
@@ -56,7 +57,8 @@ from .ha_creds import (
 )
 from .hub_sync import HubSyncManager
 from .protect_client import ProtectClient
-from .ha_client import HAClient
+from .ha_client import HAClient, ha_client_operation
+from .lock_actions import publish_lock_state
 from .relock_manager import RelockManager
 from .service_restart import request_service_restart
 from .web_routes import router as web_router
@@ -65,6 +67,10 @@ from . import web_auth
 logger = logging.getLogger(__name__)
 
 _HERE = Path(__file__).parent
+# Home Assistant stops the add-on after the manifest's 60-second timeout.
+# Hub release and relock cleanup each get a bounded quarter of that budget so
+# client closure and SQLite still have time to complete.
+_MANAGER_SHUTDOWN_TIMEOUT_SECONDS = 15.0
 
 # `_resolve_ha_creds` lives in `ha_creds.py` so the env-vs-DB precedence
 # logic can be unit-tested without dragging FastAPI (and main.py's whole
@@ -79,6 +85,71 @@ def _log_task_exception(task: asyncio.Task) -> None:
     exc = task.exception()
     if exc:
         logger.error("Unhandled exception in task %r: %s", task.get_name(), exc, exc_info=exc)
+
+
+async def _shutdown_manager_bounded(
+    manager,
+    label: str,
+    *,
+    failure_detail: str = "",
+) -> bool:
+    """Run an optional manager shutdown without exhausting HA's stop budget."""
+    shutdown = getattr(manager, "shutdown", None)
+    if not callable(shutdown):
+        return True
+    try:
+        result = shutdown()
+        if inspect.isawaitable(result):
+            await asyncio.wait_for(
+                result,
+                timeout=_MANAGER_SHUTDOWN_TIMEOUT_SECONDS,
+            )
+        return True
+    except asyncio.TimeoutError:
+        logger.error(
+            "%s shutdown exceeded %.0fs; continuing lifecycle cleanup%s",
+            label,
+            _MANAGER_SHUTDOWN_TIMEOUT_SECONDS,
+            failure_detail,
+        )
+    except Exception:
+        logger.exception("%s shutdown failed%s", label, failure_detail)
+    return False
+
+
+async def _persist_resolved_secret_key_metadata(
+    db,
+    *,
+    original_source: str | None,
+    normalized_source: str,
+    stored_fingerprint: str | None,
+    secret_key: str,
+) -> None:
+    """Persist one-time source/verifier migrations after key validation."""
+    if original_source is None:
+        # Legacy installations always encrypted with the database key, even
+        # if an env override was later added. Record that decision once.
+        await db.set_config("secret_key_source", normalized_source)
+        await db.set_config(
+            "secret_key_fingerprint", secret_key_fingerprint(secret_key)
+        )
+        return
+
+    if (
+        normalized_source == SECRET_KEY_SOURCE_ENVIRONMENT
+        and stored_fingerprint
+        and "$" not in stored_fingerprint
+    ):
+        # resolve_secret_key() has already proved this legacy raw-SHA verifier
+        # matches the supplied environment key. Replace only the verifier; the
+        # encryption/session key itself must not rotate during migration.
+        await db.set_config(
+            "secret_key_fingerprint", secret_key_fingerprint(secret_key)
+        )
+        logger.info(
+            "Migrated legacy ACCESS_CONTROL_SECRET_KEY fingerprint to the "
+            "versioned slow verifier"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +179,7 @@ async def _lifespan_inner(app: FastAPI):
     app.state.auth_engine = None
     app.state.ws_last_event = {"access": None, "protect": None}
     app.state.lock_states = {}
+    app.state.lock_state_updated_at = {}
     app.state.relock_tasks = {}
     app.state.relock_manager: RelockManager | None = None
     app.state.hub_sync_manager: HubSyncManager | None = None
@@ -136,7 +208,9 @@ async def _lifespan_inner(app: FastAPI):
     app.state.access_started_client = None
     app.state.protect_started_client = None
     app.state.seed_lock_states = None
+    app.state.mark_ha_lock_states_unknown = None
     app.state.physical_command_lock = asyncio.Lock()
+    app.state.physical_entity_locks = {}
     app.state.setup_lock = asyncio.Lock()
     app.state.settings_update_lock = asyncio.Lock()
     app.state.access_start_lock = asyncio.Lock()
@@ -506,8 +580,17 @@ async def _lifespan_inner(app: FastAPI):
                                 hub_sync.mark_access_momentary(eid, duration)
                             accepted = False
                             confirmed = False
+                            command_attempted = False
                             command_ha = None
+                            entity_lock = app.state.physical_entity_locks.setdefault(
+                                f"ha:{eid}", asyncio.Lock()
+                            )
+                            entity_lock_acquired = False
+                            ha_lease_stack = AsyncExitStack()
+                            await ha_lease_stack.__aenter__()
                             try:
+                                await entity_lock.acquire()
+                                entity_lock_acquired = True
                                 async with app.state.physical_command_lock:
                                     current_engine = app.state.auth_engine
                                     if current_engine and current_engine.lockdown:
@@ -518,6 +601,11 @@ async def _lifespan_inner(app: FastAPI):
                                         )
                                     else:
                                         command_ha = app.state.ha_client
+                                        command_attempted = command_ha is not None
+                                        if command_ha is not None:
+                                            await ha_lease_stack.enter_async_context(
+                                                ha_client_operation(command_ha)
+                                            )
                                         accepted = bool(
                                             command_ha
                                             and await command_ha.unlock(eid)
@@ -533,7 +621,9 @@ async def _lifespan_inner(app: FastAPI):
                                         if attempt < 2:
                                             await asyncio.sleep(0.25)
                                 if confirmed:
-                                    app.state.lock_states[eid] = "unlocked"
+                                    publish_lock_state(
+                                        app.state, eid, "unlocked"
+                                    )
                                     try:
                                         await rm.extend_after_success(
                                             relock_intent, duration
@@ -545,6 +635,10 @@ async def _lifespan_inner(app: FastAPI):
                                             lock_name,
                                         )
                                 else:
+                                    if command_attempted:
+                                        publish_lock_state(
+                                            app.state, eid, "unknown"
+                                        )
                                     await rm.retain_after_uncertain_unlock(
                                         relock_intent
                                     )
@@ -554,11 +648,19 @@ async def _lifespan_inner(app: FastAPI):
                                         lock_name,
                                     )
                             except asyncio.CancelledError:
+                                if command_attempted:
+                                    publish_lock_state(
+                                        app.state, eid, "unknown"
+                                    )
                                 await rm.retain_after_uncertain_unlock(
                                     relock_intent
                                 )
                                 raise
                             except Exception:
+                                if command_attempted:
+                                    publish_lock_state(
+                                        app.state, eid, "unknown"
+                                    )
                                 logger.exception(
                                     "Remote Access unlock mirroring raised for %s",
                                     lock_name,
@@ -566,6 +668,10 @@ async def _lifespan_inner(app: FastAPI):
                                 await rm.retain_after_uncertain_unlock(
                                     relock_intent
                                 )
+                            finally:
+                                await ha_lease_stack.aclose()
+                                if entity_lock_acquired:
+                                    entity_lock.release()
                     except BaseException as exc:
                         # The remote event arrives after the door was already
                         # opened. If write-ahead persistence fails, immediately
@@ -578,20 +684,39 @@ async def _lifespan_inner(app: FastAPI):
                             exc_info=True,
                         )
                         confirmed = False
+                        lock_attempted = False
                         try:
-                            async with app.state.physical_command_lock:
-                                ha = app.state.ha_client
-                                accepted = bool(ha and await ha.lock(eid))
-                            if accepted:
-                                ha = app.state.ha_client
-                                confirmed = bool(
-                                    ha
-                                    and await ha.get_entity_state(eid) == "locked"
+                            entity_lock = (
+                                app.state.physical_entity_locks.setdefault(
+                                    f"ha:{eid}", asyncio.Lock()
                                 )
+                            )
+                            async with entity_lock:
+                                async with AsyncExitStack() as ha_lease_stack:
+                                    async with app.state.physical_command_lock:
+                                        ha = app.state.ha_client
+                                        lock_attempted = ha is not None
+                                        if ha is not None:
+                                            await ha_lease_stack.enter_async_context(
+                                                ha_client_operation(ha)
+                                            )
+                                        accepted = bool(
+                                            ha and await ha.lock(eid)
+                                        )
+                                    if accepted:
+                                        confirmed = bool(
+                                            ha
+                                            and await ha.get_entity_state(eid)
+                                            == "locked"
+                                        )
                         except Exception:
                             logger.exception(
                                 "Immediate fail-safe lock raised for %s", lock_name
                             )
+                        if confirmed:
+                            publish_lock_state(app.state, eid, "locked")
+                        elif lock_attempted:
+                            publish_lock_state(app.state, eid, "unknown")
                         try:
                             await db.log_access(
                                 method="remote_relock",
@@ -741,24 +866,26 @@ async def _lifespan_inner(app: FastAPI):
 
         stored_secret_key = await db.get_config("secret_key")
         secret_key_source = await db.get_config("secret_key_source")
+        stored_secret_fingerprint = await db.get_config(
+            "secret_key_fingerprint"
+        )
+        environment_secret_key = os.environ.get("ACCESS_CONTROL_SECRET_KEY")
         secret_key, normalized_key_source = resolve_secret_key(
             stored_key=stored_secret_key,
             source=secret_key_source,
-            stored_fingerprint=await db.get_config("secret_key_fingerprint"),
-            environment_key=os.environ.get("ACCESS_CONTROL_SECRET_KEY"),
+            stored_fingerprint=stored_secret_fingerprint,
+            environment_key=environment_secret_key,
         )
-        if secret_key_source is None:
-            # One-time, backward-compatible migration.  Legacy installations
-            # always encrypted with the database key, even if an env override
-            # was later added (that override was the source of the old
-            # undecryptable-credentials bug).
-            await db.set_config("secret_key_source", normalized_key_source)
-            await db.set_config(
-                "secret_key_fingerprint", secret_key_fingerprint(secret_key)
-            )
+        await _persist_resolved_secret_key_metadata(
+            db,
+            original_source=secret_key_source,
+            normalized_source=normalized_key_source,
+            stored_fingerprint=stored_secret_fingerprint,
+            secret_key=secret_key,
+        )
         if (
             normalized_key_source == SECRET_KEY_SOURCE_DATABASE
-            and os.environ.get("ACCESS_CONTROL_SECRET_KEY")
+            and environment_secret_key
         ):
             logger.warning(
                 "Ignoring ACCESS_CONTROL_SECRET_KEY: this installation was "
@@ -918,13 +1045,18 @@ async def _lifespan_inner(app: FastAPI):
         # on_locked callback keeps the in-memory lock_states cache fresh
         # after a relock timer fires.
         def _mark_locked(entity_id: str) -> None:
-            app.state.lock_states[entity_id] = "locked"
+            publish_lock_state(app.state, entity_id, "locked")
+
+        def _mark_unknown(entity_id: str) -> None:
+            publish_lock_state(app.state, entity_id, "unknown")
 
         app.state.relock_manager = RelockManager(
             db=db,
             ha_client_getter=lambda: app.state.ha_client,
             on_locked=_mark_locked,
+            on_unknown=_mark_unknown,
             command_lock=app.state.physical_command_lock,
+            entity_command_locks=app.state.physical_entity_locks,
         )
 
         # HubSyncManager mirrors opted-in third-party HA lock states onto
@@ -933,7 +1065,7 @@ async def _lifespan_inner(app: FastAPI):
         # as RelockManager. on_hub_state keeps the lock_states cache fresh
         # so the Locks page shows the hub's new state.
         def _mark_hub_state(device_id: str, state: str) -> None:
-            app.state.lock_states[device_id] = state
+            publish_lock_state(app.state, device_id, state)
 
         app.state.hub_sync_manager = HubSyncManager(
             db=db,
@@ -951,6 +1083,7 @@ async def _lifespan_inner(app: FastAPI):
             # Protect doorbell entry device (G6 Entry) resolve their hub.
             camera_map_getter=lambda: app.state.camera_to_location,
             command_lock=app.state.physical_command_lock,
+            entity_command_locks=app.state.physical_entity_locks,
             # Opt-in relock_on_ha_origin schedules a durable re-lock through the
             # RelockManager (constructed just above) when an external HA unlock
             # is observed on a synced lock.
@@ -975,6 +1108,10 @@ async def _lifespan_inner(app: FastAPI):
             # Lazily fetched so a device-auth timed unlock can lease a momentary
             # Access hold on a bidirectionally synced lock.
             hub_sync_getter=lambda: app.state.hub_sync_manager,
+            # Credential HA unlocks publish cache state only after exact HA
+            # readback confirmation.
+            on_lock_state=_mark_hub_state,
+            entity_command_locks=app.state.physical_entity_locks,
         )
 
         # Restore lockdown mode persisted before a restart (incident control
@@ -1009,19 +1146,35 @@ async def _lifespan_inner(app: FastAPI):
             ]
             if not ha_locks:
                 return 0
+            observation_started_at = time.monotonic()
             results = await asyncio.gather(
                 *(ha.get_entity_state(lock["entity_id"]) for lock in ha_locks),
                 return_exceptions=True,
             )
-            fresh: dict[str, str] = {}
             for lock, state in zip(ha_locks, results):
-                if isinstance(state, str) and state:
-                    fresh[lock["entity_id"]] = state
-            app.state.lock_states = fresh
-            return len(fresh)
+                publish_lock_state(
+                    app.state,
+                    lock["entity_id"],
+                    state if state in {"locked", "unlocked"} else "unknown",
+                    observed_at=observation_started_at,
+                )
+            return len(ha_locks)
+
+        async def mark_ha_lock_states_unknown() -> int:
+            """Invalidate HA cache truth without erasing native Access state."""
+            all_locks = await db.get_all_locks()
+            count = 0
+            for lock in all_locks:
+                entity_id = lock.get("entity_id")
+                if lock["type"] == "ha_external" and entity_id:
+                    publish_lock_state(app.state, entity_id, "unknown")
+                    count += 1
+            return count
 
         app.state.seed_lock_states = seed_lock_states
+        app.state.mark_ha_lock_states_unknown = mark_ha_lock_states_unknown
         app.state.lock_states = {}
+        app.state.lock_state_updated_at = {}
         await seed_lock_states()
 
         # Rehydrate any pending relocks the previous run left in the DB.
@@ -1322,6 +1475,15 @@ async def _lifespan_inner(app: FastAPI):
                 await asyncio.sleep(30)
                 ha = app.state.ha_client
                 if ha is None:
+                    if previous_connected:
+                        invalidate = app.state.mark_ha_lock_states_unknown
+                        if invalidate is not None:
+                            try:
+                                await invalidate()
+                            except Exception:
+                                logger.exception(
+                                    "Could not invalidate HA lock states"
+                                )
                     previous_connected = False
                     continue
                 try:
@@ -1360,6 +1522,14 @@ async def _lifespan_inner(app: FastAPI):
                             logger.exception("Timezone refresh after HA recovery failed")
                 elif previous_connected and not now_connected:
                     logger.warning("HA connection lost — %s", ha.last_error)
+                    invalidate = app.state.mark_ha_lock_states_unknown
+                    if invalidate is not None:
+                        try:
+                            await invalidate()
+                        except Exception:
+                            logger.exception(
+                                "Could not invalidate HA lock states"
+                            )
                 elif now_connected:
                     # Steady-state while connected: sweep any overdue relocks
                     # that exhausted their retries so a door doesn't stay
@@ -1613,24 +1783,14 @@ async def _lifespan_inner(app: FastAPI):
         # relock timers or the Access REST session. Non-lockdown shutdown
         # returns native schedule ownership; lockdown retains keep_lock.
         hub_manager = app.state.hub_sync_manager
-        hub_shutdown = getattr(hub_manager, "shutdown", None)
-        if callable(hub_shutdown):
-            try:
-                shutdown_result = hub_shutdown()
-                if inspect.isawaitable(shutdown_result):
-                    await shutdown_result
-            except Exception:
-                logger.exception("Hub sync shutdown failed; durable hold rows retained")
+        await _shutdown_manager_bounded(
+            hub_manager,
+            "Hub sync",
+            failure_detail="; durable hold rows retained",
+        )
 
         relock_manager = app.state.relock_manager
-        relock_shutdown = getattr(relock_manager, "shutdown", None)
-        if callable(relock_shutdown):
-            try:
-                shutdown_result = relock_shutdown()
-                if inspect.isawaitable(shutdown_result):
-                    await shutdown_result
-            except Exception:
-                logger.exception("Relock manager shutdown failed")
+        await _shutdown_manager_bounded(relock_manager, "Relock manager")
 
         for label, client in (
             ("ProtectClient", app.state.protect_client),
@@ -1665,14 +1825,11 @@ async def _cleanup_failed_startup(app: FastAPI) -> None:
 
     for manager_name in ("hub_sync_manager", "relock_manager"):
         manager = getattr(app.state, manager_name, None)
-        shutdown = getattr(manager, "shutdown", None)
-        if callable(shutdown):
-            try:
-                result = shutdown()
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:
-                logger.exception("%s cleanup failed after startup error", manager_name)
+        await _shutdown_manager_bounded(
+            manager,
+            manager_name,
+            failure_detail=" after startup error",
+        )
 
     for label, client in (
         ("ProtectClient", getattr(app.state, "protect_client", None)),

@@ -84,6 +84,7 @@ Returns a health snapshot. All three scopes are accepted.
   "access_open_api_ready": true,
   "access_open_api_error": null,
   "protect_connected": true,
+  "protect_in_use": true,
   "ha_connected": true,
   "ha_last_error": null,
   "ha_circuit_state": "closed",
@@ -99,12 +100,13 @@ Returns a health snapshot. All three scopes are accepted.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `status` | string | Always `ok` when the authenticated route completed. It is not aggregate upstream health. |
+| `status` | string | Aggregate `ok`, `degraded`, or `critical`. `critical` means an overdue re-lock or unresolved lockdown/fail-safe lock; `degraded` means Access, HA, the Access WebSocket, a configured Open API, or Protect while `protect_in_use` is true is not ready. |
 | `unvr_connected` | boolean | Current Access REST/session connection state. The historical field name is retained for compatibility. |
 | `access_open_api_configured` | boolean | Whether the active Access client has an official Bearer token configured. |
 | `access_open_api_ready` | boolean | Whether the configured official API passed its latest startup/settings validation. |
 | `access_open_api_error` | string/null | Sanitized validation error class when the official API is configured but not ready. |
 | `protect_connected` | boolean | Current Protect client connection state. |
+| `protect_in_use` | boolean | Whether any configured entry-device mapping depends on Protect doorbell events. A disconnected optional Protect client degrades aggregate health only while this is `true`. |
 | `ha_connected` | boolean | Current HA client connection state. |
 | `ha_last_error` | string/null | Most recent HA error, if any. |
 | `ha_circuit_state` | string | HA circuit breaker: `closed`, `open`, or `half_open`. |
@@ -113,11 +115,16 @@ Returns a health snapshot. All three scopes are accepted.
 | `lock_count` | integer | Operable configured lock rows, including hidden rows but excluding upstream-missing native locks. |
 | `lockdown` | boolean | Current authorization-engine lockdown state. It normally matches persistence; on a failed transition the safer in-memory state can remain enabled while the request reports `503`. |
 | `lockdown_enforcement_pending` | array of strings | HA entity IDs whose synced Access hubs are not yet confirmed locked under the active lockdown. A non-empty list requires operator attention/retry. |
-| `hub_sync_fail_safe` | array of strings | HA entity IDs whose bidirectionally synced pair is currently held by the locked-wins fail-safe latch. While listed, the pair is forced locked and any unlock is reverted until both sides confirm/observe locked. A persistently non-empty entry points to an unconfirmed lock/unlock command or an unreadable Access side and warrants investigation. Entity IDs are exposed to every health scope, matching `lockdown_enforcement_pending`. |
+| `hub_sync_fail_safe` | array of strings | HA entity IDs whose bidirectionally synced pair is currently held by the locked-wins fail-safe latch. While listed, the pair is forced locked and any unlock is reverted until HA and every paired hub's raw official-API relay report locked. A private rule-derived state cannot release the latch. A persistently non-empty entry points to an unconfirmed command, missing authoritative token/readback, or an unreadable Access side and warrants investigation. Entity IDs are exposed to every health scope, matching `lockdown_enforcement_pending`. |
 | `pending_relocks` | object | Durable re-lock intent counts: `total` rows and how many are `overdue` (past their deadline and still retrying). Counts only — entity IDs are deliberately omitted so the lowest-privilege scope stays safe. A non-zero `overdue` means a door the app promised to re-lock is not confirmed locked; see the Locks page badges and the `access_control_relock_failed` event. |
 
 Use `GET /health/live` for process liveness and this endpoint for component
-health. Do not alert from `status` alone.
+health. Alert on `critical`; inspect the component fields and pending arrays to
+identify the affected safety contract.
+
+An Access-only deployment can report aggregate `ok` with
+`protect_connected: false` when `protect_in_use` is false. Once a Protect
+doorbell mapping exists, a Protect disconnect reports `degraded`.
 
 ### `GET /api/log`
 
@@ -192,7 +199,9 @@ if the same location is rediscovered.
 
 This endpoint returns configuration, not an authoritative live state for every
 lock. Read HA entity state or the relevant upstream system when live state is
-required.
+required. Even then, HA reports its entity and Access reports controller relay
+state; neither is independent mechanical-bolt, jam, latch, or door-contact
+proof.
 
 ### `PUT /api/locks/{lock_id}/mode`
 
@@ -231,6 +240,18 @@ Success returns `200` only after confirmation:
   "reason": null
 }
 ```
+
+If Access accepts a native lock-mode mutation but bounded readback cannot
+confirm its resulting rule/relay state, the endpoint returns `202` with
+`result: "accepted_unconfirmed"`, `confirmed: false`, and no
+`confirmed_state`. A `keep_unlock` may already be holding the door open; a
+`lock_now` may already have ended a schedule; and `reset` may already have
+returned control to a schedule that opens the door. The app publishes
+`unknown` to its native-door cache and does not run optional alarm auto-disarm.
+This uncertain persistent override is not automatically undone because a blind
+compensating mutation could be less safe than the accepted desired state.
+Inspect Access and the physical opening before retrying or issuing a deliberate
+compensating command.
 
 For `follow_schedule`, `confirmed_state` is `scheduled`: this confirms that the
 override was cleared, not that the physical door is necessarily closed. The
@@ -350,22 +371,28 @@ may have held open and confirms the paired HA lock is closed when that command
 path is available. Authenticated rule/relay and HA state are re-read while
 lockdown remains active, so a later direct unlock is detected and `keep_lock`
 is safely reasserted. `reset` is not used because it could resume an active
-native unlock schedule.
+native unlock schedule. A production pair is acknowledged safe only when HA
+reports `locked` when its command path is available, the rule remains
+`keep_lock`, and every paired hub's raw official-API relay reports `locked`.
+During an HA outage the confirmed Access relay is the fail-safe boundary. A
+tokenless private rule-derived state cannot satisfy that acknowledgement.
 
 If enabling cannot persist the desired value or cannot confirm every required
 hub lock, the endpoint returns `503` while retaining the safer enabled
 in-memory state. `GET /api/health` lists unresolved HA entity IDs in
 `lockdown_enforcement_pending`; retry `enabled=true` after restoring the
-database/Access path or correcting a pairing conflict. If `enabled=false`
-cannot be persisted, lockdown likewise remains enabled and the request returns
-`503`. On startup, an error reading the persisted value is interpreted
-fail-closed as enabled until an explicit disable succeeds.
+database/official Access path, configuring the token, or correcting a pairing
+conflict. If `enabled=false` cannot be persisted, lockdown likewise remains
+enabled and the request returns `503`. On startup, an error reading the
+persisted value is interpreted fail-closed as enabled until an explicit
+disable succeeds.
 
 Disabling lockdown does not synchronously clear persistent hub rules in the
-API response. The next authenticated reconciliation confirms both sides locked,
-replaces an app-owned `keep_lock` with `lock_now`, and clears ownership only
-after rule/relay confirmation. A removed pairing returns to its native rule
-after lockdown. Failed replacement remains durable and retries.
+API response. The next authenticated reconciliation confirms HA locked plus
+official raw Access relay locked, replaces an app-owned `keep_lock` with
+`lock_now`, and clears ownership only after rule/relay confirmation. A removed
+pairing returns to its native rule after lockdown. Failed replacement remains
+durable and retries.
 
 Lockdown cannot prevent a separate HA user/integration or direct UniFi operator
 from issuing a command outside this application's authorization path. For
@@ -489,6 +516,7 @@ mode command errors retain the structured command response documented above.
 | Status | Meaning |
 |---:|---|
 | 200 | Request completed. Inspect component booleans for degraded health. |
+| 202 | A native lock-mode mutation was accepted upstream but its resulting rule/relay state could not be confirmed. It may already be active; inspect the controller and physical opening before retrying. |
 | 401 | Bearer credential missing, malformed, or invalid. |
 | 403 | Authenticated key lacks the endpoint's scope. |
 | 404 | A requested operable lock or authorization rule does not exist. |

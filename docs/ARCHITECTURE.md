@@ -85,8 +85,16 @@ For each event, the authorization engine:
 6. Enters the shared physical-command barrier, rechecks lockdown, and only then
    issues each physical unlock command.
 7. Logs each grant, denial, or command error.
-8. Fires an `access_control_event` in Home Assistant and, when permitted,
+8. Fires an `access_control_granted` event in Home Assistant and, when permitted,
    disarms configured alarm panels.
+
+For a native momentary unlock, the private Access endpoint issues the pulse and
+the official Open API relay must then report `unlocked` before step 7 becomes a
+grant. If the write was accepted but relay confirmation is unavailable, the
+result is audited as `accepted_unconfirmed`, the native-door cache becomes
+`unknown`, and the app does not fire the grant event or auto-disarm. This
+separates the command's possible physical side effect from confirmed-success
+side effects.
 
 An unknown, unavailable, transitional, triggered, night-armed, or mixed alarm
 state is handled conservatively when any armed-state blocking flag applies.
@@ -109,18 +117,25 @@ door/location ID. The private console-session API uses a hub device ID and is
 retained only as tokenless compatibility mode. A configured token selects the
 official path exclusively: authentication, permission, transport, or schema
 failure never falls back to the private endpoint. Official responses require a
-strict `SUCCESS` envelope, and door mutations complete only after bounded rule
-and relay-state readback. Because current firmware can report the relay state
-several seconds after it accepts a rule write, that readback runs on a bounded
-progressive window (~5 s total) rather than a fixed sub-second loop; a read that
-returns no usable state mid-window is retried, and only a genuine timeout raises
-(fail-closed, unchanged). A momentary `lock_now` self-clears its rule to `reset`
-right after it executes, so the confirmation treats an observed `reset` after
-`lock_now` as the documented post-execution state and relies on the relay
-reading `locked` for its positive evidence — a rule echo alone is never success.
-When a write is accepted but the relay never reaches the expected state, the
-error distinguishes that ("rule accepted but relay did not report … within Ns")
-from a rule that was never accepted.
+strict `SUCCESS` envelope, and persistent native lock-mode commands complete
+only after bounded rule and relay-state readback. Because current firmware can
+report relay state several seconds after it accepts a rule write, that readback
+runs on a bounded progressive window (~5 s total) rather than a fixed
+sub-second loop; a read that returns no usable state mid-window is retried. A
+momentary `lock_now` self-clears its rule to `reset` right after it executes, so
+confirmation accepts the documented post-execution rule only when the relay
+provides positive `locked` evidence — a rule echo alone is never success. Once
+a strict write response has been accepted, an exhausted readback raises a
+typed accepted-unconfirmed result rather than pretending the mutation did not
+happen.
+
+Momentary credential/dashboard buzz uses the private console-session mutation
+for firmware compatibility even when a token is configured. Its acceptance is
+validated separately, the global command barrier is released, and official
+Open API relay polling must observe `unlocked` to confirm the grant. Without a
+token, or when a brief pulse is not observed inside the bounded window, the
+operation remains accepted-unconfirmed. A short pulse that falls between polls
+therefore produces a conservative false-negative, not a guessed success.
 
 Native actions map to distinct Access rules. `keep_unlock` is a persistent
 hold-open; `keep_lock` is a persistent fail-safe lock; `lock_now` terminates an
@@ -134,6 +149,12 @@ only, a door with no active override reports an empty rule type, which the
 client normalizes to `reset` (native behavior); this normalization does not
 change how state is confirmed — always through relay readback, never inferred
 from the rule — and legacy envelope parsing stays strict.
+
+An accepted-unconfirmed persistent mutation is not automatically inverted:
+`keep_unlock` may already be holding open, `lock_now` may already have ended a
+schedule, or `reset` may already have resumed one. The app publishes unknown
+and requires operator/controller inspection rather than issuing a blind
+compensating mutation.
 
 Timed re-locks apply to HA-external locks. Four sources arm one: a timed buzz,
 a device-auth credential unlock, a remote unlock, and — when the per-lock
@@ -191,15 +212,15 @@ preserves the current closed interval without allowing the persistent fail-safe
 override to suppress future native schedules. The locked-wins fail-safe latch
 (which forces the pair locked and reverts any unlock until it clears) is
 released through one shared helper on either of two conditions: a fully
-confirmed locked convergence, or — new in 1.5.12 — a poll that independently
-observes both sides validly locked even though the cosmetic `lock_now` release
-could not be confirmed. The latter prevents a permanent wedge on firmware whose
-momentary `lock_now` self-clears to `reset`: without it, a release whose confirm
-kept failing would revert every subsequent unlock indefinitely. The observation
-release requires both sides observed `locked`; any unknown, unreadable, or
-unlocked side keeps the latch (locked-wins is never weakened), and durable
-`keep_lock` ownership remains queued for a later confirmed `lock_now`. Latched
-entities are surfaced in `hub_sync_fail_safe` in authenticated health.
+confirmed locked convergence, or a poll that independently observes HA locked
+and every Access hub's **raw official-API relay** locked even though the
+cosmetic `lock_now` release could not be confirmed. The latter prevents a
+permanent wedge on firmware whose momentary `lock_now` self-clears to `reset`.
+A private rule-derived `locked` value, including a successfully written
+`keep_lock`, is never independent relay evidence. Any unknown, unreadable,
+legacy-derived, or unlocked side keeps the latch, and durable `keep_lock`
+ownership remains queued for a later confirmed `lock_now`. Latched entities
+are surfaced in `hub_sync_fail_safe` in authenticated health.
 
 Pairing resolution is snapshotted per convergence pass. When a mapping changes,
 removed hubs enter the confirmed-safe queue before the newly paired hub may be
@@ -228,17 +249,26 @@ origin, Access-rule fingerprint, and pairing signature; Access-origin schedule
 state is never confused with an app-owned override.
 
 One app-wide command barrier orders authorization/manual unlocks, HA re-locks,
-hub actuation, lockdown transitions, and live client swaps. Critical paths take
-the barrier before per-entity locks. This avoids deadlock and gives lockdown a
-clear completion guarantee: after enable returns, an older application command
-cannot issue later. The barrier is held for exactly one physical write and is
-released before the (now multi-second) relay-confirmation reads, mirroring the
-HA re-lock/confirm path, so a slow-to-actuate hub cannot stall commands to
-unrelated doors for the whole confirmation window. Enabling lockdown also
-synchronously enforces a safe hub lock. If persistence or a required lock is
-unresolved, the API returns `503`, keeps the safer in-memory lockdown state, and
-reports unresolved entity IDs through `lockdown_enforcement_pending` in
-authenticated health.
+hub actuation, lockdown transitions, and live client swaps. Physical workflows
+take their stable per-entity lock before entering the barrier and keep that
+entity lock through readback; paths needing both locks use that same order.
+This avoids deadlock while giving lockdown a clear completion guarantee: after
+enable returns, an older application command cannot issue later. The barrier is
+held for exactly one physical write and is released before the (now
+multi-second) relay-confirmation reads, mirroring the HA re-lock/confirm path,
+so a slow-to-actuate hub cannot stall commands to unrelated doors for the whole
+confirmation window. Access and HA clients lease the exact writer through that
+readback; live Settings publication can switch new work to a tested client,
+but retirement waits for already-accepted confirmation without recreating an
+old session. Enabling lockdown also
+synchronously enforces a safe hub lock. A production Access pair acknowledges
+that enforcement only when `keep_lock` plus authoritative raw relay readback
+report locked; when the HA command path is available, HA must also report
+locked. During an HA outage the Access relay is the fail-safe boundary.
+Tokenless rule-derived state cannot acknowledge the physical safety condition.
+If persistence or a required lock is unresolved, the API returns `503`, keeps
+the safer in-memory lockdown state, and reports unresolved entity IDs through
+`lockdown_enforcement_pending` in authenticated health.
 
 Remote-unlock events are different from ordinary queued authorization work: the
 upstream event says the door has already opened. Their re-lock scheduling tasks
@@ -276,13 +306,23 @@ writes. A full topology refresh uses an isolated connection and one atomic
 transaction, skips unchanged rows, and refuses to mark every user deleted or
 every native lock missing when upstream returns an empty/malformed snapshot.
 
+The database owns the invariant that one individual authorization rule exists
+per user/lock pair. Upgrade migration keeps the oldest of identical duplicate
+policies. If legacy duplicates conflict, it keeps one row but disables it and
+clears its schedule for explicit administrator review before installing the
+unique index.
+
 Logical multi-key configuration changes use one serialized bundle transaction.
 First-run encryption/credential metadata and settings credential/schedule
 updates therefore cannot be observed as a half-written set. Candidate clients
 are tested before the matching live reference is published.
 
-Use the backup procedure in [Operations](OPERATIONS.md). Copying only the main
-database file while WAL mode is active is not a consistent backup.
+Use the backup procedure in [Operations](OPERATIONS.md). The manifest requests
+a cold Supervisor backup so the process is stopped before `/data` is copied.
+That protects WAL consistency but creates a deliberate safety-automation
+outage: event intake, due re-lock actuation, sync/lockdown retry, and health are
+unavailable until restart. Copying only the main database file while WAL mode
+is active is not a consistent backup.
 
 ## Resilience and efficiency
 
@@ -309,6 +349,11 @@ database file while WAL mode is active is not a consistent backup.
 - Access rule events reduce bidirectional-sync latency, while periodic
   authenticated rule/relay reads remain authoritative and repair drift.
 - Event handling is deduplicated and concurrency-bounded.
+- UI cache refresh tasks are lifespan-owned. Hub-sync and re-lock manager
+  shutdown each have a 15-second bound inside the manifest's 60-second stop
+  timeout. The complete teardown does not yet have one aggregate deadline, so
+  Supervisor force-stop remains possible if a later client or database close
+  stalls.
 
 ## Network and trust summary
 
@@ -316,8 +361,10 @@ The application trusts Home Assistant administrators, Supervisor, the UniFi
 consoles, and the HA instance it controls. It does not authenticate the
 physical person independently of the credential event UniFi reports. Ingress
 headers are not a cryptographic boundary against another compromised app on
-the same Supervisor network. See [Security model](SECURITY-MODEL.md) for the
-full threat model and accepted risks.
+the same Supervisor network. Neither HA entity state nor the official Access
+relay is a mechanical bolt, latch, jam, or door-contact sensor. See
+[Security model](SECURITY-MODEL.md) for the full threat model and accepted
+risks.
 
 ## Repository layout
 
@@ -325,7 +372,7 @@ full threat model and accepted risks.
 .
 ├── access_control/
 │   ├── config.yaml                 # Home Assistant app manifest
-│   ├── Dockerfile / build.yaml     # multi-architecture image
+│   ├── Dockerfile                  # multi-architecture image
 │   ├── frontend/                   # pinned Tailwind build inputs
 │   ├── rootfs/run.sh               # container entry point
 │   └── rootfs/opt/access_control/  # Python app, templates, static files, tests

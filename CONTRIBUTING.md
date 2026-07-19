@@ -60,7 +60,6 @@ relative/Ingress-aware and shared behavior in `static/app.js`.
 ```bash
 cd access_control
 docker build \
-  --build-arg BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.21 \
   --build-arg BUILD_ARCH=amd64 \
   --build-arg BUILD_VERSION=dev \
   -t access-control:dev .
@@ -129,7 +128,7 @@ Conventional Commit prefixes are encouraged but not required: `feat`, `fix`,
 ```text
 access_control/
 ├── config.yaml                         # HA app manifest
-├── Dockerfile / build.yaml
+├── Dockerfile
 ├── frontend/                           # pinned Tailwind inputs
 ├── rootfs/run.sh                       # bashio/container entry point
 └── rootfs/opt/access_control/
