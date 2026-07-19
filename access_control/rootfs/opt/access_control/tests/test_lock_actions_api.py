@@ -465,6 +465,42 @@ class SharedLockActionTests(unittest.IsolatedAsyncioTestCase):
             reason=None,
         )
 
+    async def test_entity_lock_released_when_lease_close_is_cancelled(
+        self,
+    ) -> None:
+        """A cancellation delivered while the HA operation lease closes must
+        not leak the per-entity command lock: a leaked lock would permanently
+        wedge every later command and pending re-lock for that door."""
+        lock = {
+            "id": 6,
+            "type": "ha_external",
+            "entity_id": "lock.front",
+            "name": "Front",
+        }
+        db = _db_for(lock)
+
+        @asynccontextmanager
+        async def cancelled_lease():
+            try:
+                yield
+            finally:
+                raise asyncio.CancelledError()
+
+        ha = SimpleNamespace(
+            operation_lease=cancelled_lease,
+            unlock=AsyncMock(return_value=True),
+            get_entity_state=AsyncMock(return_value="unlocked"),
+        )
+        state = _state(db=db, ha=ha)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await execute_lock_action(
+                state, 6, "unlock", actor="admin", source="manual"
+            )
+
+        self.assertFalse(state.physical_entity_locks["ha:lock.front"].locked())
+        self.assertFalse(state.physical_command_lock.locked())
+
     async def test_same_ha_lock_commands_cannot_overtake_readback(self) -> None:
         lock = {
             "id": 105,

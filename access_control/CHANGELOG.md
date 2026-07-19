@@ -6,6 +6,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- The per-entity command lock is now released even when barrier release or
+  the HA operation-lease close is cancelled mid-cleanup; previously a
+  cancellation at that point could permanently wedge every later command and
+  pending re-lock for that door.
+- The hub-sync write-ahead freshness guard no longer runs the progressive
+  ~5s relay-lag observation window while holding the global physical-command
+  barrier. It now takes a single time-bounded read and suppresses the
+  HA-origin unlock (fail-safe) on any ambiguity, so a slow or lagging hub
+  cannot stall commands for unrelated doors.
+- Restored the missing runner in `test_lockdown_enforcement_unaffected`,
+  which previously passed without executing its lockdown-enforcement
+  assertions.
+
 ### Documentation
 
 - Synchronized the reference docs ([Architecture](../docs/ARCHITECTURE.md),

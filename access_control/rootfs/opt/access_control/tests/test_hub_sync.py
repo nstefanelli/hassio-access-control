@@ -1344,6 +1344,28 @@ class TestBidirectionalConvergence(unittest.TestCase):
             access.force_lock.assert_not_awaited()
         _run(go())
 
+    def test_non_settling_observation_reads_once_without_sleeping(self) -> None:
+        """The write-ahead guard observes with ``settle=False`` while holding
+        the global command barrier; even the schedule+locked relay-lag case
+        must classify on a single read with no progressive-window sleeps."""
+        async def go():
+            mgr, _ha, access, _states, _rules, _access_states = self._fixture(
+                ha_state="unlocked", rule="schedule", door_state="locked"
+            )
+            sleep = AsyncMock()
+            with patch("access_control.hub_sync.asyncio.sleep", new=sleep):
+                state, rule, _active, _relay = await mgr._observe_access_hub(
+                    access,
+                    {"device_id": "dev-hub-1", "location_id": "loc-1"},
+                    settle=False,
+                )
+            sleep.assert_not_awaited()
+            access.get_lock_rule.assert_awaited_once()
+            access.get_door_state.assert_awaited_once()
+            self.assertEqual(state, "locked")
+            self.assertEqual(rule["type"], "schedule")
+        _run(go())
+
     def test_ha_unlock_is_suppressed_if_access_changes_before_write(self) -> None:
         async def go():
             mgr, _ha, access, states, rules, access_states = self._fixture()
@@ -2446,6 +2468,7 @@ class TestFailSafeObservationRelease(unittest.TestCase):
             )
             access.restore_native_rule.assert_not_awaited()
             self.assertEqual(access_states["dev-hub-1"], "locked")
+        _run(go())
 
     def test_fail_safe_pending_property_reflects_latched_entities(self) -> None:
         """(viii) The health property exposes latched entity IDs (sorted),
