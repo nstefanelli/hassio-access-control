@@ -165,9 +165,15 @@ private rule-derived state—even after a successful `keep_lock`—is insufficie
 When the incident ends, confirmed `lock_now` replaces the owned `keep_lock` so
 future schedules remain eligible. Clean non-lockdown shutdown restores owned
 overrides and applicable unlocked baselines to Access-native ownership;
-lockdown retains `keep_lock`. Pairing changes close removed hubs before opening
-replacements, and shared physical hubs are locked/suppressed until ownership is
-one-to-one.
+lockdown retains `keep_lock`. Per lock, **Keep hold-open across graceful
+restarts** opts a deliberately held-open door out of that release: a graceful
+shutdown leaves its `keep_unlock` in place and records a single-use
+clean-shutdown marker, and startup recovery re-adopts the hold only after
+readback proves Home Assistant still reports the deadbolt unlocked and the
+door still reports `keep_unlock`. Unclean exits, stale markers, lockdown, or
+any failed readback keep the fail-closed recovery path. Pairing changes close
+removed hubs before opening replacements, and shared physical hubs are
+locked/suppressed until ownership is one-to-one.
 
 The official Access token is therefore required for authoritative latch release
 and lockdown acknowledgement. Tokenless compatibility can still parse known
@@ -257,7 +263,11 @@ copying a closed database or use SQLite's online `.backup` command, then run
 Supervisor uses a cold backup for this app, so event intake, re-lock
 actuation, sync/lockdown retries, and health are unavailable until restart.
 Avoid backups during timed unlocks or incidents; after restart, verify health,
-pending re-locks, lockdown enforcement, and affected physical doors.
+pending re-locks, lockdown enforcement, and affected physical doors. A
+backup's stop/start also re-locks a synced door held open via `keep_unlock`
+unless that lock enables **Keep hold-open across graceful restarts**, which
+preserves the hold across a graceful restart after startup readback confirms
+both sides still agree the door is open.
 
 Treat the database and backups as secrets. In environment-key mode, the exact
 `ACCESS_CONTROL_SECRET_KEY` is not stored in the database and must be backed up

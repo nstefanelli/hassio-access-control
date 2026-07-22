@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS locks (
     access_location_id  TEXT,
     sync_hub_state      INTEGER NOT NULL DEFAULT 0,
     relock_on_ha_origin INTEGER NOT NULL DEFAULT 0,
+    preserve_hold_on_restart INTEGER NOT NULL DEFAULT 0,
     upstream_present    INTEGER NOT NULL DEFAULT 1
 );
 
@@ -637,6 +638,21 @@ class Database:
                      ON access_rules(user_id, lock_id)"""
             )
 
+            # Migration 27: opt-in "survive graceful restarts" for app-owned
+            # keep_unlock holds. With `backup: cold`, every backup gracefully
+            # stops/starts the add-on, and recovery fail-closes a door that
+            # was deliberately held open. Locks with this flag keep their
+            # hold across a *clean* shutdown/recover pair (validated by
+            # readback); unclean exits still fail closed. Default 0 (off) so
+            # existing installs keep current behaviour. Mirrors migration 25.
+            async with self._db.execute("PRAGMA table_info(locks)") as cur:
+                cols = {row[1] for row in await cur.fetchall()}
+            if "preserve_hold_on_restart" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE locks ADD COLUMN preserve_hold_on_restart "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+
             await self._db.commit()
         except Exception:
             await self._db.rollback()
@@ -975,6 +991,22 @@ class Database:
                 if isolated is not None:
                     await isolated.close()
 
+    async def delete_config(self, key: str) -> None:
+        """Remove a config key. Deleting a missing key is a no-op.
+
+        Used for single-use markers (the hub-sync clean-shutdown marker)
+        where an empty value must be indistinguishable from absence.
+        """
+        async with self._config_lock:
+            try:
+                await self._db.execute(
+                    "DELETE FROM config WHERE key = ?", (key,)
+                )
+                await self._db.commit()
+            except BaseException:
+                await self._db.rollback()
+                raise
+
     # ------------------------------------------------------------------
     # Users
     # ------------------------------------------------------------------
@@ -1221,16 +1253,18 @@ class Database:
         access_location_id: Any = _KEEP, relock_on_remote: bool = False,
         relock_on_device_auth: bool = False, sync_hub_state: bool = False,
         relock_on_ha_origin: bool = False,
+        preserve_hold_on_restart: bool = False,
     ) -> None:
         sets = (
             "buzz_enabled = ?, relock_duration = ?, relock_on_remote = ?, "
             "relock_on_device_auth = ?, sync_hub_state = ?, "
-            "relock_on_ha_origin = ?"
+            "relock_on_ha_origin = ?, preserve_hold_on_restart = ?"
         )
         params: list[Any] = [
             1 if buzz_enabled else 0, relock_duration,
             1 if relock_on_remote else 0, 1 if relock_on_device_auth else 0,
             1 if sync_hub_state else 0, 1 if relock_on_ha_origin else 0,
+            1 if preserve_hold_on_restart else 0,
         ]
         # Resolve the sentinel via type(self), NOT the module-global
         # `Database`: importlib.reload (used by the integration tests)

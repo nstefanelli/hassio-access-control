@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
+import json
 import sys
 import tempfile
 import time as _time
@@ -2644,6 +2645,573 @@ class TestRelockOnHaOrigin(unittest.TestCase):
                 "dev-hub-1", location_id="loc-1"
             )
             relock.schedule.assert_not_awaited()
+        _run(go())
+
+
+class TestGracefulRestartHoldPreservation(unittest.TestCase):
+    """Opt-in survival of app-owned keep_unlock holds across a graceful
+    Supervisor stop/start pair (`backup: cold` restarts every backup).
+
+    Contract: shutdown() writes a single-use clean-shutdown marker and leaves
+    opted-in keep_unlock holds physically in place; recover() re-establishes
+    the hold only after readback proves HA still reports the deadbolt
+    unlocked (and, with a bidirectional client, the hub still reports
+    keep_unlock). Every other path — no marker, stale marker, HA locked or
+    unreachable, lockdown, opt-out — keeps today's fail-closed behavior.
+    """
+
+    MARKER_KEY = "hub_sync_clean_shutdown"
+
+    async def _make_real_db(self, tmp: str, *, preserve: bool = True):
+        db = Database(path=Path(tmp) / "hub-holds.db")
+        await db.connect()
+        hub_id = await db.upsert_native_lock(
+            "dev-hub-1", "loc-1", "Front Door Hub"
+        )
+        external_id = await db.add_external_lock("lock.front", "Front Deadbolt")
+        await db.update_lock_settings(
+            external_id,
+            buzz_enabled=True,
+            relock_duration=30,
+            access_location_id="loc-1",
+            sync_hub_state=True,
+            preserve_hold_on_restart=preserve,
+        )
+        return db, hub_id, external_id
+
+    def _bidi_world(self, *, rule="reset", door="locked", ha="locked"):
+        rules = {"dev-hub-1": {"type": rule}}
+        states = {"dev-hub-1": door}
+        ha_states = {"lock.front": ha}
+        access = _make_bidirectional_access(rules, states)
+        ha_client = _make_bidirectional_ha(ha_states)
+        return rules, states, ha_states, access, ha_client
+
+    async def _establish_hold(self, db) -> tuple:
+        """First process run: converge the pair open via an HA unlock."""
+        rules, states, ha_states, access, ha = self._bidi_world()
+        mgr = _make_mgr(db, ha, access)
+        await mgr.poll_once()  # baseline: both sides locked
+        ha_states["lock.front"] = "unlocked"
+        _clear_damping(mgr)
+        applied = await mgr.poll_once()  # HA-origin unlock → keep_unlock
+        assert applied == 1, applied
+        assert rules["dev-hub-1"]["type"] == "keep_unlock"
+        holds = await db.get_hub_sync_holds()
+        assert [
+            (r["entity_id"], r["hub_device_id"], r["override_type"])
+            for r in holds
+        ] == [("lock.front", "dev-hub-1", "keep_unlock")], holds
+        return mgr, rules, states, ha_states, access, ha
+
+    def test_graceful_restart_preserves_opted_in_hold(self) -> None:
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, _hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    mgr, rules, states, ha_states, access, ha = (
+                        await self._establish_hold(db)
+                    )
+
+                    # Graceful shutdown must NOT release the opted-in hold:
+                    # the door stays physically held open through the backup.
+                    self.assertEqual(await mgr.shutdown(), 0)
+                    self.assertEqual(rules["dev-hub-1"]["type"], "keep_unlock")
+                    access.hold_locked.assert_not_awaited()
+                    access.force_lock.assert_not_awaited()
+                    access.restore_native_rule.assert_not_awaited()
+                    holds = await db.get_hub_sync_holds()
+                    self.assertEqual(holds[0]["override_type"], "keep_unlock")
+                    raw = await db.get_config(self.MARKER_KEY)
+                    marker = json.loads(raw)
+                    self.assertEqual(marker["preserved"], ["lock.front"])
+                finally:
+                    await db.close()
+
+                # --- graceful restart: new process, same database ---
+                db2 = Database(path=Path(tmp) / "hub-holds.db")
+                await db2.connect()
+                try:
+                    rules2 = {"dev-hub-1": {"type": "keep_unlock"}}
+                    states2 = {"dev-hub-1": "unlocked"}
+                    ha_states2 = {"lock.front": "unlocked"}
+                    access2 = _make_bidirectional_access(rules2, states2)
+                    ha2 = _make_bidirectional_ha(ha_states2)
+                    mgr2 = _make_mgr(db2, ha2, access2)
+
+                    self.assertEqual(await mgr2.recover(), 0)
+                    # HA readback proved the deadbolt is still unlocked, so
+                    # the hold is re-established, not fail-closed.
+                    self.assertEqual(rules2["dev-hub-1"]["type"], "keep_unlock")
+                    access2.hold_locked.assert_not_awaited()
+                    access2.force_lock.assert_not_awaited()
+                    access2.restore_native_rule.assert_not_awaited()
+                    ha2.lock.assert_not_awaited()
+                    holds = await db2.get_hub_sync_holds()
+                    self.assertEqual(holds[0]["override_type"], "keep_unlock")
+                    self.assertEqual(
+                        {h["device_id"] for h in mgr2._held_open["lock.front"]},
+                        {"dev-hub-1"},
+                    )
+                    self.assertEqual(mgr2._pending_release, {})
+                    self.assertNotIn("lock.front", mgr2._fail_safe_reset_eids)
+                    # Single-use: the marker is consumed by recovery.
+                    self.assertFalse(await db2.get_config(self.MARKER_KEY))
+
+                    # The next poll must keep following, not re-lock the pair.
+                    await mgr2.poll_once()
+                    self.assertEqual(rules2["dev-hub-1"]["type"], "keep_unlock")
+                    self.assertEqual(ha_states2["lock.front"], "unlocked")
+                    ha2.lock.assert_not_awaited()
+                finally:
+                    await db2.close()
+        _run(go())
+
+    def test_hold_survives_repeated_backup_cycles(self) -> None:
+        """The production scenario: nightly backups each stop/start the
+        add-on; a preserved hold must survive every cycle, and each graceful
+        shutdown must re-arm the marker for the next one."""
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, _hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    mgr, *_ = await self._establish_hold(db)
+                    self.assertEqual(await mgr.shutdown(), 0)
+                finally:
+                    await db.close()
+
+                for cycle in (2, 3):
+                    db_n = Database(path=Path(tmp) / "hub-holds.db")
+                    await db_n.connect()
+                    try:
+                        rules = {"dev-hub-1": {"type": "keep_unlock"}}
+                        states = {"dev-hub-1": "unlocked"}
+                        ha_states = {"lock.front": "unlocked"}
+                        access = _make_bidirectional_access(rules, states)
+                        ha = _make_bidirectional_ha(ha_states)
+                        mgr_n = _make_mgr(db_n, ha, access)
+                        self.assertEqual(
+                            await mgr_n.recover(), 0, f"cycle {cycle}"
+                        )
+                        await mgr_n.poll_once()
+                        self.assertEqual(
+                            rules["dev-hub-1"]["type"],
+                            "keep_unlock",
+                            f"cycle {cycle}",
+                        )
+                        self.assertEqual(
+                            await mgr_n.shutdown(), 0, f"cycle {cycle}"
+                        )
+                        raw = await db_n.get_config(self.MARKER_KEY)
+                        self.assertEqual(
+                            json.loads(raw)["preserved"],
+                            ["lock.front"],
+                            f"cycle {cycle}",
+                        )
+                    finally:
+                        await db_n.close()
+        _run(go())
+
+    def test_recover_without_marker_fails_closed_despite_opt_in(self) -> None:
+        """Unclean exit (no shutdown, no marker) keeps today's behavior."""
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, _hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    await self._establish_hold(db)
+                    # No shutdown() — simulate a crash / SIGKILL.
+                finally:
+                    await db.close()
+
+                db2 = Database(path=Path(tmp) / "hub-holds.db")
+                await db2.connect()
+                try:
+                    rules2 = {"dev-hub-1": {"type": "keep_unlock"}}
+                    states2 = {"dev-hub-1": "unlocked"}
+                    access2 = _make_bidirectional_access(rules2, states2)
+                    ha2 = _make_bidirectional_ha({"lock.front": "unlocked"})
+                    mgr2 = _make_mgr(db2, ha2, access2)
+                    self.assertEqual(await mgr2.recover(), 1)
+                    access2.hold_locked.assert_awaited_once()
+                    self.assertEqual(rules2["dev-hub-1"]["type"], "keep_lock")
+                    holds = await db2.get_hub_sync_holds()
+                    self.assertEqual(holds[0]["override_type"], "keep_lock")
+                    self.assertIn("lock.front", mgr2._fail_safe_reset_eids)
+                finally:
+                    await db2.close()
+        _run(go())
+
+    def test_opt_out_lock_is_released_on_graceful_shutdown(self) -> None:
+        """Without the per-lock opt-in, shutdown keeps today's behavior."""
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, _hub_id, _eid = await self._make_real_db(
+                    tmp, preserve=False
+                )
+                try:
+                    mgr, rules, states, ha_states, access, ha = (
+                        await self._establish_hold(db)
+                    )
+                    self.assertEqual(await mgr.shutdown(), 1)
+                    access.restore_native_rule.assert_awaited_once()
+                    self.assertEqual(rules["dev-hub-1"]["type"], "reset")
+                    self.assertEqual(await db.get_hub_sync_holds(), [])
+                    raw = await db.get_config(self.MARKER_KEY)
+                    self.assertEqual(json.loads(raw)["preserved"], [])
+                finally:
+                    await db.close()
+        _run(go())
+
+    def test_preservation_requires_ha_readback_unlocked(self) -> None:
+        """Marker + opt-in are not enough: HA must still report unlocked."""
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, _hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    mgr, *_ = await self._establish_hold(db)
+                    await mgr.shutdown()
+                finally:
+                    await db.close()
+
+                db2 = Database(path=Path(tmp) / "hub-holds.db")
+                await db2.connect()
+                try:
+                    rules2 = {"dev-hub-1": {"type": "keep_unlock"}}
+                    states2 = {"dev-hub-1": "unlocked"}
+                    access2 = _make_bidirectional_access(rules2, states2)
+                    # HA re-locked (or was restored) while we were down.
+                    ha2 = _make_bidirectional_ha({"lock.front": "locked"})
+                    mgr2 = _make_mgr(db2, ha2, access2)
+                    self.assertEqual(await mgr2.recover(), 1)
+                    self.assertEqual(rules2["dev-hub-1"]["type"], "keep_lock")
+                    self.assertIn("lock.front", mgr2._fail_safe_reset_eids)
+                finally:
+                    await db2.close()
+        _run(go())
+
+    def test_preservation_requires_ha_connected(self) -> None:
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, _hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    mgr, *_ = await self._establish_hold(db)
+                    await mgr.shutdown()
+                finally:
+                    await db.close()
+
+                db2 = Database(path=Path(tmp) / "hub-holds.db")
+                await db2.connect()
+                try:
+                    rules2 = {"dev-hub-1": {"type": "keep_unlock"}}
+                    states2 = {"dev-hub-1": "unlocked"}
+                    access2 = _make_bidirectional_access(rules2, states2)
+                    ha2 = _make_bidirectional_ha({"lock.front": "unlocked"})
+                    ha2.connected = False
+                    mgr2 = _make_mgr(db2, ha2, access2)
+                    self.assertEqual(await mgr2.recover(), 1)
+                    self.assertEqual(rules2["dev-hub-1"]["type"], "keep_lock")
+                finally:
+                    await db2.close()
+        _run(go())
+
+    def test_preservation_requires_hub_rule_still_keep_unlock(self) -> None:
+        """An authenticated Access-side change while down fails closed."""
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, _hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    mgr, *_ = await self._establish_hold(db)
+                    await mgr.shutdown()
+                finally:
+                    await db.close()
+
+                db2 = Database(path=Path(tmp) / "hub-holds.db")
+                await db2.connect()
+                try:
+                    # Someone reset the door rule from the UniFi UI while the
+                    # add-on was stopped.
+                    rules2 = {"dev-hub-1": {"type": "reset"}}
+                    states2 = {"dev-hub-1": "locked"}
+                    access2 = _make_bidirectional_access(rules2, states2)
+                    ha2 = _make_bidirectional_ha({"lock.front": "unlocked"})
+                    mgr2 = _make_mgr(db2, ha2, access2)
+                    self.assertEqual(await mgr2.recover(), 1)
+                    self.assertEqual(rules2["dev-hub-1"]["type"], "keep_lock")
+                    self.assertIn("lock.front", mgr2._fail_safe_reset_eids)
+                finally:
+                    await db2.close()
+        _run(go())
+
+    def test_preservation_readback_exception_fails_closed(self) -> None:
+        """A raising Access readback (not just a wrong value) fails closed."""
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, _hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    mgr, *_ = await self._establish_hold(db)
+                    await mgr.shutdown()
+                finally:
+                    await db.close()
+
+                db2 = Database(path=Path(tmp) / "hub-holds.db")
+                await db2.connect()
+                try:
+                    rules2 = {"dev-hub-1": {"type": "keep_unlock"}}
+                    states2 = {"dev-hub-1": "unlocked"}
+                    access2 = _make_bidirectional_access(rules2, states2)
+                    access2.get_lock_rule = AsyncMock(
+                        side_effect=RuntimeError("console rebooting")
+                    )
+                    ha2 = _make_bidirectional_ha({"lock.front": "unlocked"})
+                    mgr2 = _make_mgr(db2, ha2, access2)
+                    self.assertEqual(await mgr2.recover(), 1)
+                    access2.hold_locked.assert_awaited_once()
+                    self.assertEqual(rules2["dev-hub-1"]["type"], "keep_lock")
+                    self.assertIn("lock.front", mgr2._fail_safe_reset_eids)
+                finally:
+                    await db2.close()
+        _run(go())
+
+    def test_multi_hub_partial_confirmation_fails_closed(self) -> None:
+        """One of two held hubs no longer reporting keep_unlock must fail
+        the whole entity closed — never preserve a half-confirmed hold."""
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    # Simulate the durable state a graceful shutdown leaves
+                    # behind for a two-hub pairing: both keep_unlock rows plus
+                    # a fresh clean-shutdown marker naming the entity.
+                    for device in ("dev-hub-1", "dev-hub-2"):
+                        await db.record_hub_sync_hold(
+                            "lock.front",
+                            device,
+                            hub_id,
+                            f"Hub {device}",
+                            hub_location_id="loc-1",
+                            override_type="keep_unlock",
+                        )
+                    await db.set_config(
+                        self.MARKER_KEY,
+                        json.dumps(
+                            {
+                                "ts": _time.time(),
+                                "preserved": ["lock.front"],
+                            }
+                        ),
+                    )
+                    rules = {
+                        "dev-hub-1": {"type": "keep_unlock"},
+                        # Reset from the UniFi UI while the add-on was down.
+                        "dev-hub-2": {"type": "reset"},
+                    }
+                    states = {"dev-hub-1": "unlocked", "dev-hub-2": "locked"}
+                    access = _make_bidirectional_access(rules, states)
+                    ha = _make_bidirectional_ha({"lock.front": "unlocked"})
+                    mgr = _make_mgr(db, ha, access)
+                    self.assertEqual(await mgr.recover(), 2)
+                    self.assertEqual(rules["dev-hub-1"]["type"], "keep_lock")
+                    self.assertEqual(rules["dev-hub-2"]["type"], "keep_lock")
+                    self.assertIn("lock.front", mgr._fail_safe_reset_eids)
+                    holds = await db.get_hub_sync_holds()
+                    self.assertEqual(
+                        {row["override_type"] for row in holds}, {"keep_lock"}
+                    )
+                finally:
+                    await db.close()
+        _run(go())
+
+    def test_recover_lock_lookup_failure_still_fails_closed(self) -> None:
+        """A failing get_all_locks during recovery must not abort the
+        fail-safe close of durable holds (and must not preserve them)."""
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, _hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    mgr, *_ = await self._establish_hold(db)
+                    await mgr.shutdown()
+                finally:
+                    await db.close()
+
+                db2 = Database(path=Path(tmp) / "hub-holds.db")
+                await db2.connect()
+                try:
+                    rules2 = {"dev-hub-1": {"type": "keep_unlock"}}
+                    states2 = {"dev-hub-1": "unlocked"}
+                    access2 = _make_bidirectional_access(rules2, states2)
+                    ha2 = _make_bidirectional_ha({"lock.front": "unlocked"})
+                    mgr2 = _make_mgr(db2, ha2, access2)
+                    original = db2.get_all_locks
+                    db2.get_all_locks = AsyncMock(
+                        side_effect=RuntimeError("db degraded")
+                    )
+                    try:
+                        # The held rows are already in memory; the close must
+                        # proceed from those instead of raising.
+                        self.assertEqual(await mgr2.recover(), 1)
+                    finally:
+                        db2.get_all_locks = original
+                    access2.hold_locked.assert_awaited_once()
+                    self.assertEqual(rules2["dev-hub-1"]["type"], "keep_lock")
+                    self.assertIn("lock.front", mgr2._fail_safe_reset_eids)
+                finally:
+                    await db2.close()
+        _run(go())
+
+    def test_marker_is_single_use(self) -> None:
+        """A crash after a preserved recovery must fail closed next start."""
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, _hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    mgr, *_ = await self._establish_hold(db)
+                    await mgr.shutdown()
+                finally:
+                    await db.close()
+
+                db2 = Database(path=Path(tmp) / "hub-holds.db")
+                await db2.connect()
+                try:
+                    rules2 = {"dev-hub-1": {"type": "keep_unlock"}}
+                    states2 = {"dev-hub-1": "unlocked"}
+                    access2 = _make_bidirectional_access(rules2, states2)
+                    ha2 = _make_bidirectional_ha({"lock.front": "unlocked"})
+                    mgr2 = _make_mgr(db2, ha2, access2)
+                    self.assertEqual(await mgr2.recover(), 0)  # preserved
+                    # Crash now (no shutdown). Third start: no marker left.
+                finally:
+                    await db2.close()
+
+                db3 = Database(path=Path(tmp) / "hub-holds.db")
+                await db3.connect()
+                try:
+                    rules3 = {"dev-hub-1": {"type": "keep_unlock"}}
+                    states3 = {"dev-hub-1": "unlocked"}
+                    access3 = _make_bidirectional_access(rules3, states3)
+                    ha3 = _make_bidirectional_ha({"lock.front": "unlocked"})
+                    mgr3 = _make_mgr(db3, ha3, access3)
+                    self.assertEqual(await mgr3.recover(), 1)
+                    self.assertEqual(rules3["dev-hub-1"]["type"], "keep_lock")
+                finally:
+                    await db3.close()
+        _run(go())
+
+    def test_stale_marker_fails_closed(self) -> None:
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, _hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    mgr, *_ = await self._establish_hold(db)
+                    await mgr.shutdown()
+                    # Backdate the marker far past any plausible backup window.
+                    await db.set_config(
+                        self.MARKER_KEY,
+                        json.dumps(
+                            {
+                                "ts": _time.time() - 86400,
+                                "preserved": ["lock.front"],
+                            }
+                        ),
+                    )
+                finally:
+                    await db.close()
+
+                db2 = Database(path=Path(tmp) / "hub-holds.db")
+                await db2.connect()
+                try:
+                    rules2 = {"dev-hub-1": {"type": "keep_unlock"}}
+                    states2 = {"dev-hub-1": "unlocked"}
+                    access2 = _make_bidirectional_access(rules2, states2)
+                    ha2 = _make_bidirectional_ha({"lock.front": "unlocked"})
+                    mgr2 = _make_mgr(db2, ha2, access2)
+                    self.assertEqual(await mgr2.recover(), 1)
+                    self.assertEqual(rules2["dev-hub-1"]["type"], "keep_lock")
+                finally:
+                    await db2.close()
+        _run(go())
+
+    def test_lockdown_recover_ignores_marker(self) -> None:
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, _hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    mgr, *_ = await self._establish_hold(db)
+                    await mgr.shutdown()
+                finally:
+                    await db.close()
+
+                db2 = Database(path=Path(tmp) / "hub-holds.db")
+                await db2.connect()
+                try:
+                    rules2 = {"dev-hub-1": {"type": "keep_unlock"}}
+                    states2 = {"dev-hub-1": "unlocked"}
+                    access2 = _make_bidirectional_access(rules2, states2)
+                    ha2 = _make_bidirectional_ha({"lock.front": "unlocked"})
+                    mgr2 = _make_mgr(db2, ha2, access2, lockdown=lambda: True)
+                    self.assertGreaterEqual(await mgr2.recover(), 1)
+                    self.assertEqual(rules2["dev-hub-1"]["type"], "keep_lock")
+                    # Consumed even when ignored, so it cannot linger.
+                    self.assertFalse(await db2.get_config(self.MARKER_KEY))
+                finally:
+                    await db2.close()
+        _run(go())
+
+    def test_shutdown_in_lockdown_never_preserves(self) -> None:
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, _hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    flag = {"on": False}
+                    rules = {"dev-hub-1": {"type": "reset"}}
+                    states = {"dev-hub-1": "locked"}
+                    ha_states = {"lock.front": "locked"}
+                    access = _make_bidirectional_access(rules, states)
+                    ha = _make_bidirectional_ha(ha_states)
+                    mgr = _make_mgr(db, ha, access, lockdown=lambda: flag["on"])
+                    await mgr.poll_once()  # baseline: both sides locked
+                    ha_states["lock.front"] = "unlocked"
+                    _clear_damping(mgr)
+                    self.assertEqual(await mgr.poll_once(), 1)
+                    self.assertEqual(rules["dev-hub-1"]["type"], "keep_unlock")
+
+                    flag["on"] = True
+                    await mgr.shutdown()
+                    # Lockdown shutdown retains keep_lock and preserves nothing.
+                    self.assertEqual(rules["dev-hub-1"]["type"], "keep_lock")
+                    raw = await db.get_config(self.MARKER_KEY)
+                    self.assertEqual(json.loads(raw)["preserved"], [])
+                finally:
+                    await db.close()
+        _run(go())
+
+    def test_shutdown_without_recovery_never_preserves(self) -> None:
+        """The failed-startup path (shutdown with no prior recovery) must not
+        launder an unclean exit's holds into a clean marker."""
+        async def go():
+            with tempfile.TemporaryDirectory() as tmp:
+                db, hub_id, _eid = await self._make_real_db(tmp)
+                try:
+                    await db.record_hub_sync_hold(
+                        "lock.front",
+                        "dev-hub-1",
+                        hub_id,
+                        "Front Door Hub",
+                        hub_location_id="loc-1",
+                        override_type="keep_unlock",
+                    )
+                    rules = {"dev-hub-1": {"type": "keep_unlock"}}
+                    states = {"dev-hub-1": "unlocked"}
+                    access = _make_bidirectional_access(rules, states)
+                    ha = _make_bidirectional_ha({"lock.front": "unlocked"})
+                    mgr = _make_mgr(db, ha, access)
+                    # No recover(), no poll — startup failed before either ran.
+                    self.assertEqual(await mgr.shutdown(), 1)
+                    self.assertEqual(rules["dev-hub-1"]["type"], "reset")
+                    self.assertEqual(await db.get_hub_sync_holds(), [])
+                    raw = await db.get_config(self.MARKER_KEY)
+                    self.assertEqual(json.loads(raw)["preserved"], [])
+                finally:
+                    await db.close()
         _run(go())
 
 
