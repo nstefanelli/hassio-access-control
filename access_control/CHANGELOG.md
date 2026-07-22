@@ -6,6 +6,24 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-07-22
+
+### Added
+
+- Opt-in per-lock setting **Keep hold-open across graceful restarts**
+  (`preserve_hold_on_restart`, shown when hub sync is on, off by default).
+  Because `backup: cold` gracefully stops/starts the app on every backup,
+  recovery previously fail-closed any app-owned `keep_unlock` hold — a door
+  deliberately held open re-locked itself after each backup. With the opt-in,
+  a graceful shutdown leaves the hold physically in place and records a
+  single-use, time-bounded clean-shutdown marker; startup recovery re-adopts
+  the hold only after readback proves Home Assistant still reports the
+  deadbolt unlocked and the Access door still reports `keep_unlock`. Unclean
+  exits, stale or unreadable markers, lockdown, opt-out while stopped, failed
+  readback, and the failed-startup shutdown path all keep the existing
+  fail-closed (`keep_lock`) recovery behavior. Adds locks-table migration 27
+  and `Database.delete_config`.
+
 ## [1.6.1] - 2026-07-18
 
 ### Fixed

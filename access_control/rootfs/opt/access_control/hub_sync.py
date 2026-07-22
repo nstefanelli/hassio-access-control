@@ -107,6 +107,23 @@ _ACCESS_OBSERVE_DELAYS = (0.25, 0.5, 1.0, 1.5, 2.0)
 _ACCESS_OBSERVE_WINDOW = round(sum(_ACCESS_OBSERVE_DELAYS), 1)
 _GUARD_OBSERVE_TIMEOUT = 6.0
 
+# Graceful-restart hold preservation (opt-in per lock via
+# ``preserve_hold_on_restart``). shutdown() records a single-use
+# clean-shutdown marker in the config table naming the keep_unlock holds it
+# deliberately left physically in place; recover() consumes the marker and
+# re-adopts a named hold only after readback proves HA still reports the
+# deadbolt unlocked (and a readback-capable Access client still reports
+# keep_unlock). Everything else keeps the fail-closed recovery path.
+_CLEAN_SHUTDOWN_KEY = "hub_sync_clean_shutdown"
+# A marker older than this is treated as unclean (fail closed). Generous
+# enough for a full-backup stop/start window while bounding how long a stray
+# marker could vouch for an open door. Wall-clock, because monotonic time
+# does not survive the restart the marker exists to bridge.
+_CLEAN_SHUTDOWN_MAX_AGE = 1800.0
+# Small tolerance for wall-clock steps (NTP) between write and read; a
+# marker further in the future than this is suspicious and fails closed.
+_CLEAN_SHUTDOWN_FUTURE_SKEW = 60.0
+
 _ACCESS_OPEN_RULES = {"schedule", "keep_unlock", "custom"}
 _ACCESS_CLOSED_RULES = {
     "keep_lock",
@@ -231,6 +248,11 @@ class HubSyncManager:
         self._pending_release: dict[str, list[dict]] = {}
         self._release_backoff: dict[str, float] = {}
         self._recovery_complete = False
+        # True once THIS process resolved prior-run ownership (recover(), or
+        # the _poll_once fallback that fail-safes it). shutdown() may only
+        # preserve holds afterwards: a shutdown on the failed-startup path
+        # must not launder an unclean exit's holds into a clean marker.
+        self._lifecycle_recovered = False
         self._lockdown_unresolved: set[str] = set()
         self._fail_safe_reset_eids: set[str] = set()
         # Bidirectional origin tracking. These observations are persisted only
@@ -348,30 +370,64 @@ class HubSyncManager:
         the same pass also closes every currently synced pairing without
         consulting Home Assistant.
 
+        The one exception is a hold named by a clean-shutdown marker: a
+        graceful shutdown deliberately left that keep_unlock in place, and it
+        is re-adopted instead of closed — but only outside lockdown, only for
+        a lock still opted into ``preserve_hold_on_restart``, and only after
+        readback proves HA still reports the deadbolt unlocked. HA being
+        unavailable at this point simply fails closed.
+
         Returns the number of confirmed close commands.
         """
         async with self._poll_lock:
             await self._load_persisted_sync_state()
             await self._load_persisted_holds()
             self._recovery_complete = True
+            self._lifecycle_recovered = True
             lockdown_active = self._in_lockdown()
+            # Always consumed (single-use), even when lockdown ignores it.
+            marker_eids = await self._consume_clean_shutdown_marker()
             recovered_eids = (
                 set(self._held_open)
                 | set(self._held_locked)
                 | set(self._pending_release)
             )
-            # An unclean exit left an app-owned open override behind. Closing it
-            # must use persistent keep_lock until HA is trustworthy again; a
-            # plain reset could immediately resume an active unlock schedule.
-            self._fail_safe_reset_eids.update(recovered_eids)
+            all_locks: Optional[list[dict]] = None
             if recovered_eids:
                 # Resolve the current pairing too: a topology change may have
                 # added location data or another hub after the durable row was
                 # written. The held+resolved union must all be safe before this
-                # entity is considered reset for the current incident.
-                all_locks = await self._db.get_all_locks(include_hidden=True)
-                for eid in recovered_eids:
-                    await self._queue_release(eid, all_locks)
+                # entity is considered reset for the current incident. A failed
+                # lookup must not abort the fail-safe close below (the held
+                # rows are already in memory) — and with no rows to prove the
+                # opt-in, nothing is preservable either.
+                try:
+                    all_locks = await self._db.get_all_locks(
+                        include_hidden=True
+                    )
+                except Exception:
+                    _LOGGER.exception(
+                        "Hub sync: lock lookup failed during recovery"
+                    )
+            preserved: set[str] = set()
+            if marker_eids and not lockdown_active and all_locks is not None:
+                preserved = await self._preserve_clean_holds(
+                    marker_eids & recovered_eids, all_locks
+                )
+            for eid in preserved:
+                # The physical keep_unlock never went away; re-adopt it as the
+                # converged open state so the poll loop keeps following.
+                self._pending_release.pop(eid, None)
+                self._applied[eid] = "unlocked"
+                self._last_ha_observed[eid] = "unlocked"
+                self._last_access_observed[eid] = "unlocked"
+            recovered_eids -= preserved
+            # An unclean exit left an app-owned open override behind. Closing it
+            # must use persistent keep_lock until HA is trustworthy again; a
+            # plain reset could immediately resume an active unlock schedule.
+            self._fail_safe_reset_eids.update(recovered_eids)
+            for eid in recovered_eids:
+                await self._queue_release(eid, all_locks)
             self._release_backoff.clear()
             reset_count = await self._process_pending_releases(
                 force=True, enforcing_lockdown=lockdown_active
@@ -389,9 +445,20 @@ class HubSyncManager:
 
         Non-lockdown shutdown restores native schedules. During lockdown it
         retains keep_lock. Failed commands remain durable for :meth:`recover`.
+
+        Holds on locks opted into ``preserve_hold_on_restart`` are the
+        exception: a graceful, non-incident stop leaves their keep_unlock
+        physically in place and names them in a single-use clean-shutdown
+        marker, so a Supervisor stop/start pair (every backup, with
+        ``backup: cold``) does not re-lock a door deliberately held open.
+        :meth:`recover` validates the marker with readback before re-adopting.
         """
         async with self._poll_lock:
             await self._load_persisted_sync_state()
+            # A release already pending at shutdown entry means something is
+            # actively being reset — never preservable. Snapshot before the
+            # durable-row merge below adds the healthy holds to the queue.
+            pending_before = set(self._pending_release)
             await self._load_persisted_holds()
             self._recovery_complete = True
             try:
@@ -399,15 +466,35 @@ class HubSyncManager:
             except Exception:
                 _LOGGER.exception("Hub sync: lock lookup failed during shutdown")
                 all_locks = None
-            for eid in (
+            lockdown_active = self._in_lockdown()
+            candidates = (
                 set(self._applied)
                 | set(self._held_open)
                 | set(self._held_locked)
                 | set(self._pending_release)
-            ):
+            )
+            preserved = self._preservable_holds(
+                candidates - pending_before,
+                all_locks,
+                lockdown_active=lockdown_active,
+            )
+            # The marker is what recover() trusts. If it cannot be written,
+            # the holds are released like any other shutdown (fail closed).
+            preserved = await self._write_clean_shutdown_marker(preserved)
+            for eid in candidates - preserved:
                 await self._queue_release(eid, all_locks)
+            for eid in preserved:
+                # Drop the durable rows the merge queued: a preserved hold
+                # deliberately keeps both its physical rule and its
+                # hub_sync_holds ownership row.
+                self._pending_release.pop(eid, None)
+                _LOGGER.info(
+                    "Hub sync: preserving keep_unlock hold for %s across "
+                    "graceful shutdown",
+                    eid,
+                )
             self._release_backoff.clear()
-            if not self._in_lockdown():
+            if not lockdown_active:
                 # A graceful, non-incident stop deliberately returns native
                 # schedule ownership instead of carrying keep_lock forward.
                 self._fail_safe_reset_eids.difference_update(
@@ -415,7 +502,7 @@ class HubSyncManager:
                 )
             return await self._process_pending_releases(
                 force=True,
-                enforcing_lockdown=self._in_lockdown(),
+                enforcing_lockdown=lockdown_active,
             )
 
     async def enforce_lockdown(self) -> int:
@@ -479,6 +566,9 @@ class HubSyncManager:
             await self._load_persisted_sync_state()
             await self._load_persisted_holds()
             self._recovery_complete = True
+            # This fallback fail-safes prior-run ownership just like
+            # recover(), so holds established after it are preservable.
+            self._lifecycle_recovered = True
             recovered_eids = (
                 set(self._held_open)
                 | set(self._held_locked)
@@ -2257,6 +2347,164 @@ class HubSyncManager:
             self._append_unique_hubs(
                 self._pending_release.setdefault(eid, []), [hub]
             )
+
+    @staticmethod
+    def _preserve_opted_eids(all_locks: list[dict]) -> set[str]:
+        """Entity ids whose current row opts into graceful-restart holds."""
+        return {
+            row["entity_id"]
+            for row in all_locks
+            if row.get("type") == "ha_external"
+            and row.get("entity_id")
+            and row.get("sync_hub_state")
+            and row.get("preserve_hold_on_restart")
+            and not row.get("hidden")
+        }
+
+    def _preservable_holds(
+        self,
+        candidates: set[str],
+        all_locks: Optional[list[dict]],
+        *,
+        lockdown_active: bool,
+    ) -> set[str]:
+        """Select holds a graceful shutdown may leave physically in place.
+
+        Only pure app-owned keep_unlock ownership qualifies (no keep_lock
+        rows, no fail-safe latch), only on locks whose *current* row opts in,
+        only when this process actually resolved prior-run ownership, and
+        never during lockdown.
+        """
+        if lockdown_active or not self._lifecycle_recovered or not all_locks:
+            return set()
+        opted = self._preserve_opted_eids(all_locks)
+        return {
+            eid
+            for eid in candidates
+            if eid in opted
+            and self._held_open.get(eid)
+            and not self._held_locked.get(eid)
+            and eid not in self._fail_safe_reset_eids
+        }
+
+    async def _write_clean_shutdown_marker(self, preserved: set[str]) -> set[str]:
+        """Persist the marker; return the holds it actually vouches for."""
+        setter = self._method(self._db, "set_config")
+        if setter is None:
+            # Legacy injected databases cannot carry a marker — nothing is
+            # preservable, and there is no stale marker to overwrite.
+            return set()
+        try:
+            await setter(
+                _CLEAN_SHUTDOWN_KEY,
+                json.dumps({"ts": time.time(), "preserved": sorted(preserved)}),
+            )
+        except Exception:
+            _LOGGER.exception(
+                "Hub sync: could not write clean-shutdown marker; releasing "
+                "all holds instead"
+            )
+            return set()
+        return preserved
+
+    async def _consume_clean_shutdown_marker(self) -> set[str]:
+        """Read and delete the single-use clean-shutdown marker.
+
+        The row is deleted before its contents are trusted: if it cannot be
+        removed, single-use cannot be guaranteed and the marker is ignored.
+        Malformed, stale, or future-dated contents also fail closed.
+        """
+        getter = self._method(self._db, "get_config")
+        deleter = self._method(self._db, "delete_config")
+        if getter is None or deleter is None:
+            return set()
+        try:
+            raw = await getter(_CLEAN_SHUTDOWN_KEY)
+            if not raw:
+                return set()
+            await deleter(_CLEAN_SHUTDOWN_KEY)
+        except Exception:
+            _LOGGER.exception("Hub sync: clean-shutdown marker read failed")
+            return set()
+        try:
+            data = json.loads(raw)
+            age = time.time() - float(data["ts"])
+            eids = data["preserved"]
+            if not isinstance(eids, list) or not all(
+                isinstance(eid, str) for eid in eids
+            ):
+                raise ValueError("preserved is not a list of entity ids")
+        except Exception:
+            _LOGGER.warning("Hub sync: ignoring malformed clean-shutdown marker")
+            return set()
+        if not -_CLEAN_SHUTDOWN_FUTURE_SKEW <= age <= _CLEAN_SHUTDOWN_MAX_AGE:
+            _LOGGER.warning(
+                "Hub sync: ignoring stale clean-shutdown marker (age %.0fs); "
+                "holds fail closed",
+                age,
+            )
+            return set()
+        return set(eids)
+
+    async def _preserve_clean_holds(
+        self, candidates: set[str], all_locks: list[dict]
+    ) -> set[str]:
+        """Return the marked holds that readback proves safe to re-adopt.
+
+        Eligibility is re-checked against the *current* database row (the
+        opt-in may have been cleared while stopped), then both sides are read
+        back: HA must still report the deadbolt unlocked, and a readback-
+        capable Access client must still report keep_unlock on every held
+        hub. Any doubt leaves the hold on the normal fail-closed path.
+        """
+        if not candidates:
+            return set()
+        opted = self._preserve_opted_eids(all_locks)
+        ha = self._get_ha()
+        access = self._get_access()
+        bidirectional = self._supports_bidirectional_access(access)
+        preserved: set[str] = set()
+        for eid in sorted(candidates):
+            if eid not in opted:
+                continue
+            hubs = self._held_open.get(eid)
+            if not hubs or self._held_locked.get(eid):
+                continue
+            try:
+                if ha is None or not getattr(ha, "connected", False):
+                    continue
+                if await ha.get_entity_state(eid) != "unlocked":
+                    continue
+                if bidirectional:
+                    confirmed = True
+                    for hub in hubs:
+                        state, rule, _schedule, _relay = (
+                            await self._observe_access_hub(
+                                access, hub, settle=False
+                            )
+                        )
+                        if (
+                            rule.get("type") != "keep_unlock"
+                            or state != "unlocked"
+                        ):
+                            confirmed = False
+                            break
+                    if not confirmed:
+                        continue
+            except Exception:
+                _LOGGER.exception(
+                    "Hub sync: preservation readback failed for %s; "
+                    "failing closed",
+                    eid,
+                )
+                continue
+            _LOGGER.info(
+                "Hub sync: re-adopting keep_unlock hold for %s after a "
+                "graceful restart (readback confirmed both sides open)",
+                eid,
+            )
+            preserved.add(eid)
+        return preserved
 
     async def _load_persisted_sync_state(self) -> None:
         """Restore only fully confirmed origin observations."""

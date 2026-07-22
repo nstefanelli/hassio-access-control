@@ -1,6 +1,6 @@
 ---
 name: Access Control
-version: "1.6.1"
+version: "1.7.0"
 slug: access_control
 description: >-
   Unified access control bridging UniFi Access + Protect with Home Assistant

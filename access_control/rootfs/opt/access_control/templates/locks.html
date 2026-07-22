@@ -181,6 +181,12 @@
                    class="rounded bg-gray-800 border-gray-700" />
             Auto re-lock after external (thumb-turn / HA) unlocks
           </label>
+          <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer"
+                 title="Graceful add-on restarts only (e.g. backups): a door deliberately held open stays open across the restart, re-verified against Home Assistant on startup. Crashes and lockdown still fail closed (re-lock).">
+            <input type="checkbox" name="preserve_hold_on_restart" value="1" {{ 'checked' if lock.preserve_hold_on_restart else '' }}
+                   class="rounded bg-gray-800 border-gray-700" />
+            Keep hold-open across graceful restarts (backups)
+          </label>
           {% endif %}
           {% endif %}
           <div class="flex items-center gap-2">

@@ -1371,6 +1371,7 @@ async def update_lock_settings(
     relock_on_device_auth: str = Form(default=""),
     sync_hub_state: str = Form(default=""),
     relock_on_ha_origin: str = Form(default=""),
+    preserve_hold_on_restart: str = Form(default=""),
     user: str = Depends(require_csrf),
 ):
     limited = await _enforce_action_rate_limit(request, user, "lock_admin")
@@ -1392,6 +1393,7 @@ async def update_lock_settings(
         relock_on_device_auth=bool(relock_on_device_auth),
         sync_hub_state=bool(sync_hub_state),
         relock_on_ha_origin=bool(relock_on_ha_origin),
+        preserve_hold_on_restart=bool(preserve_hold_on_restart),
     )
     return _redirect(request, "/locks")
 

@@ -250,6 +250,7 @@ Per-lock controls include:
 | Relock after device authentication | Arms a timer after an authorized face, PIN, NFC, or fingerprint event. |
 | Sync hub state | Opt-in bidirectional reconciliation between an HA lock and its paired Access door. |
 | Auto re-lock after external unlocks | Only shown when hub sync is on. Arms a timer when a synced lock is unlocked from Home Assistant's side (thumb-turn or HA automation). App-initiated unlocks are excluded: a manual dashboard Unlock, a credential tap on a lock whose auto re-lock is off (both are chosen hold-opens), and a buzz/device-auth/remote unlock that already owns a timer. Off by default. |
+| Keep hold-open across graceful restarts | Only shown when hub sync is on. Normally a stop/start pair — which Supervisor performs on every backup because this app uses cold backups — fail-closes an app-owned `keep_unlock` hold. With this on, a *graceful* shutdown leaves the hold physically in place and records a single-use clean-shutdown marker; startup recovery re-adopts the hold only after readback proves Home Assistant still reports the deadbolt unlocked (and the Access door still reports `keep_unlock`). Crashes, stale markers, lockdown, or failed readback still fail closed. Off by default. |
 | Hidden | Removes the card from normal lists without deleting mappings. |
 
 Pending HA re-locks survive restarts. Manual unlock/lock commands replace or

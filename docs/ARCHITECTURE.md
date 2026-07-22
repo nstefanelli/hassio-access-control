@@ -243,6 +243,16 @@ replacement or an authenticated external rule change supersedes it, preventing
 a crash from silently disabling future schedules. On graceful non-lockdown
 shutdown, owned overrides and applicable unlocked baselines return to native
 schedule ownership; during lockdown, managed ownership remains `keep_lock`.
+The per-lock `preserve_hold_on_restart` opt-in carves out one exception: a
+graceful shutdown leaves an eligible pure `keep_unlock` hold physically in
+place (its `hub_sync_holds` row included) and writes a single-use, wall-clock
+bounded clean-shutdown marker to the config table. Recovery deletes the marker
+before trusting it, then re-adopts a named hold only outside lockdown, only if
+the current lock row still opts in, and only after readback shows HA still
+`unlocked` and (with a readback-capable client) every held hub still
+`keep_unlock`; any doubt — including a shutdown on the failed-startup path,
+which never writes preserved holds — falls back to the uncertain-restart
+`keep_lock` behavior above.
 Unavailable or unconfirmed commands keep durable ownership queued for retry.
 `hub_sync_state` separately stores last fully confirmed HA/Access states,
 origin, Access-rule fingerprint, and pairing signature; Access-origin schedule
