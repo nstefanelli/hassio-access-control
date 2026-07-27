@@ -4,7 +4,72 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.7.1] - 2026-07-27
+
+### Fixed
+
+- Bidirectional hub sync no longer misreads its own most recent hub drive as
+  an external Access rule change. `_persist_convergence` records a
+  `command:<state>` marker (not a real rule fingerprint) into the baseline
+  used for next-poll comparison; comparing it against the following poll's
+  actual JSON fingerprint was always spuriously unequal, and — if Home
+  Assistant also changed in that same window — fell through to
+  `concurrent_conflict`, reverting a legitimate unlock issued right after a
+  lock. `_reconcile_bidirectional` now recognizes that marker and derives
+  the Access-side change from `access_state` alone for that one comparison,
+  leaving fingerprint-based external-change detection unchanged for every
+  baseline that came from a real observation. This also repairs the same
+  spurious-`access_changed` misread on the first poll after **every app
+  restart**, not only after an in-memory drive: `_persist_convergence`
+  wrote the `command:<state>` marker to SQLite and `_load_persisted_sync_state`
+  restored it verbatim, so a restart shortly after a drive carried the same
+  poisoned baseline into the next process.
+  - Known, accepted limitation: this weakens external-change *detection* to
+    *arbitration* for the one poll immediately following our own drive. An
+    Access rule change within the same effective state (e.g. an admin's
+    `keep_lock` replaced by our own `keep_unlock`, both `"locked"` as far
+    as `access_state` is concerned) is invisible to the state-only
+    comparison; if HA also changed in that same window, the pass can
+    resolve to `source="ha"` instead of `concurrent_conflict`, and the
+    relay is driven by HA's desired state even though Access-side intent
+    also moved. This can never hide a locked/unlocked divergence and so
+    cannot revert a genuine unlock or mask a lockout — it only affects
+    which side's rule wins when both change within the same state on that
+    one poll. The proper fix (threading the confirmed readback rule/state
+    through `_HubDriveResult` so a real fingerprint is built instead of
+    `f"command:{desired}"`) is a filed follow-up, not part of this change.
+- Bidirectional hub sync no longer treats a Z-Wave/Zigbee deadbolt's
+  transitional `unlocking`/`locking` report as an untrusted state. A bolt
+  mid-throw was falling into the `untrusted_state` fail-closed branch,
+  latching the entity into the fail-safe reset set and driving a
+  just-completed unlock back closed on both sides (field data for
+  `lock.back_door`: unlock transitions normally complete in 0.5-2.0s, but
+  one observed transition took 7.69s — long enough for a 5s poll to land
+  mid-throw). `_reconcile_bidirectional` now makes no convergence decision
+  for an entity reporting `unlocking`/`locking` — no drive, no latch, no
+  mutation of the observed baselines — for up to a new bounded
+  `_HA_TRANSITION_GRACE` (30s) window, timed from when the entity was first
+  seen transitional and cleared as soon as a valid `locked`/`unlocked`
+  state is observed. An entity still transitional past the grace window
+  falls through to the existing `untrusted_state` fail-closed path exactly
+  as before, and an entity already inside an active fail-safe incident is
+  never paused by a transitional reading — locked-wins enforcement
+  continues unchanged. The recorded start time is now cleared by *any*
+  non-transitional reading (a genuinely invalid one, e.g.
+  `unavailable`/`unknown`, as well as a valid one) rather than only a
+  valid `locked`/`unlocked` reading, and by an entity leaving the synced
+  set (`_drop_tracking`), so a stale start time from an earlier, unrelated
+  transition can never make a brand-new transition's grace window appear
+  already expired. It is deliberately *not* cleared by
+  `_prepare_pairing_change`: unlike `_drop_tracking`, that method re-runs
+  on every poll for as long as a stale hub's release keeps failing, so
+  clearing it there would re-arm the window each poll and a stuck bolt
+  would never fail closed.
+- Hub sync now logs the transitional-state deferral path: a debug line
+  once when an entity first enters the grace window, and a warning if it
+  is still transitional once the window expires and the entity is failed
+  closed. This branch previously wrote nothing to either the DB or the
+  logs — the only convergence outcome invisible in both channels.
 
 ## [1.7.0] - 2026-07-22
 

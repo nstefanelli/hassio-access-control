@@ -138,6 +138,40 @@ _ACCESS_STATE_EVENTS = {
     "access.temporary_unlock.end",
 }
 
+# _persist_convergence writes this prefix into _last_access_rule after our
+# own successful drive, instead of a real Access rule-fingerprint JSON blob —
+# there is no fresh observation to record at that point, only the state we
+# just commanded. A "command:<state>" marker can never equal a JSON
+# fingerprint, so comparing it against the next poll's real observation is
+# always spuriously unequal even when nothing external changed. Detecting
+# the marker lets _reconcile_bidirectional fall back to a state-only
+# comparison for that one baseline instead of misreading it as an
+# Access-origin change (and, via concurrent_conflict, reverting a legitimate
+# unlock that immediately follows our own lock drive).
+_SELF_COMMAND_RULE_PREFIX = "command:"
+
+# HA-reported states while a Z-Wave/Zigbee deadbolt's motor is mid-throw.
+# These are neither "locked" nor "unlocked" but are NOT the same as an
+# untrusted/unknown state: the bolt is actively completing a command we (or
+# the user) just issued. Field data for lock.back_door: unlock transitions
+# normally complete in 0.5-2.0s, but one observed transition took 7.69s —
+# long enough for a 5s poll to land mid-throw and, without this exemption,
+# be classified untrusted_state and drive the just-completed unlock back
+# closed on both sides.
+#
+# Deliberately EXCLUDED: "jammed", "opening", "open". These are not
+# in-flight completions of a command this app or the user just issued —
+# "jammed" in particular is a genuine mechanical fault and MUST continue to
+# fail closed via the untrusted_state path. Do not "complete" this set to
+# include them.
+_HA_TRANSITIONAL_STATES = frozenset({"unlocking", "locking"})
+
+# Bound on how long a transitional HA reading is treated as merely
+# in-flight rather than untrusted. An entity still transitional after this
+# many seconds is no longer "mid-throw" — it falls through to the existing
+# untrusted_state fail-closed path exactly as before this exemption existed.
+_HA_TRANSITION_GRACE = 30.0
+
 
 @dataclass(frozen=True)
 class _HubDriveResult:
@@ -255,6 +289,13 @@ class HubSyncManager:
         self._lifecycle_recovered = False
         self._lockdown_unresolved: set[str] = set()
         self._fail_safe_reset_eids: set[str] = set()
+        # entity_id → monotonic time first observed reporting a transitional
+        # HA state (unlocking/locking — bolt mid-throw). Bounds
+        # _HA_TRANSITION_GRACE; cleared as soon as a valid locked/unlocked
+        # state is observed for that entity. Never consulted for an entity
+        # already in _fail_safe_reset_eids — an active incident is never
+        # paused by a transitional reading.
+        self._ha_transition_started: dict[str, float] = {}
         # Bidirectional origin tracking. These observations are persisted only
         # after both sides are confirmed, allowing a restart to distinguish a
         # new HA-only change from a new Access-only change without confusing an
@@ -1065,6 +1106,16 @@ class HubSyncManager:
         return list(grouped.values())
 
     @staticmethod
+    def _is_self_command_rule(rule: str | None) -> bool:
+        """Return whether ``rule`` is our own drive marker, not an observation.
+
+        See :data:`_SELF_COMMAND_RULE_PREFIX`. Used to recognize a
+        ``_last_access_rule`` baseline that _persist_convergence wrote from
+        our own successful apply rather than a real Access readback.
+        """
+        return rule is not None and rule.startswith(_SELF_COMMAND_RULE_PREFIX)
+
+    @staticmethod
     def _hub_signature(hubs: list[dict]) -> tuple[str, ...]:
         """Return a stable physical-device signature for a resolved pairing."""
         return tuple(sorted({
@@ -1129,6 +1180,17 @@ class HubSyncManager:
         self._last_access_observed.pop(eid, None)
         self._last_access_rule.pop(eid, None)
         self._last_converged.pop(eid, None)
+        # NOTE: `_ha_transition_started` is deliberately NOT cleared here,
+        # unlike in _drop_tracking. This method re-runs its whole body on
+        # EVERY poll for as long as a stale hub's release keeps failing (the
+        # early return above only fires when `stale_ids` is empty, and
+        # `stale_ids` is derived from the held-open/held-locked rows that a
+        # failing reset retains). Clearing the record here would let the
+        # `setdefault` in _reconcile_bidirectional re-arm it at `now` every
+        # poll, so `now - started` would never reach _HA_TRANSITION_GRACE and
+        # a stuck transitional entity would defer convergence forever instead
+        # of failing closed. _drop_tracking is safe because that entity leaves
+        # the synced set entirely and is not reconciled at all.
         # A pairing update during an active incident must earn a reset for the
         # newly resolved hubs; the old one-time lockdown acknowledgement only
         # covered the previous physical set.
@@ -1592,6 +1654,58 @@ class HubSyncManager:
         valid_access = access_state in {"locked", "unlocked"}
         now = time.monotonic()
 
+        if (
+            ha_state in _HA_TRANSITIONAL_STATES
+            and eid not in self._fail_safe_reset_eids
+        ):
+            # The bolt is mid-throw, not untrusted. An entity already inside
+            # an active fail-safe incident is deliberately excluded above —
+            # locked-wins enforcement must never be paused by a transitional
+            # reading. Otherwise, make no convergence decision this pass
+            # until the grace window (bounded, see _HA_TRANSITION_GRACE)
+            # elapses; then fall through to the untrusted_state path below
+            # exactly as if this exemption did not exist.
+            #
+            # The record is cleared by the ``else`` branch below on ANY
+            # non-transitional reading — valid or not — not only a valid
+            # one. A transitional -> invalid (unavailable/unknown/jammed)
+            # -> transitional sequence with no valid reading in between
+            # must start a FRESH grace window; reusing a stale start time
+            # from a much earlier transition would let the window already
+            # be expired on the first poll of a genuinely new transition
+            # (e.g. an HA restart or a Z-Wave dropout mid-throw), which
+            # reinstates the exact bug this exemption exists to fix. Once
+            # expired, the record is deliberately NOT popped here — it is
+            # retained across the expiry pass so a still-stuck entity keeps
+            # failing closed on every subsequent poll instead of restarting
+            # its grace window.
+            started = self._ha_transition_started.setdefault(eid, now)
+            if now - started < _HA_TRANSITION_GRACE:
+                if started == now:
+                    # Log once per window (the first poll to observe it),
+                    # not every poll — this is the only convergence branch
+                    # that writes nothing to the DB (it returns before
+                    # _persist_convergence) and, before this, logged
+                    # nothing either.
+                    _LOGGER.debug(
+                        "Hub sync: %s reports %s (bolt mid-throw) — "
+                        "deferring convergence for up to %.0fs",
+                        eid, ha_state, _HA_TRANSITION_GRACE,
+                    )
+                return 0
+            _LOGGER.warning(
+                "Hub sync: %s still reports %s after %.0fs — treating as "
+                "untrusted and failing closed",
+                eid, ha_state, now - started,
+            )
+        else:
+            # Any non-transitional reading — a valid locked/unlocked state
+            # proving the transition is over, OR a genuinely invalid one
+            # (unavailable/unknown/jammed) — ends the window. See the
+            # comment above: only a non-transitional reading may clear
+            # this, so a stale start time is never silently reused.
+            self._ha_transition_started.pop(eid, None)
+
         momentary_until = self._access_momentary_until.get(eid, 0.0)
         if momentary_until:
             if ha_state == "locked":
@@ -1655,9 +1769,40 @@ class HubSyncManager:
                 fail_safe = True
         else:
             ha_changed = ha_state != previous_ha
-            access_changed = (
-                access_state != previous_access or access_rule != previous_rule
-            )
+            if self._is_self_command_rule(previous_rule):
+                # The stored baseline is our own prior drive's marker, not a
+                # real rule fingerprint — there is nothing genuine to compare
+                # ``access_rule`` against. ``previous_access`` was captured
+                # in the same _persist_convergence call, so a state-only
+                # comparison still catches any real Access-side movement
+                # since that drive; only the fingerprint-level distinction is
+                # unavailable for this one baseline.
+                #
+                # Known, accepted limitation (documented, not fixed here):
+                # this weakens change *detection* to *arbitration* on this
+                # one poll. An Access rule change WITHIN the same effective
+                # state (e.g. an admin's keep_lock replaced by our own
+                # keep_unlock — both "locked" as far as access_state is
+                # concerned) is invisible to this state-only comparison. If
+                # HA also changed in that same window, ha_changed and
+                # access_changed can resolve to (True, False) instead of
+                # the correct concurrent_conflict, so source="ha" wins and
+                # the relay is physically driven by the HA side's desired
+                # state even though Access-side intent also moved. This can
+                # never hide a locked<->unlocked divergence — access_state
+                # itself would differ — so it cannot cause a reverted
+                # unlock or mask a lockout; it only affects which side's
+                # rule literally wins when both changed within the same
+                # state and the app's own marker is the baseline. The
+                # proper fix is threading the confirmed readback rule/state
+                # back through _HubDriveResult so a real fingerprint is
+                # built instead of f"command:{desired}"; that is a filed
+                # follow-up, out of scope for this change.
+                access_changed = access_state != previous_access
+            else:
+                access_changed = (
+                    access_state != previous_access or access_rule != previous_rule
+                )
             if ha_changed and not access_changed:
                 desired = ha_state
                 source = "ha"
@@ -2775,6 +2920,7 @@ class HubSyncManager:
         self._last_converged.pop(eid, None)
         self._access_momentary_until.pop(eid, None)
         self._app_initiated_until.pop(eid, None)
+        self._ha_transition_started.pop(eid, None)
         self._clear_incident_signatures(eid)
 
     def _clear_incident_signatures(self, eid: str) -> None:
