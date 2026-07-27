@@ -57,10 +57,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   continues unchanged. The recorded start time is now cleared by *any*
   non-transitional reading (a genuinely invalid one, e.g.
   `unavailable`/`unknown`, as well as a valid one) rather than only a
-  valid `locked`/`unlocked` reading, and by a pairing change
-  (`_prepare_pairing_change`), so a stale start time from an earlier,
-  unrelated transition can never make a brand-new transition's grace
-  window appear already expired.
+  valid `locked`/`unlocked` reading, and by an entity leaving the synced
+  set (`_drop_tracking`), so a stale start time from an earlier, unrelated
+  transition can never make a brand-new transition's grace window appear
+  already expired. It is deliberately *not* cleared by
+  `_prepare_pairing_change`: unlike `_drop_tracking`, that method re-runs
+  on every poll for as long as a stale hub's release keeps failing, so
+  clearing it there would re-arm the window each poll and a stuck bolt
+  would never fail closed.
 - Hub sync now logs the transitional-state deferral path: a debug line
   once when an entity first enters the grace window, and a warning if it
   is still transitional once the window expires and the entity is failed

@@ -1180,11 +1180,17 @@ class HubSyncManager:
         self._last_access_observed.pop(eid, None)
         self._last_access_rule.pop(eid, None)
         self._last_converged.pop(eid, None)
-        # Sibling of the pop in _drop_tracking: a stale "first seen
-        # transitional" timestamp must not survive a pairing change either,
-        # or a re-observed transitional reading after the swap could reuse
-        # an old start time and find its grace window already expired.
-        self._ha_transition_started.pop(eid, None)
+        # NOTE: `_ha_transition_started` is deliberately NOT cleared here,
+        # unlike in _drop_tracking. This method re-runs its whole body on
+        # EVERY poll for as long as a stale hub's release keeps failing (the
+        # early return above only fires when `stale_ids` is empty, and
+        # `stale_ids` is derived from the held-open/held-locked rows that a
+        # failing reset retains). Clearing the record here would let the
+        # `setdefault` in _reconcile_bidirectional re-arm it at `now` every
+        # poll, so `now - started` would never reach _HA_TRANSITION_GRACE and
+        # a stuck transitional entity would defer convergence forever instead
+        # of failing closed. _drop_tracking is safe because that entity leaves
+        # the synced set entirely and is not reconciled at all.
         # A pairing update during an active incident must earn a reset for the
         # newly resolved hubs; the old one-time lockdown acknowledgement only
         # covered the previous physical set.

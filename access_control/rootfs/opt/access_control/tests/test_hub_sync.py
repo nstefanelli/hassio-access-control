@@ -3440,7 +3440,7 @@ class TestTransitionalHaState(unittest.TestCase):
             self.assertNotIn("lock.front", mgr._ha_transition_started)
         _run(go())
 
-    def test_transition_start_survives_non_transitional_gap_within_grace(
+    def test_transition_start_is_cleared_by_any_non_transitional_reading(
         self,
     ) -> None:
         """A stale ``_ha_transition_started`` record must not permanently
@@ -3522,60 +3522,41 @@ class TestTransitionalHaState(unittest.TestCase):
         _run(go())
 
 
-class TestPrepairingChangeClearsTransitionStart(unittest.TestCase):
-    def test_prepare_pairing_change_clears_ha_transition_started(self) -> None:
-        """``_prepare_pairing_change`` is the sibling of ``_drop_tracking``
-        (both invalidate stale per-entity convergence state on a topology
-        change) and must clear ``_ha_transition_started`` the same way —
-        see hub_sync.py:2851's pop in ``_drop_tracking``. Otherwise a
-        pairing change (a hub added/removed from an entity while it stays
-        in the synced set) can leave a stale transition-start timestamp
-        behind, reproducing the same poisoned-grace-window bug finding 1
-        fixes for the opt-out/restart case."""
-        async def go():
-            ha_states = {"lock.front": "locked"}
-            rules = {
-                "dev-hub-1": {"type": "reset"},
-                "dev-hub-2": {"type": "reset"},
-            }
-            access_states = {"dev-hub-1": "locked", "dev-hub-2": "locked"}
-            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
-            ha = _make_bidirectional_ha(ha_states)
-            access = _make_bidirectional_access(rules, access_states)
-            mgr = _make_mgr(db, ha, access)
+class TestPairingChangePreservesTransitionStart(unittest.TestCase):
+    def test_prepare_pairing_change_preserves_ha_transition_started(self) -> None:
+        """``_prepare_pairing_change`` must NOT clear ``_ha_transition_started``,
+        even though it is otherwise the sibling of ``_drop_tracking``.
 
-            clock = {"t": 1000.0}
-            with patch.object(
-                hs_module, "time", _MonotonicShim(lambda: clock["t"])
-            ):
-                await mgr.poll_once()  # confirmed locked baseline
+        Unlike ``_drop_tracking`` — which runs once, for an entity leaving the
+        synced set entirely — this method re-runs its whole body on EVERY poll
+        for as long as a stale hub's release keeps failing: its early return
+        only fires when ``stale_ids`` is empty, and ``stale_ids`` is derived
+        from the held-open/held-locked rows that a failing reset retains.
 
-                # Mid-throw reading starts the grace-window timer.
-                ha_states["lock.front"] = "unlocking"
-                await mgr.poll_once()
-                self.assertEqual(
-                    mgr._ha_transition_started.get("lock.front"), 1000.0
-                )
+        Clearing the record here would therefore let the ``setdefault`` in
+        ``_reconcile_bidirectional`` re-arm it at ``now`` on every poll, so
+        ``now - started`` would never reach ``_HA_TRANSITION_GRACE`` and a
+        stuck transitional entity would defer convergence FOREVER instead of
+        failing closed — a fail-open regression in the one condition
+        fail-closed exists for. See the NOTE in ``_prepare_pairing_change``.
+        """
+        db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+        mgr = _make_mgr(db, _make_ha({}), _make_access())
 
-                # Pairing change while STILL transitional: the paired hub
-                # is swapped (dev-hub-1 -> dev-hub-2). ha_state stays
-                # "unlocking" for this poll too, so reconcile's own
-                # setdefault() will repopulate an entry for "lock.front"
-                # regardless — the real question is whether it is a FRESH
-                # start time (proving _prepare_pairing_change's pop ran
-                # first) or the stale original one (proving it did not).
-                clock["t"] = 9000.0
-                db.get_locks_for_location = AsyncMock(
-                    side_effect=lambda loc, include_hidden=False: (
-                        [HUB_2] if loc == "loc-1" else []
-                    )
-                )
-                await mgr.poll_once()
+        mgr._ha_transition_started["lock.front"] = 1000.0
+        mgr._pairing_signature["lock.front"] = ("dev-hub-1",)
+        mgr._last_converged["lock.front"] = "locked"
 
-                self.assertEqual(
-                    mgr._ha_transition_started.get("lock.front"), 9000.0
-                )
-        _run(go())
+        mgr._prepare_pairing_change(
+            "lock.front",
+            [{"device_id": "dev-hub-2", "location_id": "loc-1"}],
+        )
+
+        # The method really did run its invalidation body...
+        self.assertNotIn("lock.front", mgr._pairing_signature)
+        self.assertNotIn("lock.front", mgr._last_converged)
+        # ...but the transition-start record must survive it.
+        self.assertEqual(mgr._ha_transition_started.get("lock.front"), 1000.0)
 
 
 if __name__ == "__main__":
