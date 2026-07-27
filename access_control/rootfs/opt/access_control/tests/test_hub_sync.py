@@ -3373,6 +3373,39 @@ class TestTransitionalHaState(unittest.TestCase):
             ha.lock.assert_awaited()
         _run(go())
 
+    def test_transition_start_is_cleared_when_entity_leaves_sync(self) -> None:
+        """``_drop_tracking`` must clear ``_ha_transition_started`` like every
+        sibling per-entity dict (``_last_ha_observed``, ``_last_converged``,
+        ``_access_momentary_until``, ...). Otherwise a stale timestamp
+        survives opt-out/re-enable — an unbounded-growth leak in a
+        long-running daemon, and a re-added entity could reuse a stale
+        "first seen transitional" time instead of genuinely starting a
+        fresh grace window."""
+        async def go():
+            ha_states = {"lock.front": "locked"}
+            rules = {"dev-hub-1": {"type": "reset"}}
+            access_states = {"dev-hub-1": "locked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            ha = _make_bidirectional_ha(ha_states)
+            access = _make_bidirectional_access(rules, access_states)
+            mgr = _make_mgr(db, ha, access)
+
+            await mgr.poll_once()  # confirmed locked baseline
+
+            # Mid-throw reading starts the grace-window timer.
+            ha_states["lock.front"] = "unlocking"
+            _clear_damping(mgr)
+            await mgr.poll_once()
+            self.assertIn("lock.front", mgr._ha_transition_started)
+
+            # Opt-out: the entity leaves the synced set.
+            db.get_all_locks = AsyncMock(
+                return_value=[dict(HA_LOCK, sync_hub_state=0), HUB]
+            )
+            await mgr.poll_once()
+            self.assertNotIn("lock.front", mgr._ha_transition_started)
+        _run(go())
+
 
 if __name__ == "__main__":
     unittest.main()

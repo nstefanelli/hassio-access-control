@@ -2848,6 +2848,7 @@ class HubSyncManager:
         self._last_converged.pop(eid, None)
         self._access_momentary_until.pop(eid, None)
         self._app_initiated_until.pop(eid, None)
+        self._ha_transition_started.pop(eid, None)
         self._clear_incident_signatures(eid)
 
     def _clear_incident_signatures(self, eid: str) -> None:
