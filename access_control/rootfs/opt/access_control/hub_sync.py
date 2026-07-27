@@ -138,6 +138,18 @@ _ACCESS_STATE_EVENTS = {
     "access.temporary_unlock.end",
 }
 
+# _persist_convergence writes this prefix into _last_access_rule after our
+# own successful drive, instead of a real Access rule-fingerprint JSON blob —
+# there is no fresh observation to record at that point, only the state we
+# just commanded. A "command:<state>" marker can never equal a JSON
+# fingerprint, so comparing it against the next poll's real observation is
+# always spuriously unequal even when nothing external changed. Detecting
+# the marker lets _reconcile_bidirectional fall back to a state-only
+# comparison for that one baseline instead of misreading it as an
+# Access-origin change (and, via concurrent_conflict, reverting a legitimate
+# unlock that immediately follows our own lock drive).
+_SELF_COMMAND_RULE_PREFIX = "command:"
+
 
 @dataclass(frozen=True)
 class _HubDriveResult:
@@ -1065,6 +1077,16 @@ class HubSyncManager:
         return list(grouped.values())
 
     @staticmethod
+    def _is_self_command_rule(rule: str | None) -> bool:
+        """Return whether ``rule`` is our own drive marker, not an observation.
+
+        See :data:`_SELF_COMMAND_RULE_PREFIX`. Used to recognize a
+        ``_last_access_rule`` baseline that _persist_convergence wrote from
+        our own successful apply rather than a real Access readback.
+        """
+        return rule is not None and rule.startswith(_SELF_COMMAND_RULE_PREFIX)
+
+    @staticmethod
     def _hub_signature(hubs: list[dict]) -> tuple[str, ...]:
         """Return a stable physical-device signature for a resolved pairing."""
         return tuple(sorted({
@@ -1655,9 +1677,19 @@ class HubSyncManager:
                 fail_safe = True
         else:
             ha_changed = ha_state != previous_ha
-            access_changed = (
-                access_state != previous_access or access_rule != previous_rule
-            )
+            if self._is_self_command_rule(previous_rule):
+                # The stored baseline is our own prior drive's marker, not a
+                # real rule fingerprint — there is nothing genuine to compare
+                # ``access_rule`` against. ``previous_access`` was captured
+                # in the same _persist_convergence call, so a state-only
+                # comparison still catches any real Access-side movement
+                # since that drive; only the fingerprint-level distinction is
+                # unavailable for this one baseline.
+                access_changed = access_state != previous_access
+            else:
+                access_changed = (
+                    access_state != previous_access or access_rule != previous_rule
+                )
             if ha_changed and not access_changed:
                 desired = ha_state
                 source = "ha"

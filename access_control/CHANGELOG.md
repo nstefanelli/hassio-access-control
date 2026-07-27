@@ -6,6 +6,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- Bidirectional hub sync no longer misreads its own most recent hub drive as
+  an external Access rule change. `_persist_convergence` records a
+  `command:<state>` marker (not a real rule fingerprint) into the baseline
+  used for next-poll comparison; comparing it against the following poll's
+  actual JSON fingerprint was always spuriously unequal, and — if Home
+  Assistant also changed in that same window — fell through to
+  `concurrent_conflict`, reverting a legitimate unlock issued right after a
+  lock. `_reconcile_bidirectional` now recognizes that marker and derives
+  the Access-side change from `access_state` alone for that one comparison,
+  leaving fingerprint-based external-change detection unchanged for every
+  baseline that came from a real observation.
+
 ## [1.7.0] - 2026-07-22
 
 ### Added

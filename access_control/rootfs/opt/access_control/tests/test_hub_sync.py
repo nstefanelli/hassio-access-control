@@ -3215,5 +3215,47 @@ class TestGracefulRestartHoldPreservation(unittest.TestCase):
         _run(go())
 
 
+class TestSelfCommandBaseline(unittest.TestCase):
+    """A rule-fingerprint baseline poisoned by our own prior drive must not
+    be mistaken for an external Access-origin change (see hub_sync.py
+    module docstring / _reconcile_bidirectional: "command:<state>" markers
+    written by _persist_convergence are not real rule observations)."""
+
+    def test_unlock_immediately_after_lock_is_not_reverted(self) -> None:
+        async def go():
+            ha_states = {"lock.front": "locked"}
+            rules = {"dev-hub-1": {"type": "reset"}}
+            access_states = {"dev-hub-1": "locked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            ha = _make_bidirectional_ha(ha_states)
+            access = _make_bidirectional_access(rules, access_states)
+            mgr = _make_mgr(db, ha, access)
+
+            # 1. Converge locked.
+            await mgr.poll_once()
+
+            # 2. Unlock — works.
+            ha_states["lock.front"] = "unlocked"
+            _clear_damping(mgr)
+            await mgr.poll_once()
+            self.assertEqual(rules["dev-hub-1"]["type"], "keep_unlock")
+
+            # 3. Lock again — this drive poisons the rule-fingerprint
+            # baseline with our own "command:locked" marker.
+            ha_states["lock.front"] = "locked"
+            _clear_damping(mgr)
+            await mgr.poll_once()
+
+            # 4. Unlock again within the same poll window.
+            ha_states["lock.front"] = "unlocked"
+            _clear_damping(mgr)
+            await mgr.poll_once()
+
+            # 5. The second unlock must be honored, not reverted.
+            self.assertEqual(ha_states["lock.front"], "unlocked")
+            self.assertEqual(rules["dev-hub-1"]["type"], "keep_unlock")
+        _run(go())
+
+
 if __name__ == "__main__":
     unittest.main()
