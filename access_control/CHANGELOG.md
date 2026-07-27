@@ -19,6 +19,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   the Access-side change from `access_state` alone for that one comparison,
   leaving fingerprint-based external-change detection unchanged for every
   baseline that came from a real observation.
+- Bidirectional hub sync no longer treats a Z-Wave/Zigbee deadbolt's
+  transitional `unlocking`/`locking` report as an untrusted state. A bolt
+  mid-throw was falling into the `untrusted_state` fail-closed branch,
+  latching the entity into the fail-safe reset set and driving a
+  just-completed unlock back closed on both sides (field data for
+  `lock.back_door`: unlock transitions normally complete in 0.5-2.0s, but
+  one observed transition took 7.69s — long enough for a 5s poll to land
+  mid-throw). `_reconcile_bidirectional` now makes no convergence decision
+  for an entity reporting `unlocking`/`locking` — no drive, no latch, no
+  mutation of the observed baselines — for up to a new bounded
+  `_HA_TRANSITION_GRACE` (30s) window, timed from when the entity was first
+  seen transitional and cleared as soon as a valid `locked`/`unlocked`
+  state is observed. An entity still transitional past the grace window
+  falls through to the existing `untrusted_state` fail-closed path exactly
+  as before, and an entity already inside an active fail-safe incident is
+  never paused by a transitional reading — locked-wins enforcement
+  continues unchanged.
 
 ## [1.7.0] - 2026-07-22
 

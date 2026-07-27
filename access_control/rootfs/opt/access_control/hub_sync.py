@@ -150,6 +150,22 @@ _ACCESS_STATE_EVENTS = {
 # unlock that immediately follows our own lock drive).
 _SELF_COMMAND_RULE_PREFIX = "command:"
 
+# HA-reported states while a Z-Wave/Zigbee deadbolt's motor is mid-throw.
+# These are neither "locked" nor "unlocked" but are NOT the same as an
+# untrusted/unknown state: the bolt is actively completing a command we (or
+# the user) just issued. Field data for lock.back_door: unlock transitions
+# normally complete in 0.5-2.0s, but one observed transition took 7.69s —
+# long enough for a 5s poll to land mid-throw and, without this exemption,
+# be classified untrusted_state and drive the just-completed unlock back
+# closed on both sides.
+_HA_TRANSITIONAL_STATES = frozenset({"unlocking", "locking"})
+
+# Bound on how long a transitional HA reading is treated as merely
+# in-flight rather than untrusted. An entity still transitional after this
+# many seconds is no longer "mid-throw" — it falls through to the existing
+# untrusted_state fail-closed path exactly as before this exemption existed.
+_HA_TRANSITION_GRACE = 30.0
+
 
 @dataclass(frozen=True)
 class _HubDriveResult:
@@ -267,6 +283,13 @@ class HubSyncManager:
         self._lifecycle_recovered = False
         self._lockdown_unresolved: set[str] = set()
         self._fail_safe_reset_eids: set[str] = set()
+        # entity_id → monotonic time first observed reporting a transitional
+        # HA state (unlocking/locking — bolt mid-throw). Bounds
+        # _HA_TRANSITION_GRACE; cleared as soon as a valid locked/unlocked
+        # state is observed for that entity. Never consulted for an entity
+        # already in _fail_safe_reset_eids — an active incident is never
+        # paused by a transitional reading.
+        self._ha_transition_started: dict[str, float] = {}
         # Bidirectional origin tracking. These observations are persisted only
         # after both sides are confirmed, allowing a restart to distinguish a
         # new HA-only change from a new Access-only change without confusing an
@@ -1613,6 +1636,24 @@ class HubSyncManager:
         valid_ha = ha_state in {"locked", "unlocked"}
         valid_access = access_state in {"locked", "unlocked"}
         now = time.monotonic()
+
+        if valid_ha:
+            # A valid reading proves the transition (if any) is over.
+            self._ha_transition_started.pop(eid, None)
+        elif (
+            ha_state in _HA_TRANSITIONAL_STATES
+            and eid not in self._fail_safe_reset_eids
+        ):
+            # The bolt is mid-throw, not untrusted. An entity already inside
+            # an active fail-safe incident is deliberately excluded above —
+            # locked-wins enforcement must never be paused by a transitional
+            # reading. Otherwise, make no convergence decision this pass
+            # until the grace window (bounded, see _HA_TRANSITION_GRACE)
+            # elapses; then fall through to the untrusted_state path below
+            # exactly as if this exemption did not exist.
+            started = self._ha_transition_started.setdefault(eid, now)
+            if now - started < _HA_TRANSITION_GRACE:
+                return 0
 
         momentary_until = self._access_momentary_until.get(eid, 0.0)
         if momentary_until:
