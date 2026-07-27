@@ -18,7 +18,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   lock. `_reconcile_bidirectional` now recognizes that marker and derives
   the Access-side change from `access_state` alone for that one comparison,
   leaving fingerprint-based external-change detection unchanged for every
-  baseline that came from a real observation.
+  baseline that came from a real observation. This also repairs the same
+  spurious-`access_changed` misread on the first poll after **every app
+  restart**, not only after an in-memory drive: `_persist_convergence`
+  wrote the `command:<state>` marker to SQLite and `_load_persisted_sync_state`
+  restored it verbatim, so a restart shortly after a drive carried the same
+  poisoned baseline into the next process.
+  - Known, accepted limitation: this weakens external-change *detection* to
+    *arbitration* for the one poll immediately following our own drive. An
+    Access rule change within the same effective state (e.g. an admin's
+    `keep_lock` replaced by our own `keep_unlock`, both `"locked"` as far
+    as `access_state` is concerned) is invisible to the state-only
+    comparison; if HA also changed in that same window, the pass can
+    resolve to `source="ha"` instead of `concurrent_conflict`, and the
+    relay is driven by HA's desired state even though Access-side intent
+    also moved. This can never hide a locked/unlocked divergence and so
+    cannot revert a genuine unlock or mask a lockout — it only affects
+    which side's rule wins when both change within the same state on that
+    one poll. The proper fix (threading the confirmed readback rule/state
+    through `_HubDriveResult` so a real fingerprint is built instead of
+    `f"command:{desired}"`) is a filed follow-up, not part of this change.
 - Bidirectional hub sync no longer treats a Z-Wave/Zigbee deadbolt's
   transitional `unlocking`/`locking` report as an untrusted state. A bolt
   mid-throw was falling into the `untrusted_state` fail-closed branch,
@@ -35,7 +54,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   falls through to the existing `untrusted_state` fail-closed path exactly
   as before, and an entity already inside an active fail-safe incident is
   never paused by a transitional reading — locked-wins enforcement
-  continues unchanged.
+  continues unchanged. The recorded start time is now cleared by *any*
+  non-transitional reading (a genuinely invalid one, e.g.
+  `unavailable`/`unknown`, as well as a valid one) rather than only a
+  valid `locked`/`unlocked` reading, and by a pairing change
+  (`_prepare_pairing_change`), so a stale start time from an earlier,
+  unrelated transition can never make a brand-new transition's grace
+  window appear already expired.
+- Hub sync now logs the transitional-state deferral path: a debug line
+  once when an entity first enters the grace window, and a warning if it
+  is still transitional once the window expires and the entity is failed
+  closed. This branch previously wrote nothing to either the DB or the
+  logs — the only convergence outcome invisible in both channels.
 
 ## [1.7.0] - 2026-07-22
 

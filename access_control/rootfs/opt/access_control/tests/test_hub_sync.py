@@ -201,6 +201,33 @@ class _AddTrackingSet(set):
         super().add(item)
 
 
+class _MonotonicShim:
+    """Stand-in for the ``time`` module, with only ``monotonic`` faked.
+
+    Tests that need to fast-forward ``time.monotonic()`` must NOT patch
+    ``time.monotonic`` on the real, global ``time`` module: ``hub_sync``
+    does ``import time`` and reads ``time.monotonic`` off that same global
+    module object, but so does asyncio — ``BaseEventLoop.time()`` resolves
+    ``time.monotonic`` at call time, so a global patch also freezes the
+    event loop's clock. Nothing on the paths exercised by these tests
+    reaches ``asyncio.sleep`` today, so a global patch happens to pass, but
+    if that ever changes the test would hang instead of failing. Assigning
+    this shim to ``hub_sync.time`` (the module-local name) instead patches
+    only what ``hub_sync`` itself sees; every other attribute (``time.time``,
+    ``time.sleep``, ...) is forwarded to the real module so unrelated code
+    paths are unaffected.
+    """
+
+    def __init__(self, get_now) -> None:
+        self._get_now = get_now
+
+    def monotonic(self) -> float:
+        return self._get_now()
+
+    def __getattr__(self, name):
+        return getattr(_time, name)
+
+
 class TestConvergence(unittest.TestCase):
     def test_first_poll_converges_hub_to_unlocked(self) -> None:
         """THE field-reported behavior: lock is unlocked when sync starts
@@ -3326,9 +3353,11 @@ class TestTransitionalHaState(unittest.TestCase):
             mgr = _make_mgr(db, ha, access)
 
             clock = {"t": 1000.0}
-            with patch(
-                "access_control.hub_sync.time.monotonic",
-                side_effect=lambda: clock["t"],
+            # Patch hub_sync's local ``time`` name, not the global module —
+            # see _MonotonicShim docstring: a global patch of
+            # time.monotonic also freezes asyncio's event-loop clock.
+            with patch.object(
+                hs_module, "time", _MonotonicShim(lambda: clock["t"])
             ):
                 await mgr.poll_once()  # confirmed locked baseline
 
@@ -3351,6 +3380,11 @@ class TestTransitionalHaState(unittest.TestCase):
 
             self.assertIn("lock.front", tracked.added)
             ha.lock.assert_awaited()
+            # Distinguish "grace expired, untrusted_state fired" from any
+            # other latch cause: the Access side must also have been
+            # actively driven closed, not merely left alone because it was
+            # already locked.
+            access.force_lock.assert_awaited()
         _run(go())
 
     def test_transitional_state_does_not_pause_an_active_fail_safe_latch(self) -> None:
@@ -3404,6 +3438,143 @@ class TestTransitionalHaState(unittest.TestCase):
             )
             await mgr.poll_once()
             self.assertNotIn("lock.front", mgr._ha_transition_started)
+        _run(go())
+
+    def test_transition_start_survives_non_transitional_gap_within_grace(
+        self,
+    ) -> None:
+        """A stale ``_ha_transition_started`` record must not permanently
+        disable the grace window for an entity (review finding 1).
+
+        ``unlocking`` -> some OTHER invalid reading (``unavailable`` here,
+        standing in for an HA restart or a Z-Wave dropout) -> ``unlocking``
+        again, with no VALID (locked/unlocked) reading in between, must
+        still be granted a FRESH grace window on the second transitional
+        reading — not an instant fail-closed latch because the elapsed time
+        since the ORIGINAL start already exceeds _HA_TRANSITION_GRACE.
+        Only a valid reading was clearing the record before this fix; any
+        non-transitional reading (valid or not) must clear it.
+        """
+        async def go():
+            ha_states = {"lock.front": "locked"}
+            rules = {"dev-hub-1": {"type": "reset"}}
+            access_states = {"dev-hub-1": "locked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            ha = _make_bidirectional_ha(ha_states)
+            access = _make_bidirectional_access(rules, access_states)
+            mgr = _make_mgr(db, ha, access)
+
+            clock = {"t": 1000.0}
+            with patch.object(
+                hs_module, "time", _MonotonicShim(lambda: clock["t"])
+            ):
+                await mgr.poll_once()  # confirmed locked baseline
+
+                # First transitional reading starts the grace window.
+                ha_states["lock.front"] = "unlocking"
+                applied = await mgr.poll_once()
+                self.assertEqual(applied, 0)
+                self.assertEqual(
+                    mgr._ha_transition_started.get("lock.front"), clock["t"]
+                )
+
+                # An HA restart or a Z-Wave dropout mid-throw: an invalid,
+                # non-transitional reading lands with no valid reading in
+                # between. This must end the grace window (the record is
+                # cleared), and — because this is a genuinely untrusted
+                # reading in its own right — is judged on its own merits by
+                # the existing untrusted_state path exactly as before.
+                clock["t"] += 5.0
+                ha_states["lock.front"] = "unavailable"
+                await mgr.poll_once()
+                self.assertNotIn("lock.front", mgr._ha_transition_started)
+                # This poll's own untrusted_state verdict independently
+                # drove HA back locked (ha.lock succeeds in this fixture,
+                # so "unavailable" resolves within the same pass) and
+                # force_lock'd the Access side to match — proof the record
+                # was actually cleared rather than merely untouched.
+                ha.lock.assert_awaited()
+                access.force_lock.assert_awaited()
+                self.assertEqual(rules["dev-hub-1"]["type"], "lock_early")
+
+                # Long after the ORIGINAL start (t=1000) — well past
+                # _HA_TRANSITION_GRACE measured from there — but the entity
+                # is only now reporting transitional again. It must get a
+                # FRESH grace window timed from THIS reading, not an
+                # instant fail-closed latch from the stale start time.
+                clock["t"] += hs_module._HA_TRANSITION_GRACE + 100.0
+                ha.lock.reset_mock()
+                access.force_lock.reset_mock()
+                ha_states["lock.front"] = "unlocking"
+                applied = await mgr.poll_once()
+                self.assertEqual(applied, 0)
+                ha.lock.assert_not_awaited()
+                access.force_lock.assert_not_awaited()
+                self.assertNotIn("lock.front", mgr._fail_safe_reset_eids)
+                self.assertEqual(rules["dev-hub-1"]["type"], "lock_early")
+
+                # And the transition completing is still honored normally.
+                ha_states["lock.front"] = "unlocked"
+                await mgr.poll_once()
+                self.assertEqual(ha_states["lock.front"], "unlocked")
+                self.assertEqual(rules["dev-hub-1"]["type"], "keep_unlock")
+                ha.lock.assert_not_awaited()
+        _run(go())
+
+
+class TestPrepairingChangeClearsTransitionStart(unittest.TestCase):
+    def test_prepare_pairing_change_clears_ha_transition_started(self) -> None:
+        """``_prepare_pairing_change`` is the sibling of ``_drop_tracking``
+        (both invalidate stale per-entity convergence state on a topology
+        change) and must clear ``_ha_transition_started`` the same way —
+        see hub_sync.py:2851's pop in ``_drop_tracking``. Otherwise a
+        pairing change (a hub added/removed from an entity while it stays
+        in the synced set) can leave a stale transition-start timestamp
+        behind, reproducing the same poisoned-grace-window bug finding 1
+        fixes for the opt-out/restart case."""
+        async def go():
+            ha_states = {"lock.front": "locked"}
+            rules = {
+                "dev-hub-1": {"type": "reset"},
+                "dev-hub-2": {"type": "reset"},
+            }
+            access_states = {"dev-hub-1": "locked", "dev-hub-2": "locked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            ha = _make_bidirectional_ha(ha_states)
+            access = _make_bidirectional_access(rules, access_states)
+            mgr = _make_mgr(db, ha, access)
+
+            clock = {"t": 1000.0}
+            with patch.object(
+                hs_module, "time", _MonotonicShim(lambda: clock["t"])
+            ):
+                await mgr.poll_once()  # confirmed locked baseline
+
+                # Mid-throw reading starts the grace-window timer.
+                ha_states["lock.front"] = "unlocking"
+                await mgr.poll_once()
+                self.assertEqual(
+                    mgr._ha_transition_started.get("lock.front"), 1000.0
+                )
+
+                # Pairing change while STILL transitional: the paired hub
+                # is swapped (dev-hub-1 -> dev-hub-2). ha_state stays
+                # "unlocking" for this poll too, so reconcile's own
+                # setdefault() will repopulate an entry for "lock.front"
+                # regardless — the real question is whether it is a FRESH
+                # start time (proving _prepare_pairing_change's pop ran
+                # first) or the stale original one (proving it did not).
+                clock["t"] = 9000.0
+                db.get_locks_for_location = AsyncMock(
+                    side_effect=lambda loc, include_hidden=False: (
+                        [HUB_2] if loc == "loc-1" else []
+                    )
+                )
+                await mgr.poll_once()
+
+                self.assertEqual(
+                    mgr._ha_transition_started.get("lock.front"), 9000.0
+                )
         _run(go())
 
 
