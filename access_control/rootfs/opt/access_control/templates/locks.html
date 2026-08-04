@@ -5,6 +5,12 @@
 {% block content %}
 <div class="p-4 sm:p-6 space-y-6">
 
+  {% if command_error %}
+  <div class="card border border-red-900/50 bg-red-950/30 text-red-200 text-sm" role="alert">
+    {{ command_error }}
+  </div>
+  {% endif %}
+
   {% if command_notice %}
   <div class="badge-error rounded-lg px-4 py-3" role="status">{{ command_notice }}</div>
   {% endif %}

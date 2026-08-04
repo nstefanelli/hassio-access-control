@@ -42,6 +42,7 @@ from .web_auth import (
     refresh_session_cookie,  # noqa: F401  (re-exported for backward compat)
     require_csrf,
     require_login,
+    resolve_effective_user,
     set_session_cookie,
 )
 
@@ -409,9 +410,14 @@ async def _render(template: str, request: Request, context: dict) -> HTMLRespons
     `<base href>` correctly and hide UI elements that don't make sense under
     HA SSO (e.g. the logout button).
     """
-    user = get_session_user(request)
+    # Resolve identity with the SAME precedence as require_login and the
+    # CSRF middleware (ingress SSO first, then session cookie). Preferring
+    # the cookie here minted CSRF tokens for the cookie identity while the
+    # validators checked the ingress identity — a client holding both got
+    # a 403 on every POST, and the cookie refresh below kept re-signing
+    # the stale cookie, making the lockout self-sustaining.
     ingress_user = getattr(request.state, "ingress_user", None)
-    effective_user = user or (f"ha:{ingress_user['name']}" if ingress_user else None)
+    effective_user = resolve_effective_user(request)
 
     context["csrf_token"] = generate_csrf_token(effective_user) if effective_user else ""
     _inject_ingress_context(request, context)
@@ -423,8 +429,11 @@ async def _render(template: str, request: Request, context: dict) -> HTMLRespons
     background_poll = (
         getattr(request, "headers", {}).get("X-Background-Poll") == "true"
     )
-    if user and not background_poll:
-        refresh_session_cookie(response, request, user)
+    # Under ingress SSO the cookie is irrelevant to auth — never refresh
+    # it there, or a stale cookie for a different identity lives forever.
+    cookie_user = get_session_user(request)
+    if cookie_user and not ingress_user and not background_poll:
+        refresh_session_cookie(response, request, cookie_user)
     return response
 
 
@@ -505,6 +514,25 @@ def _visitor_operation_lock(request: Request, visitor_id: int) -> asyncio.Lock:
     return locks.setdefault(visitor_id, asyncio.Lock())
 
 
+def _discard_visitor_operation_lock(request: Request, visitor_id: int) -> None:
+    """Drop the per-visitor lock once the visitor is gone, keeping the map bounded.
+
+    Without this, visitor_operation_locks accumulated one asyncio.Lock per
+    visitor ID for the life of the process. Only discard while the lock is
+    uncontended — a holder or waiter must keep serializing on the same Lock
+    object or mutual exclusion is lost; a later request simply mints a fresh
+    lock via setdefault, which is safe because nothing holds the old one.
+    """
+    locks = getattr(request.app.state, "visitor_operation_locks", None)
+    if not locks:
+        return
+    lock = locks.get(visitor_id)
+    if lock is None:
+        return
+    if not lock.locked() and not getattr(lock, "_waiters", None):
+        locks.pop(visitor_id, None)
+
+
 # ---------------------------------------------------------------------------
 # Public routes
 # ---------------------------------------------------------------------------
@@ -543,7 +571,7 @@ async def login_post(
         return templates.TemplateResponse(
             request,
             "login.html",
-            _inject_ingress_context(request, {"request": request, "error": "Too many failed attempts. Try again in 60 seconds."}),
+            _inject_ingress_context(request, {"request": request, "page": "login", "error": "Too many failed attempts. Try again in 60 seconds."}),
             status_code=429,
         )
 
@@ -859,7 +887,12 @@ async def _setup_post_impl(
         secret_key = secrets.token_hex(32)
         secret_key_source = SECRET_KEY_SOURCE_DATABASE
     salt = os.urandom(16)
-    enc_key = derive_key(secret_key, salt)
+    # derive_key and secret_key_fingerprint below are 480k-iteration PBKDF2
+    # — same order of CPU as hash_password — so they run in worker threads
+    # for the same reason (keep the event loop serving WS door events and
+    # relock timers during first-run setup).
+    enc_key = await asyncio.to_thread(derive_key, secret_key, salt)
+    fingerprint = await asyncio.to_thread(secret_key_fingerprint, secret_key)
 
     # 4. Save credentials to config. init_runtime() below re-reads these
     # from the DB to bring up the runtime clients (AccessClient, HAClient,
@@ -870,7 +903,7 @@ async def _setup_post_impl(
             hash_password, admin_password
         ),
         "secret_key_source": secret_key_source,
-        "secret_key_fingerprint": secret_key_fingerprint(secret_key),
+        "secret_key_fingerprint": fingerprint,
         "encryption_salt": salt.hex(),
         "unvr_host": unvr_host,
         "unvr_username": encrypt_value(unvr_username, enc_key),
@@ -1327,6 +1360,7 @@ async def locks_list(request: Request, user: str = Depends(require_login)):
             "access_locations": access_locations,
             "protect_doorbells": protect_doorbells, "protect_cameras": protect_cameras,
             "command_notice": getattr(request, "query_params", {}).get("notice"),
+            "command_error": getattr(request, "query_params", {}).get("error"),
         },
     )
 
@@ -2221,10 +2255,17 @@ async def delete_visitor_route(
     data_lock = getattr(request.app.state, "access_data_lock", None)
     if data_lock is None:
         async with _visitor_operation_lock(request, visitor_id):
-            return await _delete_visitor_impl(visitor_id, request, user)
-    async with data_lock:
-        async with _visitor_operation_lock(request, visitor_id):
-            return await _delete_visitor_impl(visitor_id, request, user)
+            response = await _delete_visitor_impl(visitor_id, request, user)
+    else:
+        async with data_lock:
+            async with _visitor_operation_lock(request, visitor_id):
+                response = await _delete_visitor_impl(visitor_id, request, user)
+    # The visitor no longer exists locally on the non-error paths (deleted,
+    # or already gone) — retire its serialization lock so the map stays
+    # bounded. Failed deletes keep the lock; the visitor is still live.
+    if "error=" not in response.headers.get("location", ""):
+        _discard_visitor_operation_lock(request, visitor_id)
+    return response
 
 
 async def _delete_visitor_impl(
@@ -2339,21 +2380,22 @@ async def _load_settings_context(request: Request, db, enc_key) -> dict:
     ha_alarms = []
     if ha and ha.connected:
         try:
-            # Same full-/api/states download as the locks page — cache
-            # the filtered list rather than re-downloading per render.
-            ha_alarms = await db.get_ui_cache("settings_ha_alarm_entities")
-            if ha_alarms is None:
-                ha_alarms = await ha.get_alarm_entities()
-                await db.set_ui_cache(
-                    "settings_ha_alarm_entities", ha_alarms, _LOCKS_CACHE_TTL
-                )
+            # Same full-/api/states download as the locks page — serve it
+            # through the shared stale-while-revalidate helper so a cache
+            # miss never blocks the settings render on a multi-MB fetch;
+            # the background refresh makes the next render fresh.
+            ha_alarms = await _cached_device_options(
+                request,
+                "settings_ha_alarm_entities",
+                _LOCKS_CACHE_TTL,
+                ha.get_alarm_entities,
+            ) or []
             existing_eids = {p["entity_id"] for p in alarm_panels}
             ha_alarms = [a for a in ha_alarms if a["entity_id"] not in existing_eids]
         except Exception as exc:
             # HA may have temporarily dropped or returned an unexpected
             # shape — Settings page renders with an empty alarm dropdown.
-            # Log for diagnostics. (ha_alarms may be None here if the
-            # cache missed and the fetch raised.)
+            # Log for diagnostics.
             logger.warning("Settings: could not fetch HA alarm entities: %s", exc)
             ha_alarms = []
 
