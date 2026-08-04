@@ -128,9 +128,12 @@ For a mapped HA-external lock, **Sync Access hub & door to this lock's state**
 reconciles the HA entity and Access door in both directions. An HA-only change
 is applied to Access; an Access-only rule/relay change—including activation or
 deactivation of an Access unlock schedule—is applied to HA. Newer Access rule
-events wake the reconcile immediately, but are hints only: the app performs
-authenticated readback before acting. The five-second poll is authoritative
-and catches dropped events, firmware without those events, and external drift.
+events and HA `state_changed` WebSocket push events wake the reconcile
+immediately, but are hints only: the app performs authenticated readback
+before acting. The periodic poll is authoritative and catches dropped events,
+firmware without those events, and external drift; it runs as a 60-second
+backstop while the HA push feed and REST connection are healthy and falls
+back to five seconds otherwise.
 
 Normal opening uses `keep_unlock`; a normal lock uses `lock_now`. Fail-safe
 directions such as lockdown, unreadable state, or an origin conflict use

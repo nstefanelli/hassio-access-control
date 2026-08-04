@@ -172,6 +172,13 @@ _HA_TRANSITIONAL_STATES = frozenset({"unlocking", "locking"})
 # untrusted_state fail-closed path exactly as before this exemption existed.
 _HA_TRANSITION_GRACE = 30.0
 
+# While NO lock is opted into hub sync and nothing is held/pending, the poll
+# loop has nothing to do; re-check the lock table for a newly enabled sync on
+# this cadence instead of running the full read every 5s poll. Any tracked
+# state, an Access rule event (reconcile_location), or lockdown enforcement
+# bypasses the idle backoff entirely.
+_IDLE_RECHECK_INTERVAL = 60.0
+
 
 @dataclass(frozen=True)
 class _HubDriveResult:
@@ -188,9 +195,14 @@ class HubSyncManager:
     calling :meth:`poll_once` every :data:`POLL_INTERVAL` seconds.
     """
 
-    # Poll cadence for the main.py loop — bounds reaction latency (the
-    # app has no HA websocket).
+    # Poll cadence for the main.py loop — bounds reaction latency while the
+    # HA websocket push feed is unavailable.
     POLL_INTERVAL = 5.0
+
+    # Poll cadence while HA ``state_changed`` push events are flowing
+    # (``ha.ws_connected``). Push handles reaction latency; the poll then only
+    # reconciles drift/missed events as a slow backstop.
+    BACKSTOP_POLL_INTERVAL = 60.0
 
     def __init__(
         self,
@@ -304,7 +316,19 @@ class HubSyncManager:
         self._last_access_observed: dict[str, str] = {}
         self._last_access_rule: dict[str, str] = {}
         self._last_converged: dict[str, str] = {}
+        # eid → (desired, access_rule_fingerprint, pairing_signature JSON) of
+        # the last durable set_hub_sync_state write that succeeded. Lets the
+        # steady-state already_converged pass skip an identical durable write
+        # every poll; absent (startup / after clear) always writes.
+        self._last_persisted_convergence: dict[str, tuple[str, str, str]] = {}
         self._sync_state_loaded = False
+        # eid → pairing signature already driven to confirmed keep_lock during
+        # the CURRENT HA outage. Suppresses re-issuing the identical fail-safe
+        # hold (hub command + durable ownership write + access_log row) on
+        # every 5s poll for the whole outage; cleared when HA returns, and a
+        # pairing-topology change during the outage re-drives the new hubs.
+        self._ha_outage_locked: dict[str, tuple[str, ...]] = {}
+        self._ha_outage_logged = False
         # A remote Access unlock is momentary. While its durable HA relock is
         # live, do not echo HA's temporary unlocked state back as keep_unlock.
         self._access_momentary_until: dict[str, float] = {}
@@ -317,6 +341,25 @@ class HubSyncManager:
         # Event hints reduce latency. They are never trusted as proof of an
         # unsafe open; reconciliation still performs authenticated readback.
         self._dirty_locations: set[str] = set()
+        # Monotonic deadline while the manager is idle (a full pass found zero
+        # opted-in locks and no held/pending/tracked state). Until it passes,
+        # _poll_once skips the per-5s full-table read; reconcile_location and
+        # lockdown enforcement clear/bypass it so nothing safety-relevant
+        # waits on the idle recheck cadence.
+        self._idle_recheck_until = 0.0
+        # Push-event coalescing (HA websocket ``state_changed`` wake-ups).
+        # At most one reconcile task runs at a time; a burst of events while
+        # it runs collapses into a single queued trailing pass. The task
+        # reference keeps it from being garbage-collected mid-flight.
+        self._push_reconcile_task: Optional[asyncio.Task] = None
+        self._push_reconcile_queued = False
+        # Terminal shutdown latch. Set at the top of :meth:`shutdown` BEFORE
+        # it takes ``_poll_lock``: from that moment no new push-reconcile
+        # task may be scheduled and no poll pass may start, so a trailing
+        # pass queued moments before shutdown can never re-drive hubs (e.g.
+        # re-apply keep_unlock + write a fresh durable hold row) AFTER the
+        # shutdown pass released the app-owned rules of an exiting process.
+        self._stopping = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -326,6 +369,136 @@ class HubSyncManager:
         """Serialize and execute one desired-state convergence pass."""
         async with self._poll_lock:
             return await self._poll_once()
+
+    def notify_ha_state_change(
+        self, entity_id: str, new_state: str | None
+    ) -> None:
+        """Wake reconciliation for a pushed HA ``state_changed`` event.
+
+        Sync, cheap, and safe to call straight from an event callback: it
+        never raises and never blocks. Entities that are not part of any
+        tracked/synced pairing are ignored — the periodic backstop poll
+        covers newly opted-in locks. For a tracked entity it schedules a
+        coalesced ``poll_once`` pass: at most one runs at a time and at most
+        one trailing pass is queued behind it, so any burst of events
+        collapses into a single follow-up reconcile (the pushed payload is
+        only a wake-up hint; the pass re-reads authenticated state itself).
+        """
+        try:
+            if self._stopping:
+                # Shutdown owns the endgame: a late WS event must not
+                # schedule work that could re-drive hubs after the shutdown
+                # pass released the app-owned rules.
+                return
+            if not self._is_tracked_entity(entity_id):
+                return
+            _LOGGER.debug(
+                "Hub sync: HA push event for %s (new_state=%r) — waking "
+                "reconciliation",
+                entity_id,
+                new_state,
+            )
+            self._schedule_coalesced_reconcile()
+        except Exception:
+            # Contract: never raise into the event callback.
+            _LOGGER.exception(
+                "Hub sync: failed to schedule push reconcile for %s", entity_id
+            )
+
+    def request_reconcile(self) -> None:
+        """Wake reconciliation for an out-of-band configuration change.
+
+        Sync, cheap, never raises. Used by the settings save path so a
+        runtime ``sync_hub_state`` toggle converges within one coalesced
+        pass instead of waiting for the slow WS-healthy backstop poll.
+        Unlike :meth:`notify_ha_state_change` this deliberately ignores the
+        tracked-entity filter — a newly opted-in lock has no tracked state
+        yet — while still respecting the terminal ``_stopping`` latch.
+        """
+        try:
+            if self._stopping:
+                return
+            _LOGGER.debug(
+                "Hub sync: reconcile requested — waking reconciliation"
+            )
+            self._schedule_coalesced_reconcile()
+        except Exception:
+            # Same contract as notify_ha_state_change: never raise into the
+            # (sync) caller — the periodic poll still provides convergence.
+            _LOGGER.exception("Hub sync: failed to schedule reconcile request")
+
+    def _schedule_coalesced_reconcile(self) -> None:
+        """Schedule the shared single-flight reconcile task.
+
+        Requires a running event loop; exceptions propagate to the caller
+        (both public wake paths wrap this in their never-raise guard).
+        """
+        # A wake-up is an explicit invalidation: even a manager whose
+        # lock-table reads are idle-backed-off must re-check immediately.
+        self._idle_recheck_until = 0.0
+        task = self._push_reconcile_task
+        if task is not None and not task.done():
+            # Single-flight with one trailing pass: the running pass may
+            # have sampled state from before this event, so queue exactly
+            # one follow-up; further events while either runs are served
+            # by that same trailing pass.
+            self._push_reconcile_queued = True
+            return
+        self._push_reconcile_queued = False
+        self._push_reconcile_task = asyncio.get_running_loop().create_task(
+            self._push_reconcile()
+        )
+
+    def _is_tracked_entity(self, entity_id: str) -> bool:
+        """Return whether ``entity_id`` has any tracked/synced pairing state.
+
+        Deliberately conservative (raw key presence across every per-entity
+        structure): a held, pending, backed-off, latched, or merely observed
+        entity always earns the push wake-up. Entities never seen by a poll
+        pass are unknown here and are covered by the periodic backstop.
+        """
+        if not entity_id:
+            return False
+        return any(
+            entity_id in collection
+            for collection in (
+                self._applied,
+                self._pairing_signature,
+                self._paired_hubs,
+                self._held_open,
+                self._held_locked,
+                self._pending_release,
+                self._last_converged,
+                self._last_ha_observed,
+                self._last_access_observed,
+                self._backoff_until,
+                self._suspended_until,
+                self._fail_safe_reset_eids,
+                self._lockdown_reset,
+                self._lockdown_unresolved,
+                self._ha_outage_locked,
+            )
+        )
+
+    async def _push_reconcile(self) -> None:
+        """Run one poll pass, plus the single queued trailing pass if set."""
+        try:
+            while True:
+                try:
+                    await self.poll_once()
+                except Exception:
+                    _LOGGER.exception(
+                        "Hub sync: push-driven reconcile pass failed"
+                    )
+                if not self._push_reconcile_queued:
+                    return
+                # Consume the queued marker and run exactly one more pass;
+                # events arriving during THAT pass may queue one more, so a
+                # continuous event stream still runs strictly serialized
+                # passes with at most one queued at any time.
+                self._push_reconcile_queued = False
+        finally:
+            self._push_reconcile_task = None
 
     @property
     def lockdown_unresolved(self) -> tuple[str, ...]:
@@ -343,6 +516,59 @@ class HubSyncManager:
         handling: it already exposes entity IDs to every health scope.
         """
         return tuple(sorted(self._fail_safe_reset_eids))
+
+    def has_pending_work(self) -> bool:
+        """Return whether a poll pass would act WITHOUT any external event.
+
+        Deferred/backoff work resumes only when a pass runs, and none of it
+        produces an HA ``state_changed`` push — so while any of it is live
+        the main-loop poll must stay on the fast :data:`POLL_INTERVAL`
+        cadence and may not relax to the WS-healthy backstop. Deliberately
+        cheap (dict emptiness / max-deadline checks, no DB or network) so
+        the loop can call it every iteration. Covered state, exhaustively:
+
+        - ``_pending_release`` non-empty: hubs still owed a reset/keep_lock
+          drive, retried each pass on ``_release_backoff`` spacing.
+        - ``_fail_safe_reset_eids`` non-empty: a live locked-wins latch is
+          re-asserted/released by passes, not by events.
+        - any ``_backoff_until`` deadline in the future: a failed drive is
+          retried by the first pass after the deadline (fast cadence is
+          engaged while the deadline runs so that pass is at most
+          POLL_INTERVAL late).
+        - any ``_suspended_until`` deadline in the future: a flap-suspended
+          hold-open resumes on the first pass after the suspension.
+        - ``_access_momentary_until`` non-empty (live OR expired): a live
+          lease's expiry must be consumed by a pass (an expired lease falls
+          into locked-wins with no event at the boundary), and only a pass
+          ever pops the entry — so presence, not deadline, is what counts.
+        - any live ``_app_initiated_until`` marker: a lost push event means
+          the app-initiated unlock edge must still be OBSERVED by a pass
+          before the marker expires, or ``relock_on_ha_origin`` would later
+          misclassify it as external. (Expired markers are inert — they are
+          only ever consulted, never consumed, so they do not count.)
+        - any ``_last_applied_at`` within :data:`_MIN_APPLY_INTERVAL`: the
+          min-apply damping may just have deferred a pending hold-open; the
+          first pass after the window applies it without any new event.
+        """
+        if (
+            self._pending_release
+            or self._fail_safe_reset_eids
+            or self._access_momentary_until
+        ):
+            return True
+        now = time.monotonic()
+        for deadlines in (
+            self._backoff_until,
+            self._suspended_until,
+            self._app_initiated_until,
+        ):
+            if deadlines and max(deadlines.values()) > now:
+                return True
+        if self._last_applied_at and (
+            max(self._last_applied_at.values()) + _MIN_APPLY_INTERVAL > now
+        ):
+            return True
+        return False
 
     @staticmethod
     def is_access_state_event(event_type: str) -> bool:
@@ -367,14 +593,23 @@ class HubSyncManager:
         )
 
     def mark_app_initiated_unlock(
-        self, entity_id: str, ttl: float = 15.0
+        self, entity_id: str, ttl: float = BACKSTOP_POLL_INTERVAL + 15.0
     ) -> None:
         """Mark an imminent HA unlock as app-initiated for ``ttl`` seconds.
 
         Used by the manual dashboard Unlock (a deliberate hold-open that cancels
         pending re-locks) so ``relock_on_ha_origin`` does not observe that HA
-        edge as an external thumb-turn. The short TTL covers the 5s poll edge
-        without leaving a genuine later external unlock uncovered.
+        edge as an external thumb-turn. The TTL must outlive the WORST-CASE
+        delay until a poll pass first observes the unlock edge: with the WS
+        push feed healthy the periodic poll relaxes to
+        ``BACKSTOP_POLL_INTERVAL`` (60s), so a lost/late push event means the
+        edge may only be seen by the next backstop pass — up to a full
+        backstop interval later, plus slack for that pass to sample HA
+        (confirm retries / command-barrier waits). Hence backstop + 15s;
+        a 15s-only TTL (sized for the old 5s cadence) expired first and made
+        ``_ensure_ha_origin_relock`` misclassify the deliberate hold-open as
+        an external unlock, scheduling a spurious auto-relock. Still bounded
+        so a genuine later external unlock is not left uncovered.
         """
         self._app_initiated_until[entity_id] = (
             time.monotonic() + max(0.0, float(ttl))
@@ -395,6 +630,9 @@ class HubSyncManager:
             return 0
         if location_id in self._dirty_locations:
             return 0
+        # An Access rule event is an explicit invalidation: even an idle
+        # manager must re-read the lock table for this wake-up.
+        self._idle_recheck_until = 0.0
         self._dirty_locations.add(location_id)
         try:
             return await self.poll_once()
@@ -494,6 +732,37 @@ class HubSyncManager:
         ``backup: cold``) does not re-lock a door deliberately held open.
         :meth:`recover` validates the marker with readback before re-adopting.
         """
+        # Terminal: refuse all new push/poll work BEFORE waiting on the poll
+        # lock, then cancel any in-flight push-reconcile pass. Without this,
+        # (a) a trailing pass queued just before shutdown would acquire
+        # ``_poll_lock`` AFTER this method released the app-owned holds and
+        # run a full normal pass that can re-drive hubs (fresh keep_unlock +
+        # durable hold row) from an exiting process, and (b) a push pass
+        # holding ``_poll_lock`` could starve the bounded (15s) manager
+        # shutdown into exiting without releasing app-owned rules at all.
+        # Cancelling mid-pass is safe by the same contract as the cancelled
+        # hub-sync loop: passes are lock-serialized desired-state convergence
+        # and every partial effect is either durable-first or retried by
+        # recover() from the retained hold rows.
+        self._stopping = True
+        self._push_reconcile_queued = False
+        task = self._push_reconcile_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                # Suppress the push task's own cancellation, but preserve an
+                # outer cancellation (the bounded manager shutdown timing
+                # out) so the 15s bound is never silently exceeded.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+            except Exception:
+                _LOGGER.exception(
+                    "Hub sync: push reconcile task failed during shutdown"
+                )
+        self._push_reconcile_task = None
         async with self._poll_lock:
             await self._load_persisted_sync_state()
             # A release already pending at shutdown entry means something is
@@ -594,6 +863,12 @@ class HubSyncManager:
         One sync pass over all opted-in locks. Returns the number of
         state changes successfully applied to hubs.
         """
+        if self._stopping:
+            # shutdown() owns every remaining action. A pass that slipped in
+            # behind it (queued trailing push pass, a late poll_once) must
+            # not re-drive hubs after the shutdown release.
+            return 0
+
         if self._urgent_lockdown.is_set() and not enforcing_lockdown:
             return 0
 
@@ -623,6 +898,23 @@ class HubSyncManager:
                 force=True, enforcing_lockdown=enforcing_lockdown
             )
 
+        # Idle fast-path: the previous full pass proved there is nothing to
+        # sync and nothing held/pending. Skip the full lock-table read until
+        # the recheck deadline. Never taken while any state is tracked, so
+        # behavior is identical whenever any lock is (or was) synced.
+        if (
+            not enforcing_lockdown
+            and self._idle_recheck_until > time.monotonic()
+            and not self._has_tracked_sync_state()
+        ):
+            return 0
+
+        # Captured BEFORE the removed-entity cleanup below: the idle backoff
+        # may only engage on a pass that both started empty and found nothing
+        # opted in, so the first pass after a disable (which still has cleanup
+        # to do) never delays an immediate re-enable.
+        idle_candidate = not self._has_tracked_sync_state()
+
         # include_hidden so a just-hidden lock's row is still available
         # for hub resolution when we release its held-open hub below.
         all_locks = await self._db.get_all_locks(include_hidden=True)
@@ -633,6 +925,8 @@ class HubSyncManager:
             and lock.get("entity_id")
             and not lock.get("hidden")
         ]
+        if synced_rows:
+            self._idle_recheck_until = 0.0
         # Multiple legacy rows can name the same HA entity. Treat them as one
         # desired-state owner whose pairing is the union of every row, so HA is
         # sampled once and no second row is hidden by the state fast-path.
@@ -666,6 +960,19 @@ class HubSyncManager:
         await self._process_pending_releases(
             enforcing_lockdown=enforcing_lockdown
         )
+
+        if (
+            idle_candidate
+            and not synced_rows
+            and not self._has_tracked_sync_state()
+        ):
+            # Nothing opted in, nothing held, nothing pending — and the pass
+            # started that way too: back off the full lock-table read until
+            # the idle recheck deadline. The rest of this pass is a no-op
+            # over the empty synced set.
+            self._idle_recheck_until = (
+                time.monotonic() + _IDLE_RECHECK_INTERVAL
+            )
 
         if self._urgent_lockdown.is_set() and not enforcing_lockdown:
             return 0
@@ -797,6 +1104,12 @@ class HubSyncManager:
             # A persistent hold-open is a lease on HA's desired state. Once HA
             # is unavailable, that lease has no trustworthy owner: reset every
             # hub we may hold instead of leaving a door open indefinitely.
+            if not self._ha_outage_logged:
+                self._ha_outage_logged = True
+                _LOGGER.warning(
+                    "Hub sync: Home Assistant unavailable — failing safe "
+                    "(keep_lock) every synced pairing until it returns"
+                )
             access_for_fail_safe = self._get_access()
             bidirectional_fail_safe = self._supports_bidirectional_access(
                 access_for_fail_safe
@@ -806,10 +1119,21 @@ class HubSyncManager:
                 if bidirectional_fail_safe:
                     self._fail_safe_reset_eids.add(eid)
                     hubs = resolved_by_eid.get(eid)
-                    if hubs is not None:
-                        await self._apply_state(
-                            lock, "locked", hubs=hubs, fail_safe=True
-                        )
+                    if hubs is None:
+                        continue
+                    # One confirmed keep_lock per outage per pairing is
+                    # enough: re-issuing the identical persistent hold on
+                    # every 5s poll for a long outage is pure churn (hub
+                    # command + durable ownership write + access_log row). A
+                    # pairing change mid-outage invalidates the record so the
+                    # new hub set is still driven closed.
+                    signature = self._hub_signature(hubs)
+                    if self._ha_outage_locked.get(eid) == signature:
+                        continue
+                    if await self._apply_state(
+                        lock, "locked", hubs=hubs, fail_safe=True
+                    ):
+                        self._ha_outage_locked[eid] = signature
                 elif (
                     self._held_open.get(eid)
                     or self._applied.get(eid) == "unlocked"
@@ -820,6 +1144,11 @@ class HubSyncManager:
                 force=True, enforcing_lockdown=enforcing_lockdown
             )
             return 0
+        # HA is reachable again (or was never gone): the next outage gets a
+        # fresh one-shot keep_lock drive and a fresh log line.
+        if self._ha_outage_locked or self._ha_outage_logged:
+            self._ha_outage_locked.clear()
+            self._ha_outage_logged = False
 
         poll_time = time.monotonic()
         # Always observe HA state. Backoff, flap suspension, and damping are
@@ -1905,13 +2234,14 @@ class HubSyncManager:
             if not await self._drive_ha_state(
                 lock, desired, fail_safe=fail_safe or desired == "locked"
             ):
-                self._last_ha_observed[eid] = (
-                    ha_state if valid_ha else "locked"
-                )
-                self._last_access_observed[eid] = (
-                    access_state if valid_access else "locked"
-                )
-                self._last_access_rule[eid] = access_rule
+                # Do NOT overwrite the confirmed baselines with this pass's
+                # divergent observation. Doing so made the still-divergent
+                # observation on the next pass look like "nothing changed on
+                # either side" → concurrent_conflict → locked, physically
+                # reverting a genuine unlock whose drive merely failed once.
+                # Keeping the pre-change baselines lets the next pass
+                # re-arbitrate with the original origin info and retry the
+                # same drive after the backoff.
                 # Back off retries of the unsafe direction only; a failed lock
                 # must keep retrying every poll (fail-closed) — unless it is a
                 # repeated hard rejection, which is spaced but never stopped.
@@ -1985,14 +2315,18 @@ class HubSyncManager:
                         eid,
                     )
                     return 0
-                # HA may already have moved. Keep the desired baseline absent so
-                # the next pass retries rather than treating this partial apply
-                # as a new external HA change.
-                self._last_ha_observed[eid] = ha_state
-                self._last_access_observed[eid] = (
-                    access_state if valid_access else "locked"
-                )
-                self._last_access_rule[eid] = access_rule
+                # Do NOT overwrite the confirmed baselines with this pass's
+                # divergent observation (same rationale as the failed HA drive
+                # above): recording the divergence as "confirmed" made the
+                # unchanged mismatch on the next pass read as
+                # concurrent_conflict and revert a genuine HA-origin unlock
+                # whose Access apply merely failed once. Keeping the old
+                # baselines preserves the origin info so the same drive is
+                # retried after the backoff. The one partial-apply case where
+                # this pass itself moved HA (a successful HA drive above)
+                # only happens with desired == "locked" under the fail-safe
+                # latch, which forces locked next pass regardless of
+                # baselines.
                 # Back off retries of the unsafe direction only; a failed lock
                 # must keep retrying every poll (fail-closed) — unless it is a
                 # repeated hard rejection, which is spaced but never stopped.
@@ -2029,7 +2363,12 @@ class HubSyncManager:
             if desired == "unlocked":
                 # Do not leave an unsafe state whose origin cannot survive a
                 # restart. Best-effort close both sides; durable hold ownership
-                # remains until Access confirms the safe direction.
+                # remains until Access confirms the safe direction. The latch
+                # is required: this compensation records app-owned keep_lock,
+                # and only the latch's confirmed-locked release path replaces
+                # it with lock_now — without it the keep_lock would suppress
+                # every future Access schedule until restart.
+                self._fail_safe_reset_eids.add(eid)
                 await self._drive_ha_state(lock, "locked", fail_safe=True)
                 await self._apply_state(
                     lock, "locked", hubs=hubs, fail_safe=True
@@ -2700,23 +3039,37 @@ class HubSyncManager:
         access_rule: str,
         hubs: list[dict],
     ) -> None:
-        setter = self._method(self._db, "set_hub_sync_state")
-        if setter is not None:
-            await setter(
-                entity_id=eid,
-                desired_state=desired,
-                source=source,
-                ha_state=desired,
-                access_state=desired,
-                access_rule_fingerprint=access_rule,
-                pairing_signature=json.dumps(self._hub_signature(hubs)),
-            )
+        pairing_signature = json.dumps(self._hub_signature(hubs))
+        snapshot = (desired, access_rule, pairing_signature)
+        # Steady-state no-op convergence (already_converged every 5s poll) must
+        # not cost a durable BEGIN IMMEDIATE + fsync per entity per poll. Skip
+        # the DB write when nothing the durable row records has changed since
+        # the last successful persist; the first pass after startup (or after
+        # the row was cleared) always writes because the in-memory snapshot is
+        # absent. The snapshot is recorded only after the setter succeeds, so a
+        # failed write is retried on the next pass.
+        if self._last_persisted_convergence.get(eid) != snapshot:
+            setter = self._method(self._db, "set_hub_sync_state")
+            if setter is not None:
+                await setter(
+                    entity_id=eid,
+                    desired_state=desired,
+                    source=source,
+                    ha_state=desired,
+                    access_state=desired,
+                    access_rule_fingerprint=access_rule,
+                    pairing_signature=pairing_signature,
+                )
+            self._last_persisted_convergence[eid] = snapshot
         self._last_ha_observed[eid] = desired
         self._last_access_observed[eid] = desired
         self._last_access_rule[eid] = access_rule
         self._last_converged[eid] = desired
 
     async def _clear_persisted_convergence(self, eid: str) -> None:
+        # The durable row is gone (or about to be); the next convergence for
+        # this entity must write unconditionally.
+        self._last_persisted_convergence.pop(eid, None)
         clearer = self._method(self._db, "clear_hub_sync_state")
         if clearer is not None:
             await clearer(eid)
@@ -2902,6 +3255,28 @@ class HubSyncManager:
                     self._applied[eid] = "locked"
         return reset_count
 
+    def _has_tracked_sync_state(self) -> bool:
+        """Return whether ANY entity still has sync state worth a full pass.
+
+        Deliberately conservative (raw key presence, including empty held
+        lists): the idle fast-path in _poll_once may only engage when every
+        one of these is empty, so a synced/held/pending/latched entity always
+        gets the normal per-poll pass.
+        """
+        return bool(
+            self._applied
+            or self._held_open
+            or self._held_locked
+            or self._pending_release
+            or self._pairing_signature
+            or self._paired_hubs
+            or self._last_converged
+            or self._fail_safe_reset_eids
+            or self._lockdown_reset
+            or self._lockdown_unresolved
+            or self._ha_outage_locked
+        )
+
     def _drop_tracking(self, eid: str) -> None:
         self._applied.pop(eid, None)
         self._pairing_signature.pop(eid, None)
@@ -2918,6 +3293,8 @@ class HubSyncManager:
         self._last_access_observed.pop(eid, None)
         self._last_access_rule.pop(eid, None)
         self._last_converged.pop(eid, None)
+        self._last_persisted_convergence.pop(eid, None)
+        self._ha_outage_locked.pop(eid, None)
         self._access_momentary_until.pop(eid, None)
         self._app_initiated_until.pop(eid, None)
         self._ha_transition_started.pop(eid, None)

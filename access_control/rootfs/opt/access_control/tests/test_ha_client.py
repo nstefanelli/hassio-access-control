@@ -80,6 +80,9 @@ class TestHAClientHealthCircuitRecovery(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
+            async def read(self):
+                return b""
+
         class Session:
             closed = False
 
@@ -157,6 +160,39 @@ class TestHAClientLifetime(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client._closed)
         self.assertEqual(client._active_operations, 0)
         await client.close()
+
+    async def test_cancellation_during_lease_release_does_not_hang_close(
+        self,
+    ) -> None:
+        """Regression: a cancellation delivered while the lease's finally
+        block waits on the lifecycle Condition used to abandon the decrement,
+        leaking the lease count so _close_impl's drain loop hung forever."""
+        client = HAClient("http://ha.local", "token")
+        lease_started = asyncio.Event()
+
+        async def use_exact_client() -> None:
+            async with client.operation_lease():
+                lease_started.set()
+                await asyncio.Event().wait()  # cancelled here
+
+        operation = asyncio.create_task(use_exact_client())
+        await lease_started.wait()
+
+        # Hold the lifecycle lock so the finally-block release must wait on
+        # it, then deliver the cancellations: the first lands in the lease
+        # body, the second while the release is blocked on the lock.
+        async with client._lifecycle:
+            operation.cancel()
+            await asyncio.sleep(0)
+            operation.cancel()
+            await asyncio.sleep(0)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await operation
+
+        await asyncio.wait_for(client.close(), timeout=1)
+        self.assertTrue(client._closed)
+        self.assertEqual(client._active_operations, 0)
 
 
 if __name__ == "__main__":

@@ -72,8 +72,10 @@ For native doors, **Unlock** applies `keep_unlock`; **Lock** uses `lock_now` to
 end an active unlock schedule or temporary unlock; **Follow Schedule** uses
 `reset` and can immediately reopen the door if its Access schedule is active.
 Opted-in HA/Access pairs synchronize in both directions. Access rule events
-wake reconciliation immediately and a five-second authenticated poll catches
-missed events and drift. Simultaneous disagreement or unreadable state resolves
+and HA WebSocket push events wake reconciliation immediately; an authenticated
+poll catches missed events and drift, running as a 60-second backstop while
+push is healthy and every five seconds otherwise. Simultaneous disagreement
+or unreadable state resolves
 locked; a verified active Access schedule is the only startup mismatch allowed
 to establish an unlocked baseline. Lockdown always suppresses opening and
 drives the safe locked direction.

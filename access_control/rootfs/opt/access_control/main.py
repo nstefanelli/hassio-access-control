@@ -71,6 +71,11 @@ _HERE = Path(__file__).parent
 # Hub release and relock cleanup each get a bounded quarter of that budget so
 # client closure and SQLite still have time to complete.
 _MANAGER_SHUTDOWN_TIMEOUT_SECONDS = 15.0
+# Bring-up topology retry backoff: one flaky HTTP fetch during Access
+# bring-up must not black out door-event processing until the 15-minute
+# periodic resync. Module constants so tests can compress the schedule.
+_TOPOLOGY_RETRY_INITIAL_DELAY_SECONDS = 15.0
+_TOPOLOGY_RETRY_MAX_DELAY_SECONDS = 300.0
 
 # `_resolve_ha_creds` lives in `ha_creds.py` so the env-vs-DB precedence
 # logic can be unit-tested without dragging FastAPI (and main.py's whole
@@ -153,6 +158,90 @@ async def _persist_resolved_secret_key_metadata(
 
 
 # ---------------------------------------------------------------------------
+# HA push wiring helpers
+# ---------------------------------------------------------------------------
+
+def _hub_sync_poll_interval(ha_client, manager=None) -> float:
+    """Choose the hub-sync loop's sleep for the next iteration.
+
+    The slow backstop cadence is safe only when EVERY faster signal is
+    healthy and nothing is waiting on a pass:
+
+    - ``ws_connected`` — state changes wake reconciliation via
+      ``notify_ha_state_change``, so the poll is only a drift/missed-event
+      backstop.
+    - ``connected`` (REST) — the manager's HA-outage fail-safe keys on the
+      REST client state (a 401/circuit-open can flip REST down while the
+      authenticated WS stays up); held-open doors must then fail safe on
+      the fast cadence, not once a minute.
+    - ``manager.has_pending_work()`` — deferred/backoff work (pending
+      releases, failure backoffs, flap suspensions, min-apply deferrals,
+      live momentary/app-initiated markers, fail-safe latches) resumes
+      only on a pass and produces no push event.
+
+    Everything is read via getattr with safe defaults so older or injected
+    clients/managers degrade to the full 5s polling cadence (fail fast,
+    never fail slow).
+    """
+    if ha_client is None or not (
+        getattr(ha_client, "ws_connected", False)
+        and getattr(ha_client, "connected", False)
+    ):
+        return HubSyncManager.POLL_INTERVAL
+    has_pending_work = getattr(manager, "has_pending_work", None)
+    if callable(has_pending_work):
+        try:
+            if has_pending_work():
+                return HubSyncManager.POLL_INTERVAL
+        except Exception:
+            logger.exception("has_pending_work failed; polling fast")
+            return HubSyncManager.POLL_INTERVAL
+    return HubSyncManager.BACKSTOP_POLL_INTERVAL
+
+
+def _make_ha_state_changed_callback(app: FastAPI):
+    """Build the async HA ``state_changed`` callback for the hub sync manager.
+
+    Locks only: alarm panel state is read on demand by the auth engine via
+    its DB-configured panels and is deliberately NOT push-wired here. The
+    manager guard mirrors the existing ``_hub_sync_loop`` (manager absent =
+    unconfigured / feature not brought up yet). ``notify_ha_state_change``
+    itself never raises and treats the payload as a wake-up hint only.
+    """
+
+    async def _on_ha_state_changed(
+        entity_id: str, old_state: str | None, new_state: str | None
+    ) -> None:
+        if not isinstance(entity_id, str) or not entity_id.startswith("lock."):
+            return
+        manager = getattr(app.state, "hub_sync_manager", None)
+        if manager is None:
+            return
+        manager.notify_ha_state_change(entity_id, new_state)
+
+    return _on_ha_state_changed
+
+
+def _register_ha_websocket(ha_client, callback) -> None:
+    """Idempotently register the HA state_changed websocket, best-effort.
+
+    ``start_websocket`` is sync and idempotent per the HAClient contract; the
+    WS loop retries connection on its own, so this is called regardless of
+    current REST connectivity. Guarded with getattr so an older/injected
+    client without websocket support simply stays on 5s polling.
+    """
+    if ha_client is None or callback is None:
+        return
+    start_ws = getattr(ha_client, "start_websocket", None)
+    if not callable(start_ws):
+        return
+    try:
+        start_ws(callback)
+    except Exception:
+        logger.exception("HA WebSocket registration failed")
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
@@ -209,6 +298,9 @@ async def _lifespan_inner(app: FastAPI):
     app.state.protect_started_client = None
     app.state.seed_lock_states = None
     app.state.mark_ha_lock_states_unknown = None
+    # HA state_changed push callback — built in initialize_configured_state
+    # and reused by the HA health loop to (re-)register the websocket.
+    app.state.on_ha_state_changed = None
     app.state.physical_command_lock = asyncio.Lock()
     app.state.physical_entity_locks = {}
     app.state.setup_lock = asyncio.Lock()
@@ -218,6 +310,7 @@ async def _lifespan_inner(app: FastAPI):
     app.state.topology_sync_lock = asyncio.Lock()
     app.state.visitor_operation_locks = {}
     app.state.access_data_lock = asyncio.Lock()
+    app.state.topology_retry_task = None
 
     # Door-event work is deliberately fire-and-forget during normal
     # operation, but it still needs an owner so shutdown can cancel and await
@@ -388,13 +481,62 @@ async def _lifespan_inner(app: FastAPI):
             app.state.event_topology_ready = True
             logger.info("Camera→location map: %d entries", len(new_map))
 
+    async def _topology_bringup_retry() -> None:
+        """Short-interval sync_users() retries after a failed bring-up sync.
+
+        While event_topology_ready is False every Access AND Protect door
+        event is hard-dropped (fail-closed). Waiting for the 900s periodic
+        resync would black out door-event processing for up to 15 minutes
+        after one flaky HTTP fetch at boot, so retry on a capped backoff
+        until the sync succeeds or the client is stopped.
+        """
+        delay = _TOPOLOGY_RETRY_INITIAL_DELAY_SECONDS
+        while True:
+            await asyncio.sleep(delay)
+            if app.state.event_topology_ready:
+                return
+            sync = app.state.sync_users
+            if sync is None or app.state.access_client is None:
+                # Client stopped/retired — the next bring-up schedules its
+                # own retry if its sync fails again.
+                return
+            try:
+                await sync()
+            except Exception:
+                delay = min(delay * 2, _TOPOLOGY_RETRY_MAX_DELAY_SECONDS)
+                logger.exception(
+                    "Topology sync retry failed — next attempt in %.0fs",
+                    delay,
+                )
+            else:
+                if app.state.event_topology_ready:
+                    logger.info("Topology sync retry succeeded")
+                    return
+                # sync() returned without publishing (e.g. a retired client
+                # was detected mid-apply) — keep retrying on the backoff.
+                delay = min(delay * 2, _TOPOLOGY_RETRY_MAX_DELAY_SECONDS)
+
+    def _schedule_topology_bringup_retry() -> None:
+        """Single-flight scheduling of the bring-up topology retry task."""
+        existing = app.state.topology_retry_task
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            _topology_bringup_retry(), name="topology-bringup-retry"
+        )
+        app.state.topology_retry_task = task
+        # Tracked like other event work so shutdown (and live-client
+        # publication swaps) cancel it before clients/SQLite close.
+        _track_event_task(task)
+
+    app.state.schedule_topology_bringup_retry = _schedule_topology_bringup_retry
+
     # Semaphore to cap concurrent process_event invocations during event floods
     _event_semaphore = asyncio.Semaphore(5)
 
     # Register WebSocket event callback
     def on_access_event(message: dict) -> None:
         """Dispatch relevant Access events to the auth engine."""
-        app.state.ws_last_event["access"] = datetime.now(timezone.utc).isoformat()
         if not app.state.event_topology_ready:
             logger.warning(
                 "Dropping Access event while topology is being refreshed"
@@ -527,6 +669,12 @@ async def _lifespan_inner(app: FastAPI):
                 ulp_id = "remote"
             else:
                 return
+
+        # Only a confirmed door-relevant event (credential or remote unlock)
+        # refreshes the scheduled-reboot "someone at the door" guard.
+        # Stamping on every WS message let periodic non-door chatter keep
+        # the guard perpetually fresh, so the maintenance reboot never fired.
+        app.state.ws_last_event["access"] = datetime.now(timezone.utc).isoformat()
 
         # Apply dedup before the remote-unlock early return too. Re-delivered
         # remote events used to replace the durable relock row and extend the
@@ -770,15 +918,21 @@ async def _lifespan_inner(app: FastAPI):
 
     def on_protect_event(message: dict) -> None:
         """Handle ring, NFC, fingerprint, and doorAccess events from Protect."""
+        event = message.get("event", "")
+        camera_id = message.get("camera_id", "")
+        if not camera_id:
+            return
+        if event not in ("door_access", "ring", "nfc", "fingerprint"):
+            # Periodic non-door chatter (motion, device status) must not be
+            # recorded as door activity — it kept the scheduled-reboot
+            # "someone at the door" guard perpetually fresh, so the
+            # maintenance reboot never fired.
+            return
         app.state.ws_last_event["protect"] = datetime.now(timezone.utc).isoformat()
         if not app.state.event_topology_ready:
             logger.warning(
                 "Dropping Protect event while topology is being refreshed"
             )
-            return
-        event = message.get("event", "")
-        camera_id = message.get("camera_id", "")
-        if not camera_id:
             return
 
         auth_engine = app.state.auth_engine
@@ -1039,6 +1193,15 @@ async def _lifespan_inner(app: FastAPI):
             app.state.ha_unhealthy = False
         app.state.ha_client = ha_client
 
+        # Push wiring: HA lock state_changed events wake hub sync directly
+        # instead of waiting out the 5s poll (the poll then relaxes to a slow
+        # backstop while ws_connected). Registered regardless of the REST
+        # test_connection outcome above — the WS loop retries on its own.
+        # The callback resolves the hub sync manager lazily off app.state,
+        # so registering before the manager is constructed below is safe.
+        app.state.on_ha_state_changed = _make_ha_state_changed_callback(app)
+        _register_ha_websocket(ha_client, app.state.on_ha_state_changed)
+
         # RelockManager wraps the relock-task dict and persists pending relocks
         # to the DB. ha_client is fetched lazily via the getter so credential
         # updates from Settings transparently use the new client. The
@@ -1119,16 +1282,33 @@ async def _lifespan_inner(app: FastAPI):
         # closed as enabled until an operator can explicitly clear it.
         await app.state.auth_engine.load_persisted_lockdown()
 
+        # Restore the last-known HA timezone before event processing starts —
+        # if HA Core is down at boot, schedules would otherwise evaluate in
+        # container-local time (UTC on stock HAOS) until the next successful
+        # health tick, granting/denying at the wrong local hours. A missing,
+        # unreadable, or invalid value keeps the TZ-env / container-local
+        # fallback; set_timezone() rejects invalid names itself.
+        try:
+            persisted_tz = await db.get_config("ha_timezone")
+        except Exception:
+            persisted_tz = None
+            logger.exception(
+                "Failed to read persisted HA timezone — schedules use %s",
+                app.state.auth_engine.tz,
+            )
+        if persisted_tz:
+            app.state.auth_engine.set_timezone(persisted_tz)
+
         # Align schedule evaluation with the site's local timezone. HA's
         # configured time_zone is authoritative; until it's available the
-        # engine falls back to TZ env / container-local time (see
-        # auth_engine._default_timezone). The HA health loop retries this
-        # on recovery if HA was down at boot.
+        # engine falls back to the persisted zone loaded above, then TZ env /
+        # container-local time (see auth_engine._default_timezone). The HA
+        # health loop retries this on recovery if HA was down at boot.
         if ha_ok:
             try:
                 tz_name = await ha_client.get_timezone()
                 if tz_name:
-                    app.state.auth_engine.set_timezone(tz_name)
+                    await app.state.auth_engine.apply_ha_timezone(tz_name)
             except Exception:
                 logger.exception("Failed to fetch HA timezone — schedules use %s",
                                  app.state.auth_engine.tz)
@@ -1260,12 +1440,14 @@ async def _lifespan_inner(app: FastAPI):
                     try:
                         await sync_users()
                     except Exception:
-                        # Keep event intake fail-closed until the periodic sync
-                        # succeeds and marks event_topology_ready.
+                        # Keep event intake fail-closed until a retry succeeds
+                        # and marks event_topology_ready — but retry on a short
+                        # backoff instead of waiting for the 900s resync loop.
                         app.state.event_topology_ready = False
                         logger.exception(
                             "Topology refresh failed during Access bring-up"
                         )
+                        _schedule_topology_bringup_retry()
 
                     candidate.register_callback(on_access_event)
                     await candidate.start_websocket()
@@ -1311,6 +1493,15 @@ async def _lifespan_inner(app: FastAPI):
                 if not creds:
                     return False
                 host, user, pwd = creds
+                if existing is not None:
+                    # Best-effort close of the stale disconnected client so
+                    # each recovery cycle does not leak its aiohttp session.
+                    try:
+                        await existing.close()
+                    except Exception:
+                        logger.exception(
+                            "Failed to close stale Protect client before replacement"
+                        )
                 protect_client = ProtectClient(host, user, pwd)
                 try:
                     await protect_client.login()
@@ -1429,7 +1620,19 @@ async def _lifespan_inner(app: FastAPI):
                         if access_client is None:
                             continue
                         unvr_visitors = await access_client.list_visitors()
-                    unvr_map = {v["unique_id"]: v for v in unvr_visitors}
+                    unvr_map: dict[str, dict] = {}
+                    for uv in unvr_visitors:
+                        uv_id = uv.get("unique_id")
+                        if not uv_id:
+                            # A malformed upstream row must not abort the
+                            # whole 5-minute sync pass with a KeyError.
+                            logger.warning(
+                                "Skipping upstream visitor row without "
+                                "unique_id (name=%r)",
+                                uv.get("name"),
+                            )
+                            continue
+                        unvr_map[uv_id] = uv
                     for lv in remaining_visitors:
                         uvid = lv["unvr_visitor_id"]
                         uv = unvr_map.get(uvid)
@@ -1486,6 +1689,11 @@ async def _lifespan_inner(app: FastAPI):
                                 )
                     previous_connected = False
                     continue
+                # Keep the state_changed websocket registered — idempotent
+                # per the client contract, and covers a client swapped in by
+                # a Settings credential update or a registration that failed
+                # at boot. The WS loop handles reconnects itself.
+                _register_ha_websocket(ha, app.state.on_ha_state_changed)
                 try:
                     now_connected = await ha.test_connection()
                 except Exception:
@@ -1510,14 +1718,15 @@ async def _lifespan_inner(app: FastAPI):
                         except Exception:
                             logger.exception("Relock rehydrate after HA recovery failed")
                     # Refresh the schedule timezone — covers HA being down
-                    # at boot (the engine would still be on its TZ-env /
-                    # container-local fallback).
+                    # at boot (the engine would still be on its persisted /
+                    # TZ-env / container-local fallback). apply_ha_timezone
+                    # also persists the zone for the next HA-down boot.
                     engine = app.state.auth_engine
                     if engine is not None:
                         try:
                             tz_name = await ha.get_timezone()
                             if tz_name:
-                                engine.set_timezone(tz_name)
+                                await engine.apply_ha_timezone(tz_name)
                         except Exception:
                             logger.exception("Timezone refresh after HA recovery failed")
                 elif previous_connected and not now_connected:
@@ -1552,12 +1761,22 @@ async def _lifespan_inner(app: FastAPI):
         ))
 
         # Hub sync — bidirectionally reconciles opted-in HA locks and paired
-        # Access doors. Access events wake it early; polling authenticated HA
-        # state plus Access rule/relay readback catches missed events, bounds
-        # drift, and confirms physical convergence.
+        # Access doors. Access events and HA state_changed push events wake
+        # it early; polling authenticated HA state plus Access rule/relay
+        # readback catches missed events, bounds drift, and confirms physical
+        # convergence. Only while the HA websocket AND REST client are both
+        # healthy and the manager reports no pending deferred/backoff work
+        # does the poll relax to the slow backstop cadence; the interval is
+        # re-chosen every iteration so a WS/REST drop or newly pending work
+        # restores 5s polling within one sleep.
         async def _hub_sync_loop():
             while True:
-                await asyncio.sleep(HubSyncManager.POLL_INTERVAL)
+                await asyncio.sleep(
+                    _hub_sync_poll_interval(
+                        app.state.ha_client,
+                        getattr(app.state, "hub_sync_manager", None),
+                    )
+                )
                 mgr = app.state.hub_sync_manager
                 if mgr is None:
                     continue
@@ -1759,10 +1978,16 @@ async def _lifespan_inner(app: FastAPI):
 
         # Stop event intake before snapshotting fire-and-forget work. Otherwise
         # a final WS callback can enqueue a physical command after the gather
-        # and run against clients/SQLite while they are being closed.
+        # and run against clients/SQLite while they are being closed. HA is
+        # included so a late state_changed push cannot wake hub sync into
+        # re-driving a hub AFTER the manager's shutdown pass released its
+        # holds below; HAClient.close() would stop the websocket too, but it
+        # runs after that shutdown pass — stop_websocket is idempotent, so
+        # the later close() is a harmless no-op stop.
         for label, client in (
             ("Protect", app.state.protect_client),
             ("Access", app.state.access_client),
+            ("HA", app.state.ha_client),
         ):
             if client is None:
                 continue

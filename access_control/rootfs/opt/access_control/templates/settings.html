@@ -39,19 +39,31 @@
     // document.baseURI because deferred app.js has not initialized globals yet.
     var url = new URL('settings', document.baseURI).toString();
     var attempts = 0;
+    var FAST_ATTEMPTS = 30;
     function tryReload() {
       attempts++;
       fetch(url, {method: 'GET', cache: 'no-store', credentials: 'same-origin'})
         .then(function(r) {
           if (r.ok) {
             window.location.replace(url);
-          } else if (attempts < 30) {
-            setTimeout(tryReload, 2000);
+          } else {
+            scheduleNext();
           }
         })
-        .catch(function() {
-          if (attempts < 30) setTimeout(tryReload, 2000);
-        });
+        .catch(scheduleNext);
+    }
+    function scheduleNext() {
+      // ~63s of fast 2s polling, then fall back to a slower 5s poll forever
+      // instead of silently giving up with the banner stuck on screen.
+      if (attempts === FAST_ATTEMPTS) {
+        var banner = document.getElementById('restart-banner');
+        if (banner) {
+          banner.textContent =
+            'Still restarting… This is taking longer than usual. ' +
+            'The page will reload automatically, or you can reload it manually.';
+        }
+      }
+      setTimeout(tryReload, attempts < FAST_ATTEMPTS ? 2000 : 5000);
     }
     setTimeout(tryReload, 3000);
   })();
@@ -405,16 +417,4 @@
 
 </div>
 
-<script>
-function toggleKey(btn, displayId) {
-  const el = document.getElementById(displayId);
-  if (btn.textContent.trim() === 'Show') {
-    el.textContent = el.dataset.fullKey;
-    btn.textContent = 'Hide';
-  } else {
-    el.textContent = el.dataset.maskedKey;
-    btn.textContent = 'Show';
-  }
-}
-</script>
 {% endblock %}

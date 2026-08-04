@@ -108,8 +108,12 @@ class DatabaseRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.db.get_ui_cache("key", now=110.0))
 
         await self.db.set_ui_cache("restart-key", ["value"], ttl=60, now=100.0)
-        async with self.db._db.execute("SELECT COUNT(*) FROM ui_cache") as cursor:
-            self.assertEqual((await cursor.fetchone())[0], 0)
+        # The cache is purely in-process now: the legacy ui_cache table is
+        # dropped by migration and never recreated.
+        async with self.db._db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='ui_cache'"
+        ) as cursor:
+            self.assertIsNone(await cursor.fetchone())
         await self.db.close()
 
         restarted = Database(path=self.path)

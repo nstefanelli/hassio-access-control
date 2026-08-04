@@ -27,7 +27,8 @@ def get_session_user(request: Request) -> str | None:
 
     Returns None if the cookie is missing, expired, or tampered with.
     """
-    token = request.cookies.get("session")
+    cookies = getattr(request, "cookies", None)
+    token = cookies.get("session") if cookies else None
     if not token:
         return None
     try:
@@ -56,26 +57,41 @@ def _cookie_path(request: Request) -> str:
     return request.scope.get("root_path") or "/"
 
 
+def resolve_effective_user(request: Request) -> str | None:
+    """
+    Resolve the authenticated identity, or None if unauthenticated.
+
+    Order of precedence (shared by require_login, the CSRF middleware in
+    main.py, and web_routes._render — anything that mints or validates a
+    CSRF token MUST resolve identity in this exact order, otherwise a
+    client presenting both an ingress SSO identity and a stale session
+    cookie gets tokens generated for one identity but validated against
+    the other, and every POST 403s):
+
+    1. HA Ingress SSO — if ingress_middleware identified an HA admin via
+       the X-Remote-User-* headers, trust that and skip cookie auth
+       entirely. Use the HA display name as the in-app username so
+       admin_log entries are attributable; callers can reach ingress_user
+       via request.state if they need the HA user id.
+    2. Signed session cookie — the legacy path for direct-port deployments.
+    """
+    ingress_user = getattr(request.state, "ingress_user", None)
+    if ingress_user:
+        return f"ha:{ingress_user['name']}"
+    return get_session_user(request)
+
+
 def require_login(request: Request) -> str:
     """
     Return the logged-in username, or raise an HTTPException (303 redirect to /login).
 
-    Order of precedence:
-    1. HA Ingress SSO — if ingress_middleware identified an HA admin via the
-       X-Remote-User-* headers, trust that and skip cookie auth entirely.
-    2. Signed session cookie — the legacy path for direct-port deployments.
+    Identity precedence lives in resolve_effective_user (ingress SSO first,
+    then the signed session cookie).
 
     For HTMX requests with no auth, return HX-Redirect header so the browser
     performs a full navigation instead of injecting the login page into the DOM.
     """
-    ingress_user = getattr(request.state, "ingress_user", None)
-    if ingress_user:
-        # SSO-authenticated. Use the HA display name as the in-app username
-        # so admin_log entries are attributable. The caller can also reach
-        # ingress_user via request.state if it needs the HA user id.
-        return f"ha:{ingress_user['name']}"
-
-    user = get_session_user(request)
+    user = resolve_effective_user(request)
     if not user:
         root = request.scope.get("root_path", "")
         if request.headers.get("HX-Request") == "true":
@@ -127,6 +143,31 @@ async def require_csrf(request: Request, user: str = Depends(require_login)) -> 
     return user
 
 
+def _cookie_secure(request: Request) -> bool:
+    """
+    Whether the session cookie should carry the Secure attribute.
+
+    Browsers silently discard Secure cookies set over plain HTTP, so
+    hardcoding secure=True turned the documented direct-port http://
+    deployment into an infinite login loop. Derive it instead:
+
+    - Ingress: the browser-facing hop is the HA frontend (HTTPS in any
+      sane deployment) even though the Supervisor proxies to us over
+      plain HTTP internally — keep Secure.
+    - Otherwise trust X-Forwarded-Proto (reverse-proxy TLS termination),
+      falling back to the request scheme itself.
+    """
+    if getattr(request.state, "ingress_active", False):
+        return True
+    headers = getattr(request, "headers", None) or {}
+    forwarded_proto = headers.get("x-forwarded-proto") or headers.get(
+        "X-Forwarded-Proto"
+    )
+    if forwarded_proto:
+        return forwarded_proto.split(",")[0].strip().lower() == "https"
+    return getattr(getattr(request, "url", None), "scheme", "") == "https"
+
+
 def set_session_cookie(response, request: Request, username: str) -> None:
     """
     Set the signed session cookie, scoped to the ingress prefix when active.
@@ -137,7 +178,7 @@ def set_session_cookie(response, request: Request, username: str) -> None:
         "session",
         cookie_value,
         httponly=True,
-        secure=True,
+        secure=_cookie_secure(request),
         samesite="lax",
         max_age=SESSION_MAX_AGE,
         path=_cookie_path(request),

@@ -41,11 +41,14 @@
   // leave the button alone. CSRF hidden inputs are injected at load, unaffected.
   document.addEventListener("submit", (event) => {
     if (event.defaultPrevented) return;
-    const button = event.target.querySelector(
-      'button[type="submit"], button:not([type]), input[type="submit"]',
-    );
+    // Prefer the button that actually triggered the submit so forms with two
+    // submit buttons (e.g. "Save" + "Clear") disable the right one.
+    const button =
+      event.submitter ||
+      event.target.querySelector(
+        'button[type="submit"], button:not([type]), input[type="submit"]',
+      );
     if (!button || button.disabled) return;
-    button.disabled = true;
     button.style.opacity = "0.6";
     const pending = button.dataset.pendingText || "Working…";
     if (button.tagName === "INPUT") {
@@ -53,6 +56,12 @@
     } else {
       button.textContent = pending;
     }
+    // Defer the disable: disabling the submitter synchronously during the
+    // submit event drops its name/value from the POST payload in some
+    // browsers (e.g. the "clear" flag on the settings Clear buttons).
+    window.setTimeout(() => {
+      button.disabled = true;
+    }, 0);
   });
 
   const refreshHook = document.querySelector("[data-background-refresh]");
@@ -68,6 +77,14 @@
   const refreshUrl = refreshHook.dataset.backgroundRefreshUrl || ".";
   const targetSelector =
     refreshHook.dataset.backgroundRefreshTarget || ".auto-refresh";
+
+  function markupWithoutCsrf(element) {
+    const clone = element.cloneNode(true);
+    clone
+      .querySelectorAll('input[name="_csrf_token"]')
+      .forEach((input) => input.remove());
+    return clone.outerHTML;
+  }
 
   async function refresh() {
     try {
@@ -96,9 +113,21 @@
           const nextTarget = nextDocument.querySelector(targetSelector);
 
           if (currentTarget && nextTarget) {
+            // Always rotate the CSRF meta so per-response tokens stay fresh
+            // whether or not the subtree is swapped.
             updateCsrfToken(nextDocument);
-            currentTarget.replaceWith(nextTarget);
-            injectCsrf(nextTarget);
+            // Skip the swap while the user is interacting with the target
+            // (focused button/form control) — replaceWith would discard focus
+            // and any in-progress tap. The next poll retries.
+            const busy = currentTarget.contains(document.activeElement);
+            // Skip when nothing changed: swapping identical markup only
+            // churns the DOM and drops selection state. Compare without the
+            // client-injected CSRF hidden inputs, which the fetched document
+            // never contains.
+            if (!busy && markupWithoutCsrf(currentTarget) !== nextTarget.outerHTML) {
+              currentTarget.replaceWith(nextTarget);
+              injectCsrf(nextTarget);
+            }
           }
         }
       }

@@ -178,6 +178,28 @@ class AuthEngine:
         _LOGGER.info("Schedule evaluation timezone set to %s", tz_name)
         return True
 
+    async def apply_ha_timezone(self, tz_name: str) -> bool:
+        """
+        Apply HA's configured timezone AND persist it to the config table.
+
+        Without persistence, a restart while HA Core is down falls back to
+        TZ env / container-local time (UTC on stock HAOS) until the next
+        successful health tick — schedules would grant/deny at the wrong
+        local hours. A failed write keeps the in-memory zone; the next
+        successful health tick retries the persist.
+        """
+        if not self.set_timezone(tz_name):
+            return False
+        try:
+            await self._db.set_config("ha_timezone", tz_name)
+        except Exception:
+            _LOGGER.exception(
+                "Failed to persist timezone %s — schedules fall back to "
+                "TZ/container-local time after a restart while HA is down",
+                tz_name,
+            )
+        return True
+
     # ------------------------------------------------------------------
     # Lockdown property
     # ------------------------------------------------------------------
@@ -210,8 +232,10 @@ class AuthEngine:
             # starts while an older request drains.
             self._lockdown = True
             _LOGGER.warning("Lockdown mode ENABLED")
-            async with self._command_lock:
-                pass
+            # Write-ahead durability: persist BEFORE draining the command
+            # barrier. The barrier can be held by an in-flight physical
+            # command, and a crash/watchdog restart during that wait must
+            # not come back with lockdown OFF mid-incident.
             try:
                 await self._db.set_config("lockdown", "1")
             except Exception as exc:
@@ -220,6 +244,8 @@ class AuthEngine:
                     "Failed to persist lockdown state to config table"
                 )
                 persistence_error = exc
+            async with self._command_lock:
+                pass
         else:
             # Disable is the opposite ordering: while still under the command
             # barrier, durable state must change first. A failed write leaves

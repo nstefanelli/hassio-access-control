@@ -1089,6 +1089,68 @@ class TestAuthEngineLockdownPersistence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(writes, ["0", "1"])
         self.assertTrue(engine.lockdown)
 
+    async def test_enable_persists_before_command_barrier_drain(self) -> None:
+        """Write-ahead ordering: lockdown=1 must be durable BEFORE waiting
+        out an in-flight physical command on the global barrier. A crash or
+        watchdog restart during that (potentially long) wait previously came
+        back with lockdown OFF mid-incident."""
+        db = make_db()
+        barrier = asyncio.Lock()
+        engine = AuthEngine(
+            db=db,
+            access_client=None,
+            ha_client=make_ha(),
+            command_lock=barrier,
+        )
+        await barrier.acquire()  # simulate an in-flight physical command
+        try:
+            enable = asyncio.create_task(engine.set_lockdown(True))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            # Still blocked on the barrier, but already durable + published.
+            self.assertFalse(enable.done())
+            self.assertTrue(engine.lockdown)
+            db.set_config.assert_awaited_once_with("lockdown", "1")
+        finally:
+            barrier.release()
+        await enable
+        self.assertTrue(engine.lockdown)
+
+    async def test_enable_persist_survives_cancelled_barrier_wait(self) -> None:
+        """Cancelling an enable that is stuck behind the command barrier
+        must leave the durable row already written and memory enabled."""
+        db = make_db()
+        barrier = asyncio.Lock()
+        engine = AuthEngine(
+            db=db,
+            access_client=None,
+            ha_client=make_ha(),
+            command_lock=barrier,
+        )
+        await barrier.acquire()
+        try:
+            enable = asyncio.create_task(engine.set_lockdown(True))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            db.set_config.assert_awaited_once_with("lockdown", "1")
+            enable.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await enable
+        finally:
+            barrier.release()
+        self.assertTrue(engine.lockdown)
+        db.set_config.assert_awaited_once_with("lockdown", "1")
+
+    async def test_enable_persist_failure_keeps_memory_enabled_and_raises(self) -> None:
+        db = make_db()
+        db.set_config = AsyncMock(side_effect=OSError("disk full"))
+        engine = make_engine(db)
+
+        with self.assertRaises(RuntimeError):
+            await engine.set_lockdown(True)
+
+        self.assertTrue(engine.lockdown)
+
     async def test_enforcement_failure_surfaces_but_keeps_lockdown_enabled(self) -> None:
         db = make_db(user=make_active_user())
         enforce = AsyncMock(side_effect=RuntimeError("hub still open"))
@@ -1142,6 +1204,41 @@ class TestScheduleTimezone(unittest.TestCase):
         # line is on a different weekday, so the schedule must deny.
         self.assertTrue(engine.set_timezone(west))
         self.assertFalse(engine._check_schedule(rule))
+
+
+class TestTimezonePersistence(unittest.IsolatedAsyncioTestCase):
+    """The resolved HA timezone must survive a restart while HA Core is
+    down — otherwise schedules evaluate in container-local time (UTC on
+    stock HAOS) until the next successful health tick, granting/denying
+    at wrong local hours."""
+
+    async def test_apply_ha_timezone_sets_and_persists(self) -> None:
+        db = make_db()
+        engine = make_engine(db)
+
+        self.assertTrue(await engine.apply_ha_timezone("Europe/Berlin"))
+
+        self.assertEqual(str(engine.tz), "Europe/Berlin")
+        db.set_config.assert_awaited_once_with("ha_timezone", "Europe/Berlin")
+
+    async def test_apply_invalid_timezone_is_not_persisted(self) -> None:
+        db = make_db()
+        engine = make_engine(db)
+        before = engine.tz
+
+        self.assertFalse(await engine.apply_ha_timezone("Not/AZone"))
+
+        self.assertEqual(engine.tz, before)
+        db.set_config.assert_not_awaited()
+
+    async def test_apply_persist_failure_keeps_in_memory_zone(self) -> None:
+        db = make_db()
+        db.set_config = AsyncMock(side_effect=OSError("disk full"))
+        engine = make_engine(db)
+
+        self.assertTrue(await engine.apply_ha_timezone("Europe/Berlin"))
+
+        self.assertEqual(str(engine.tz), "Europe/Berlin")
 
 
 class TestCredentialHaUnlockSafety(unittest.IsolatedAsyncioTestCase):

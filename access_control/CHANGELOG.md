@@ -4,6 +4,84 @@ All notable changes to this app are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-08-04
+
+### Added
+
+- Home Assistant WebSocket push for bidirectional hub sync. The HA client now
+  maintains a `state_changed` WebSocket subscription (Supervisor
+  `/core/websocket`, or `/api/websocket` on a direct HA URL), authenticated
+  with the existing token and reconnecting with 5s→300s jittered backoff that
+  resets only after 30 s of stable connection; `auth_invalid` is treated as
+  transient Supervisor token rotation, not a terminal failure. Lock state
+  changes wake hub-sync reconciliation immediately through a coalesced
+  single-flight pass — an event burst across many doors collapses into one
+  pass plus at most one trailing pass — and saving lock settings likewise
+  wakes a pass, so enabling sync at runtime converges immediately. Push
+  events are wake-up hints only; authenticated readback remains authoritative.
+
+### Changed
+
+- With push available, the hub-sync 5-second HA REST poll relaxes to a
+  60-second reconciliation backstop, used only while the HA WebSocket is
+  connected, HA REST health is good, and no deferred work (pending releases,
+  failure backoffs, flap suspensions, momentary leases, app-initiated
+  markers, min-apply deferrals) is waiting; anything else returns to the full
+  five-second cadence. This replaces roughly 17,000 HA REST polls per lock
+  per day with push wakes plus a drift-bound backstop and cuts reaction
+  latency to HA-side lock changes from up to 5 s to near-immediate.
+- The app-initiated-unlock marker TTL was raised from 15 s to 75 s (backstop
+  interval plus pass slack): with a lost push event the unlock edge is first
+  observed by the next backstop pass, and an expired marker misclassified a
+  deliberate operator hold-open as an external unlock, scheduling a spurious
+  auto re-lock.
+- Hub-sync shutdown now owns the push-reconcile task: new wakes are refused,
+  the queued trailing pass is cleared, and the in-flight pass is cancelled
+  and awaited before app-owned holds are released, so a late push event can
+  never re-drive a hub from an exiting process.
+
+### Fixed
+
+Highlights of the 2026-08-04 end-to-end review remediation (31 findings
+fixed; the full report is
+[docs/END-TO-END-REVIEW-2026-08-04.md](../docs/END-TO-END-REVIEW-2026-08-04.md)):
+
+- A transiently failed hub drive of a genuine HA unlock (or Access schedule
+  mirror) no longer records the divergent observation as the confirmed
+  baseline; the next pass re-arbitrates with the original origin and retries
+  after backoff instead of misclassifying the unchanged divergence as a
+  concurrent conflict and physically re-locking the door.
+- Lockdown enable persists write-ahead, before awaiting the global
+  command-barrier drain, so a crash or watchdog restart between the
+  operator's enable and the barrier wait no longer comes back up with
+  lockdown off mid-incident.
+- Protect REST calls clear auth state and retry once on 401 instead of
+  silently returning empty lists forever after session expiry, and the
+  Protect WebSocket frame parser honors the deflate flag and decompresses
+  payloads — compressed door/ring/NFC events were previously dropped as
+  parse errors while the connection reported healthy.
+- The HA-outage fail-safe `keep_lock` is driven once per outage per pairing
+  (was once per 5-second poll: hub command plus durable write plus audit row
+  each time), and steady-state convergence skips the durable per-entity
+  write when desired state, rule, and pairing are unchanged.
+- SQLite: removed a migration cycle that rewrote the `api_keys` table on
+  every startup, set `PRAGMA synchronous=NORMAL` alongside WAL on all
+  writer connections, pruned stale never-locked-out rate-limit rows, and
+  added per-tap lookup indexes (migrations 28–29).
+
+### Security
+
+- Closed a stored XSS in the group-detail remove-member confirm by moving
+  the group name out of the inline `onsubmit` JS string into a data
+  attribute.
+- CSRF token identity now resolves with the same precedence as the
+  validators (Ingress SSO first), the session cookie is no longer re-signed
+  under Ingress, and the cookie `Secure` flag is derived from the request,
+  so plain-HTTP direct-port logins no longer loop.
+- Dependency bumps for six known CVEs: aiohttp 3.14.1 → 3.14.3
+  (CVE-2026-59881, CVE-2026-69243, CVE-2026-69244) and cryptography
+  48.0.1 → 50.0.0 (CVE-2026-69247, CVE-2026-69248, CVE-2026-69249).
+
 ## [1.7.1] - 2026-07-27
 
 ### Fixed
