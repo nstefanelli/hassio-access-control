@@ -172,6 +172,13 @@ _HA_TRANSITIONAL_STATES = frozenset({"unlocking", "locking"})
 # untrusted_state fail-closed path exactly as before this exemption existed.
 _HA_TRANSITION_GRACE = 30.0
 
+# While NO lock is opted into hub sync and nothing is held/pending, the poll
+# loop has nothing to do; re-check the lock table for a newly enabled sync on
+# this cadence instead of running the full read every 5s poll. Any tracked
+# state, an Access rule event (reconcile_location), or lockdown enforcement
+# bypasses the idle backoff entirely.
+_IDLE_RECHECK_INTERVAL = 60.0
+
 
 @dataclass(frozen=True)
 class _HubDriveResult:
@@ -304,7 +311,19 @@ class HubSyncManager:
         self._last_access_observed: dict[str, str] = {}
         self._last_access_rule: dict[str, str] = {}
         self._last_converged: dict[str, str] = {}
+        # eid → (desired, access_rule_fingerprint, pairing_signature JSON) of
+        # the last durable set_hub_sync_state write that succeeded. Lets the
+        # steady-state already_converged pass skip an identical durable write
+        # every poll; absent (startup / after clear) always writes.
+        self._last_persisted_convergence: dict[str, tuple[str, str, str]] = {}
         self._sync_state_loaded = False
+        # eid → pairing signature already driven to confirmed keep_lock during
+        # the CURRENT HA outage. Suppresses re-issuing the identical fail-safe
+        # hold (hub command + durable ownership write + access_log row) on
+        # every 5s poll for the whole outage; cleared when HA returns, and a
+        # pairing-topology change during the outage re-drives the new hubs.
+        self._ha_outage_locked: dict[str, tuple[str, ...]] = {}
+        self._ha_outage_logged = False
         # A remote Access unlock is momentary. While its durable HA relock is
         # live, do not echo HA's temporary unlocked state back as keep_unlock.
         self._access_momentary_until: dict[str, float] = {}
@@ -317,6 +336,12 @@ class HubSyncManager:
         # Event hints reduce latency. They are never trusted as proof of an
         # unsafe open; reconciliation still performs authenticated readback.
         self._dirty_locations: set[str] = set()
+        # Monotonic deadline while the manager is idle (a full pass found zero
+        # opted-in locks and no held/pending/tracked state). Until it passes,
+        # _poll_once skips the per-5s full-table read; reconcile_location and
+        # lockdown enforcement clear/bypass it so nothing safety-relevant
+        # waits on the idle recheck cadence.
+        self._idle_recheck_until = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -395,6 +420,9 @@ class HubSyncManager:
             return 0
         if location_id in self._dirty_locations:
             return 0
+        # An Access rule event is an explicit invalidation: even an idle
+        # manager must re-read the lock table for this wake-up.
+        self._idle_recheck_until = 0.0
         self._dirty_locations.add(location_id)
         try:
             return await self.poll_once()
@@ -623,6 +651,23 @@ class HubSyncManager:
                 force=True, enforcing_lockdown=enforcing_lockdown
             )
 
+        # Idle fast-path: the previous full pass proved there is nothing to
+        # sync and nothing held/pending. Skip the full lock-table read until
+        # the recheck deadline. Never taken while any state is tracked, so
+        # behavior is identical whenever any lock is (or was) synced.
+        if (
+            not enforcing_lockdown
+            and self._idle_recheck_until > time.monotonic()
+            and not self._has_tracked_sync_state()
+        ):
+            return 0
+
+        # Captured BEFORE the removed-entity cleanup below: the idle backoff
+        # may only engage on a pass that both started empty and found nothing
+        # opted in, so the first pass after a disable (which still has cleanup
+        # to do) never delays an immediate re-enable.
+        idle_candidate = not self._has_tracked_sync_state()
+
         # include_hidden so a just-hidden lock's row is still available
         # for hub resolution when we release its held-open hub below.
         all_locks = await self._db.get_all_locks(include_hidden=True)
@@ -633,6 +678,8 @@ class HubSyncManager:
             and lock.get("entity_id")
             and not lock.get("hidden")
         ]
+        if synced_rows:
+            self._idle_recheck_until = 0.0
         # Multiple legacy rows can name the same HA entity. Treat them as one
         # desired-state owner whose pairing is the union of every row, so HA is
         # sampled once and no second row is hidden by the state fast-path.
@@ -666,6 +713,19 @@ class HubSyncManager:
         await self._process_pending_releases(
             enforcing_lockdown=enforcing_lockdown
         )
+
+        if (
+            idle_candidate
+            and not synced_rows
+            and not self._has_tracked_sync_state()
+        ):
+            # Nothing opted in, nothing held, nothing pending — and the pass
+            # started that way too: back off the full lock-table read until
+            # the idle recheck deadline. The rest of this pass is a no-op
+            # over the empty synced set.
+            self._idle_recheck_until = (
+                time.monotonic() + _IDLE_RECHECK_INTERVAL
+            )
 
         if self._urgent_lockdown.is_set() and not enforcing_lockdown:
             return 0
@@ -797,6 +857,12 @@ class HubSyncManager:
             # A persistent hold-open is a lease on HA's desired state. Once HA
             # is unavailable, that lease has no trustworthy owner: reset every
             # hub we may hold instead of leaving a door open indefinitely.
+            if not self._ha_outage_logged:
+                self._ha_outage_logged = True
+                _LOGGER.warning(
+                    "Hub sync: Home Assistant unavailable — failing safe "
+                    "(keep_lock) every synced pairing until it returns"
+                )
             access_for_fail_safe = self._get_access()
             bidirectional_fail_safe = self._supports_bidirectional_access(
                 access_for_fail_safe
@@ -806,10 +872,21 @@ class HubSyncManager:
                 if bidirectional_fail_safe:
                     self._fail_safe_reset_eids.add(eid)
                     hubs = resolved_by_eid.get(eid)
-                    if hubs is not None:
-                        await self._apply_state(
-                            lock, "locked", hubs=hubs, fail_safe=True
-                        )
+                    if hubs is None:
+                        continue
+                    # One confirmed keep_lock per outage per pairing is
+                    # enough: re-issuing the identical persistent hold on
+                    # every 5s poll for a long outage is pure churn (hub
+                    # command + durable ownership write + access_log row). A
+                    # pairing change mid-outage invalidates the record so the
+                    # new hub set is still driven closed.
+                    signature = self._hub_signature(hubs)
+                    if self._ha_outage_locked.get(eid) == signature:
+                        continue
+                    if await self._apply_state(
+                        lock, "locked", hubs=hubs, fail_safe=True
+                    ):
+                        self._ha_outage_locked[eid] = signature
                 elif (
                     self._held_open.get(eid)
                     or self._applied.get(eid) == "unlocked"
@@ -820,6 +897,11 @@ class HubSyncManager:
                 force=True, enforcing_lockdown=enforcing_lockdown
             )
             return 0
+        # HA is reachable again (or was never gone): the next outage gets a
+        # fresh one-shot keep_lock drive and a fresh log line.
+        if self._ha_outage_locked or self._ha_outage_logged:
+            self._ha_outage_locked.clear()
+            self._ha_outage_logged = False
 
         poll_time = time.monotonic()
         # Always observe HA state. Backoff, flap suspension, and damping are
@@ -1905,13 +1987,14 @@ class HubSyncManager:
             if not await self._drive_ha_state(
                 lock, desired, fail_safe=fail_safe or desired == "locked"
             ):
-                self._last_ha_observed[eid] = (
-                    ha_state if valid_ha else "locked"
-                )
-                self._last_access_observed[eid] = (
-                    access_state if valid_access else "locked"
-                )
-                self._last_access_rule[eid] = access_rule
+                # Do NOT overwrite the confirmed baselines with this pass's
+                # divergent observation. Doing so made the still-divergent
+                # observation on the next pass look like "nothing changed on
+                # either side" → concurrent_conflict → locked, physically
+                # reverting a genuine unlock whose drive merely failed once.
+                # Keeping the pre-change baselines lets the next pass
+                # re-arbitrate with the original origin info and retry the
+                # same drive after the backoff.
                 # Back off retries of the unsafe direction only; a failed lock
                 # must keep retrying every poll (fail-closed) — unless it is a
                 # repeated hard rejection, which is spaced but never stopped.
@@ -1985,14 +2068,18 @@ class HubSyncManager:
                         eid,
                     )
                     return 0
-                # HA may already have moved. Keep the desired baseline absent so
-                # the next pass retries rather than treating this partial apply
-                # as a new external HA change.
-                self._last_ha_observed[eid] = ha_state
-                self._last_access_observed[eid] = (
-                    access_state if valid_access else "locked"
-                )
-                self._last_access_rule[eid] = access_rule
+                # Do NOT overwrite the confirmed baselines with this pass's
+                # divergent observation (same rationale as the failed HA drive
+                # above): recording the divergence as "confirmed" made the
+                # unchanged mismatch on the next pass read as
+                # concurrent_conflict and revert a genuine HA-origin unlock
+                # whose Access apply merely failed once. Keeping the old
+                # baselines preserves the origin info so the same drive is
+                # retried after the backoff. The one partial-apply case where
+                # this pass itself moved HA (a successful HA drive above)
+                # only happens with desired == "locked" under the fail-safe
+                # latch, which forces locked next pass regardless of
+                # baselines.
                 # Back off retries of the unsafe direction only; a failed lock
                 # must keep retrying every poll (fail-closed) — unless it is a
                 # repeated hard rejection, which is spaced but never stopped.
@@ -2029,7 +2116,12 @@ class HubSyncManager:
             if desired == "unlocked":
                 # Do not leave an unsafe state whose origin cannot survive a
                 # restart. Best-effort close both sides; durable hold ownership
-                # remains until Access confirms the safe direction.
+                # remains until Access confirms the safe direction. The latch
+                # is required: this compensation records app-owned keep_lock,
+                # and only the latch's confirmed-locked release path replaces
+                # it with lock_now — without it the keep_lock would suppress
+                # every future Access schedule until restart.
+                self._fail_safe_reset_eids.add(eid)
                 await self._drive_ha_state(lock, "locked", fail_safe=True)
                 await self._apply_state(
                     lock, "locked", hubs=hubs, fail_safe=True
@@ -2700,23 +2792,37 @@ class HubSyncManager:
         access_rule: str,
         hubs: list[dict],
     ) -> None:
-        setter = self._method(self._db, "set_hub_sync_state")
-        if setter is not None:
-            await setter(
-                entity_id=eid,
-                desired_state=desired,
-                source=source,
-                ha_state=desired,
-                access_state=desired,
-                access_rule_fingerprint=access_rule,
-                pairing_signature=json.dumps(self._hub_signature(hubs)),
-            )
+        pairing_signature = json.dumps(self._hub_signature(hubs))
+        snapshot = (desired, access_rule, pairing_signature)
+        # Steady-state no-op convergence (already_converged every 5s poll) must
+        # not cost a durable BEGIN IMMEDIATE + fsync per entity per poll. Skip
+        # the DB write when nothing the durable row records has changed since
+        # the last successful persist; the first pass after startup (or after
+        # the row was cleared) always writes because the in-memory snapshot is
+        # absent. The snapshot is recorded only after the setter succeeds, so a
+        # failed write is retried on the next pass.
+        if self._last_persisted_convergence.get(eid) != snapshot:
+            setter = self._method(self._db, "set_hub_sync_state")
+            if setter is not None:
+                await setter(
+                    entity_id=eid,
+                    desired_state=desired,
+                    source=source,
+                    ha_state=desired,
+                    access_state=desired,
+                    access_rule_fingerprint=access_rule,
+                    pairing_signature=pairing_signature,
+                )
+            self._last_persisted_convergence[eid] = snapshot
         self._last_ha_observed[eid] = desired
         self._last_access_observed[eid] = desired
         self._last_access_rule[eid] = access_rule
         self._last_converged[eid] = desired
 
     async def _clear_persisted_convergence(self, eid: str) -> None:
+        # The durable row is gone (or about to be); the next convergence for
+        # this entity must write unconditionally.
+        self._last_persisted_convergence.pop(eid, None)
         clearer = self._method(self._db, "clear_hub_sync_state")
         if clearer is not None:
             await clearer(eid)
@@ -2902,6 +3008,28 @@ class HubSyncManager:
                     self._applied[eid] = "locked"
         return reset_count
 
+    def _has_tracked_sync_state(self) -> bool:
+        """Return whether ANY entity still has sync state worth a full pass.
+
+        Deliberately conservative (raw key presence, including empty held
+        lists): the idle fast-path in _poll_once may only engage when every
+        one of these is empty, so a synced/held/pending/latched entity always
+        gets the normal per-poll pass.
+        """
+        return bool(
+            self._applied
+            or self._held_open
+            or self._held_locked
+            or self._pending_release
+            or self._pairing_signature
+            or self._paired_hubs
+            or self._last_converged
+            or self._fail_safe_reset_eids
+            or self._lockdown_reset
+            or self._lockdown_unresolved
+            or self._ha_outage_locked
+        )
+
     def _drop_tracking(self, eid: str) -> None:
         self._applied.pop(eid, None)
         self._pairing_signature.pop(eid, None)
@@ -2918,6 +3046,8 @@ class HubSyncManager:
         self._last_access_observed.pop(eid, None)
         self._last_access_rule.pop(eid, None)
         self._last_converged.pop(eid, None)
+        self._last_persisted_convergence.pop(eid, None)
+        self._ha_outage_locked.pop(eid, None)
         self._access_momentary_until.pop(eid, None)
         self._app_initiated_until.pop(eid, None)
         self._ha_transition_started.pop(eid, None)

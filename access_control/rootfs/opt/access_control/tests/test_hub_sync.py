@@ -568,6 +568,39 @@ class TestOptIn(unittest.TestCase):
             access.unlock_persistent.assert_awaited_once_with("dev-hub-1")
         _run(go())
 
+    def test_idle_manager_backs_off_lock_table_reads(self) -> None:
+        """With the feature off for every lock and nothing held/pending, the
+        5s poll must not run the full lock-table read every pass — it backs
+        off to the idle recheck cadence until something invalidates it."""
+        async def go():
+            plain = dict(HA_LOCK, sync_hub_state=0)
+            db = _make_db([plain, HUB], location_map={"loc-1": [HUB]})
+            ha = _make_ha({"lock.front": "locked"})
+            mgr = _make_mgr(db, ha, _make_access())
+
+            await mgr.poll_once()
+            self.assertEqual(db.get_all_locks.await_count, 1)
+            # Polls inside the idle window skip the full read entirely.
+            for _ in range(5):
+                self.assertEqual(await mgr.poll_once(), 0)
+            self.assertEqual(db.get_all_locks.await_count, 1)
+
+            # An Access rule event invalidates the backoff immediately.
+            await mgr.reconcile_location(
+                "loc-1", "access.unlock_schedule.activate"
+            )
+            self.assertEqual(db.get_all_locks.await_count, 2)
+
+            # Once a lock opts in, behavior is identical to before: the full
+            # pass (and its DB read) runs on every poll again.
+            db.get_all_locks = AsyncMock(return_value=[HA_LOCK, HUB])
+            mgr._idle_recheck_until = 0.0  # idle deadline elapsed
+            self.assertEqual(await mgr.poll_once(), 1)  # converges
+            await mgr.poll_once()
+            await mgr.poll_once()
+            self.assertEqual(db.get_all_locks.await_count, 3)
+        _run(go())
+
 
 class TestLockdown(unittest.TestCase):
     def test_lockdown_flip_during_durable_write_never_sends_unlock(self) -> None:
@@ -1599,6 +1632,161 @@ class TestBidirectionalConvergence(unittest.TestCase):
             self.assertEqual(await mgr.poll_once(), 1)
             self.assertEqual(states["lock.front"], "unlocked")
             ha.unlock.assert_awaited_once_with("lock.front")
+        _run(go())
+
+
+class TestFailedDriveKeepsOriginBaselines(unittest.TestCase):
+    """A failed drive must NOT record the divergent observation as the
+    confirmed baseline. Doing so made the identical observation on the next
+    pass read as "neither side changed" → concurrent_conflict → locked,
+    physically reverting a genuine unlock whose drive merely failed once."""
+
+    def _fixture(self, *, ha_state="locked", rule="reset", door_state="locked"):
+        ha_states = {"lock.front": ha_state}
+        access_rules = {"dev-hub-1": {"type": rule}}
+        access_states = {"dev-hub-1": door_state}
+        db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+        ha = _make_bidirectional_ha(ha_states)
+        access = _make_bidirectional_access(access_rules, access_states)
+        mgr = _make_mgr(db, ha, access)
+        return mgr, ha, access, ha_states, access_rules, access_states
+
+    def test_failed_access_apply_of_ha_unlock_is_retried_not_reverted(self) -> None:
+        async def go():
+            mgr, ha, access, states, rules, _access_states = self._fixture()
+            await mgr.poll_once()  # confirmed locked baseline
+
+            # Genuine HA-origin unlock; the Access hold fails transiently.
+            states["lock.front"] = "unlocked"
+            real_hold = access.hold_unlocked.side_effect
+            access.hold_unlocked = AsyncMock(side_effect=RuntimeError("hub 502"))
+            old_delay = hs_module._APPLY_RETRY_DELAY
+            hs_module._APPLY_RETRY_DELAY = 0.0
+            try:
+                _clear_damping(mgr)
+                self.assertEqual(await mgr.poll_once(), 0)
+            finally:
+                hs_module._APPLY_RETRY_DELAY = old_delay
+            # The divergent observation must not become the baseline; the
+            # unsafe direction is merely backed off.
+            self.assertEqual(mgr._last_ha_observed.get("lock.front"), "locked")
+            self.assertEqual(
+                mgr._last_access_observed.get("lock.front"), "locked"
+            )
+            self.assertIn("lock.front", mgr._backoff_until)
+
+            access.hold_unlocked = AsyncMock(side_effect=real_hold)
+
+            # While the backoff is pending nothing is driven — above all the
+            # genuine unlock must not be reverted (the old code re-locked
+            # both sides here via concurrent_conflict).
+            _clear_damping(mgr)
+            self.assertEqual(await mgr.poll_once(), 0)
+            self.assertEqual(states["lock.front"], "unlocked")
+            ha.lock.assert_not_awaited()
+            access.hold_locked.assert_not_awaited()
+
+            # After the backoff the SAME HA-origin unlock is retried.
+            mgr._backoff_until.clear()
+            _clear_damping(mgr)
+            self.assertEqual(await mgr.poll_once(), 1)
+            self.assertEqual(states["lock.front"], "unlocked")
+            self.assertEqual(rules["dev-hub-1"]["type"], "keep_unlock")
+            ha.lock.assert_not_awaited()
+            access.hold_locked.assert_not_awaited()
+        _run(go())
+
+    def test_failed_ha_mirror_of_access_schedule_is_retried_not_overridden(self) -> None:
+        async def go():
+            mgr, ha, access, states, rules, access_states = self._fixture()
+            await mgr.poll_once()  # confirmed locked baseline
+
+            # A genuine Access schedule opens the native door...
+            rules["dev-hub-1"] = {"type": "schedule"}
+            access_states["dev-hub-1"] = "unlocked"
+            # ...but the HA mirror is not accepted this pass.
+            real_unlock = ha.unlock.side_effect
+            ha.unlock = AsyncMock(return_value=False)
+            _clear_damping(mgr)
+            self.assertEqual(await mgr.poll_once(), 0)
+            self.assertEqual(mgr._last_ha_observed.get("lock.front"), "locked")
+            self.assertEqual(
+                mgr._last_access_observed.get("lock.front"), "locked"
+            )
+            self.assertIn("lock.front", mgr._backoff_until)
+
+            # HA recovers; after the backoff the schedule is mirrored open —
+            # never overridden closed as a concurrent_conflict.
+            ha.unlock = AsyncMock(side_effect=real_unlock)
+            mgr._backoff_until.clear()
+            _clear_damping(mgr)
+            self.assertEqual(await mgr.poll_once(), 1)
+            self.assertEqual(states["lock.front"], "unlocked")
+            self.assertEqual(rules["dev-hub-1"]["type"], "schedule")
+            ha.lock.assert_not_awaited()
+            access.hold_locked.assert_not_awaited()
+            access.force_lock.assert_not_awaited()
+        _run(go())
+
+    def test_persist_failure_compensation_latches_and_releases_keep_lock(self) -> None:
+        """When _persist_convergence fails after an unlocked convergence, the
+        compensating keep_lock must engage the fail-safe latch so it is later
+        replaced by lock_now instead of suppressing every future Access
+        schedule until restart."""
+        async def go():
+            mgr, _ha, _access, states, rules, _access_states = self._fixture()
+            mgr._db.get_hub_sync_states = AsyncMock(return_value=[])
+            mgr._db.set_hub_sync_state = AsyncMock()
+            await mgr.poll_once()  # confirmed locked baseline
+
+            states["lock.front"] = "unlocked"
+            mgr._db.set_hub_sync_state = AsyncMock(
+                side_effect=RuntimeError("db degraded")
+            )
+            _clear_damping(mgr)
+            self.assertEqual(await mgr.poll_once(), 0)
+            # Compensation closed both sides with app-owned keep_lock AND
+            # engaged the latch that owns its eventual replacement.
+            self.assertEqual(states["lock.front"], "locked")
+            self.assertEqual(rules["dev-hub-1"]["type"], "keep_lock")
+            self.assertEqual(mgr.fail_safe_pending, ("lock.front",))
+
+            # DB recovers: the confirmed-locked release path replaces the
+            # keep_lock (schedules become possible again) and drops the latch.
+            mgr._db.set_hub_sync_state = AsyncMock()
+            _clear_damping(mgr)
+            await mgr.poll_once()
+            self.assertNotEqual(rules["dev-hub-1"]["type"], "keep_lock")
+            self.assertEqual(mgr.fail_safe_pending, ())
+            self.assertEqual(mgr._held_locked.get("lock.front", []), [])
+        _run(go())
+
+    def test_ha_outage_fail_safe_drives_once_per_outage(self) -> None:
+        """While HA is disconnected, the bidirectional branch fail-safes each
+        pairing ONCE per outage — not one hub command + durable ownership
+        write + access_log row per 5s poll for the whole outage."""
+        async def go():
+            mgr, ha, access, _states, _rules, _access_states = self._fixture()
+            await mgr.poll_once()  # confirmed locked baseline
+
+            ha.connected = False
+            for _ in range(5):
+                self.assertEqual(await mgr.poll_once(), 0)
+            self.assertEqual(access.hold_locked.await_count, 1)
+            self.assertEqual(mgr._db.record_hub_sync_hold.await_count, 1)
+            self.assertEqual(mgr._db.log_access.await_count, 1)
+
+            # HA returns: the latch replaces keep_lock through the normal
+            # confirmed-locked release and the outage record clears...
+            ha.connected = True
+            await mgr.poll_once()
+            self.assertEqual(mgr._ha_outage_locked, {})
+            self.assertEqual(mgr.fail_safe_pending, ())
+
+            # ...so the NEXT outage earns a fresh one-shot fail-safe drive.
+            ha.connected = False
+            await mgr.poll_once()
+            self.assertEqual(access.hold_locked.await_count, 2)
         _run(go())
 
 
