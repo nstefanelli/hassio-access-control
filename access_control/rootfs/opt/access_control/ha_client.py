@@ -81,6 +81,10 @@ class HAClient:
         # affect neither.
         self._ws_task: asyncio.Task | None = None
         self._ws_running = False
+        # Counts in-flight stop_websocket() calls: while non-zero a
+        # start_websocket() must not spin up a new loop, or the stop that is
+        # awaiting the old task would null the fresh reference and orphan it.
+        self._ws_stopping = 0
         self._ws_connected = False
         self._on_state_changed: (
             Callable[[str, str | None, str | None], Awaitable[None]] | None
@@ -485,12 +489,17 @@ class HAClient:
 
         Idempotent — re-registering replaces the callback; if the WS task is
         already running it keeps running. Starting on a closed/closing client
-        is a no-op.
+        or while a stop_websocket() is still in flight is a no-op.
         """
         if self._closing or self._closed:
             _LOGGER.debug("HA client is closed — ignoring start_websocket")
             return
         self._on_state_changed = on_state_changed
+        if self._ws_stopping:
+            # A stop is mid-await on the old task; starting now would let that
+            # stop null our fresh task reference and orphan the loop.
+            _LOGGER.debug("stop_websocket in progress — ignoring start_websocket")
+            return
         if self._ws_task is not None and not self._ws_task.done():
             return
         self._ws_running = True
@@ -502,14 +511,21 @@ class HAClient:
         self._ws_running = False
         task = self._ws_task
         if task is not None:
-            task.cancel()
+            self._ws_stopping += 1
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                _LOGGER.exception("HA WebSocket task raised during shutdown")
-            self._ws_task = None
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    _LOGGER.exception("HA WebSocket task raised during shutdown")
+                # Only clear the reference we captured — never a task some
+                # concurrent start created (that would orphan its loop).
+                if self._ws_task is task:
+                    self._ws_task = None
+            finally:
+                self._ws_stopping -= 1
         self._ws_connected = False
         _LOGGER.debug("HA WebSocket listener task stopped")
 
@@ -545,8 +561,11 @@ class HAClient:
             if self._ws_running and not self._closing and not self._closed:
                 _LOGGER.debug("HA WebSocket reconnecting in %.0fs", delay)
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, _WS_MAX_RECONNECT_DELAY) * (
-                    0.75 + secrets.SystemRandom().random() * 0.5
+                # Clamp AFTER jitter so the sleep can never exceed
+                # _WS_MAX_RECONNECT_DELAY (jitter-after-clamp allowed 375s).
+                delay = min(
+                    delay * 2 * (0.75 + secrets.SystemRandom().random() * 0.5),
+                    _WS_MAX_RECONNECT_DELAY,
                 )
 
     async def _ws_connect(self) -> None:
@@ -677,13 +696,17 @@ class HAClient:
     # ------------------------------------------------------------------
 
     async def _close_impl(self) -> None:
-        # Stop push delivery first so no state_changed callback fires into an
-        # app that is tearing this client down, then drain leased operations.
-        await self.stop_websocket()
+        # Latch _closing FIRST (under the lifecycle lock) so a concurrent
+        # start_websocket cannot slip past the closed guard and spin up a
+        # loop this close would never stop — same ordering as AccessClient.
         async with self._lifecycle:
             if self._closed:
                 return
             self._closing = True
+        # Now stop push delivery so no state_changed callback fires into an
+        # app that is tearing this client down, then drain leased operations.
+        await self.stop_websocket()
+        async with self._lifecycle:
             while self._active_operations:
                 await self._lifecycle.wait()
             self._closed = True

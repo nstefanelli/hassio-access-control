@@ -279,6 +279,36 @@ class TestHandshakeAndDispatch(_WSTestCase):
         ws.ack_subscribe()
         await _wait_for(lambda: client.ws_connected)
 
+    async def test_handshake_ignores_stray_frames_before_subscribe_ack(self) -> None:
+        # WSR-4a: a stray event frame and an off-id result frame arriving
+        # between auth_ok and the subscribe ack must not complete (or fail)
+        # the handshake — it keeps waiting and still succeeds on the real ack.
+        ws = FakeHAWebSocket(keep_open=True, auto_ack_subscribe=False)
+        client = self.make_client(lambda: ws)
+        recorder = Recorder()
+        client.start_websocket(recorder)
+
+        # Authenticated, subscribe sent, handshake now awaiting the ack.
+        await _wait_for(lambda: len(ws.sent) == 2)
+        ws.feed_json(state_changed_event("lock.front_door", "locked", "unlocked"))
+        ws.feed_json({"id": 99, "type": "result", "success": False})
+        # Give the handshake loop time to consume (and ignore) the strays.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        self.assertFalse(client.ws_connected)
+        self.assertIsNotNone(client._ws_task)
+        self.assertFalse(client._ws_task.done())
+
+        # The genuine ack still completes the handshake.
+        ws.ack_subscribe()
+        await _wait_for(lambda: client.ws_connected)
+        # Frames consumed mid-handshake were ignored, not dispatched.
+        self.assertEqual(recorder.calls, [])
+        # And the pump works normally afterwards.
+        ws.feed_json(state_changed_event("lock.side_door", None, "locked"))
+        await _wait_for(lambda: len(recorder.calls) == 1)
+        self.assertEqual(recorder.calls, [("lock.side_door", None, "locked")])
+
     async def test_url_derivation_direct_vs_supervisor(self) -> None:
         cases = [
             ("http://supervisor/core", "ws://supervisor/core/websocket"),
@@ -477,6 +507,35 @@ class TestReconnectBackoff(_WSTestCase):
         # every time instead of latching a permanent auth failure.
         self.assertEqual(attempts, 4)
 
+    async def test_ws_connect_client_error_backs_off_and_retries(self) -> None:
+        # WSR-4b: ws_connect itself raising aiohttp.ClientError (connection
+        # refused, DNS, etc.) is a normal cycle failure — the loop backs off
+        # and retries until a connect succeeds.
+        attempts = 0
+        good_ws = FakeHAWebSocket(keep_open=True)
+
+        def factory():
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 2:
+                return aiohttp.ClientError("connection refused")
+            return good_ws
+
+        client = self.make_client(factory)
+        with patch(f"{_MODULE}._WS_RECONNECT_DELAY", 0.01):
+            with self.assertLogs(_MODULE, level="DEBUG") as logs:
+                client.start_websocket(Recorder())
+                await _wait_for(lambda: client.ws_connected)
+        # Two failed dials then the successful one.
+        self.assertEqual(attempts, 3)
+        self.assertEqual(len(client._session.ws_urls), 3)
+        self.assertTrue(
+            any("HA WebSocket cycle failed" in line for line in logs.output)
+        )
+        self.assertTrue(
+            any("HA WebSocket reconnecting" in line for line in logs.output)
+        )
+
     async def test_loop_exits_promptly_when_client_closing(self) -> None:
         client = self.make_client(lambda: FakeHAWebSocket())
 
@@ -515,6 +574,82 @@ class TestLifecycle(_WSTestCase):
         self.assertFalse(client.ws_connected)
         self.assertTrue(ws.closed)
 
+    async def test_start_during_inflight_stop_does_not_orphan_task(self) -> None:
+        # WSR-1: stop_websocket awaits the old task; a start_websocket landing
+        # in that await window must be a no-op — otherwise stop would null the
+        # fresh reference and orphan the new loop.
+        client = self.make_client(lambda: FakeHAWebSocket(keep_open=True))
+        cancelled = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_shutdown():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()  # hold stop_websocket in its await window
+                raise
+
+        old_task = asyncio.create_task(slow_shutdown())
+        client._ws_running = True
+        client._ws_task = old_task
+        stop_task = asyncio.create_task(client.stop_websocket())
+        await asyncio.wait_for(cancelled.wait(), timeout=2)
+
+        # stop is parked awaiting old_task: a start now must not create a
+        # second loop task that the finishing stop would orphan.
+        client.start_websocket(Recorder())
+        self.assertIs(client._ws_task, old_task)
+
+        release.set()
+        await asyncio.wait_for(stop_task, timeout=2)
+        self.assertIsNone(client._ws_task)
+        self.assertEqual(client._ws_stopping, 0)
+        self.assertFalse(client.ws_connected)
+
+        # After the stop fully completes, starting works normally again.
+        client.start_websocket(Recorder())
+        self.assertIsNotNone(client._ws_task)
+        await _wait_for(lambda: client.ws_connected)
+
+    async def test_stop_only_clears_its_own_task_reference(self) -> None:
+        # WSR-1 (reference guard): even if a newer task somehow occupies
+        # _ws_task while a stale stop finishes, the stale stop must not null
+        # a reference it did not capture.
+        client = self.make_client(lambda: FakeHAWebSocket(keep_open=True))
+        cancelled = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_shutdown():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+                raise
+
+        old_task = asyncio.create_task(slow_shutdown())
+        client._ws_running = True
+        client._ws_task = old_task
+        stop_task = asyncio.create_task(client.stop_websocket())
+        await asyncio.wait_for(cancelled.wait(), timeout=2)
+
+        async def replacement():
+            await asyncio.Event().wait()
+
+        new_task = asyncio.create_task(replacement())
+        client._ws_task = new_task  # simulates a racing (re)start
+        release.set()
+        await asyncio.wait_for(stop_task, timeout=2)
+        self.assertIs(client._ws_task, new_task)  # not nulled by the stale stop
+
+        new_task.cancel()
+        try:
+            await new_task
+        except asyncio.CancelledError:
+            pass
+        client._ws_task = None
+
     async def test_close_stops_websocket(self) -> None:
         ws = FakeHAWebSocket(keep_open=True)
         client = self.make_client(lambda: ws)
@@ -529,6 +664,57 @@ class TestLifecycle(_WSTestCase):
         self.assertIsNone(client._ws_task)
         self.assertTrue(ws.closed)
         self.assertTrue(session.closed)
+
+    async def test_close_latches_closing_before_stopping_websocket(self) -> None:
+        # WSR-2 (ordering): _close_impl must set _closing BEFORE stopping the
+        # WS, so a concurrent start_websocket cannot pass the closed guard and
+        # spin up a loop the close never stops.
+        ws = FakeHAWebSocket(keep_open=True)
+        client = self.make_client(lambda: ws)
+        client.start_websocket(Recorder())
+        await _wait_for(lambda: client.ws_connected)
+
+        seen: dict = {}
+        orig_stop = client.stop_websocket
+
+        async def spying_stop():
+            seen["closing_at_stop"] = client._closing
+            await orig_stop()
+
+        client.stop_websocket = spying_stop
+        await asyncio.wait_for(client.close(), timeout=2)
+        self.assertIs(seen.get("closing_at_stop"), True)
+        self.assertTrue(client._closed)
+        self.assertIsNone(client._ws_task)
+
+    async def test_start_websocket_during_close_is_noop(self) -> None:
+        # WSR-2 (regression): a start_websocket landing while close() is in
+        # flight (here: blocked draining an operation lease, after the WS was
+        # already stopped) must be refused — no loop may outlive the close.
+        ws = FakeHAWebSocket(keep_open=True)
+        client = self.make_client(lambda: ws)
+        client.start_websocket(Recorder())
+        await _wait_for(lambda: client.ws_connected)
+
+        # Hold a lease so close blocks in its drain phase.
+        async with client._lifecycle:
+            client._active_operations += 1
+        close_task = asyncio.create_task(client.close())
+        await _wait_for(lambda: client._closing and client._ws_task is None)
+        self.assertFalse(client._closed)  # close is genuinely mid-flight
+
+        client.start_websocket(Recorder())
+        self.assertIsNone(client._ws_task)
+        self.assertFalse(client._ws_running)
+        self.assertFalse(client.ws_connected)
+
+        async with client._lifecycle:
+            client._active_operations -= 1
+            client._lifecycle.notify_all()
+        await asyncio.wait_for(close_task, timeout=2)
+        self.assertTrue(client._closed)
+        self.assertIsNone(client._ws_task)
+        self.assertTrue(ws.closed)
 
     async def test_start_on_closed_client_is_a_noop(self) -> None:
         client = self.make_client(lambda: FakeHAWebSocket(keep_open=True))
