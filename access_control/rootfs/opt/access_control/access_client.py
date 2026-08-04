@@ -87,6 +87,12 @@ _LOCKED_RULE_TYPES = frozenset({"keep_lock", "lock_early", "lock_now"})
 
 WS_RECONNECT_DELAY = 5  # seconds
 
+# Only reset the reconnect backoff after the socket stayed up this long. A
+# server that accepts the upgrade and then immediately closes used to reset
+# the delay to the 5s base every cycle — fixed 5s churn (plus a per-cycle
+# identity re-verification) forever instead of backing off.
+_WS_STABLE_CONNECTION_SECS = 30.0
+
 
 class AccessClientError(Exception):
     """Raised for errors communicating with the UniFi Access API.
@@ -949,7 +955,23 @@ class AccessClient:
         """
         resp = await self._request("GET", API_BOOTSTRAP)
         async with resp:
-            return await resp.json(content_type=None)
+            try:
+                payload = await resp.json(content_type=None)
+            except (aiohttp.ClientError, TypeError, ValueError) as exc:
+                raise AccessClientError(
+                    "UniFi Access returned invalid JSON for topology"
+                ) from exc
+        # This API family answers with either a top-level list or a
+        # {"data": [...]} envelope (see fetch_users). Anything else —
+        # including {"data": null} — must fail here, not crash topology
+        # sync with a raw AttributeError deep in the walkers.
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            return payload
+        raise AccessClientError(
+            "UniFi Access returned an invalid topology envelope"
+        )
 
     async def fetch_users(self) -> List[dict]:
         """
@@ -995,6 +1017,19 @@ class AccessClient:
     # Topology parsing
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _iter_dicts(value: object):
+        """Yield only the dict rows of a list, tolerating any other shape.
+
+        Firmware has produced null/non-list levels in the topology tree;
+        mirroring fetch_users' guards keeps a malformed row from crashing
+        topology sync with a raw AttributeError/TypeError.
+        """
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    yield item
+
     def parse_doors_and_devices(self, bootstrap: dict) -> List[dict]:
         """
         Extract door/hub device entries from a topology bootstrap response.
@@ -1015,16 +1050,25 @@ class AccessClient:
         """
         results = []
 
-        raw = bootstrap if isinstance(bootstrap, list) else bootstrap.get("data", [])
+        raw = (
+            bootstrap
+            if isinstance(bootstrap, list)
+            else bootstrap.get("data", [])
+            if isinstance(bootstrap, dict)
+            else []
+        )
 
-        for building in raw:
-            for floor in building.get("floors", []):
-                for door in floor.get("doors", []):
+        for building in self._iter_dicts(raw):
+            for floor in self._iter_dicts(building.get("floors", [])):
+                for door in self._iter_dicts(floor.get("doors", [])):
                     door_id = door.get("unique_id", "")
                     door_name = door.get("name", "")
 
-                    for device_group in door.get("device_groups", []):
-                        for device in device_group:
+                    device_groups = door.get("device_groups", [])
+                    if not isinstance(device_groups, list):
+                        continue
+                    for device_group in device_groups:
+                        for device in self._iter_dicts(device_group):
                             device_type = device.get("device_type", "")
                             if device_type not in SUPPORTED_DEVICE_TYPES:
                                 continue
@@ -1054,16 +1098,25 @@ class AccessClient:
             List of dicts with keys: id, name (for use in entry-device dropdowns).
         """
         locations = []
-        raw = bootstrap if isinstance(bootstrap, list) else bootstrap.get("data", [])
+        raw = (
+            bootstrap
+            if isinstance(bootstrap, list)
+            else bootstrap.get("data", [])
+            if isinstance(bootstrap, dict)
+            else []
+        )
 
-        for building in raw:
-            for floor in building.get("floors", []):
-                for door in floor.get("doors", []):
+        for building in self._iter_dicts(raw):
+            for floor in self._iter_dicts(building.get("floors", [])):
+                for door in self._iter_dicts(floor.get("doors", [])):
                     door_id = door.get("unique_id", "")
                     # Use the alias of the first device as a friendlier name, or the door name
                     door_name = door.get("name", door_id)
-                    for device_group in door.get("device_groups", []):
-                        for device in device_group:
+                    device_groups = door.get("device_groups", [])
+                    if not isinstance(device_groups, list):
+                        device_groups = []
+                    for device_group in device_groups:
+                        for device in self._iter_dicts(device_group):
                             alias = device.get("alias") or device.get("name", "")
                             if alias:
                                 door_name = alias
@@ -1373,6 +1426,13 @@ class AccessClient:
             raise error from last_error
         raise error
 
+    async def _release_operation_lease(self) -> None:
+        """Decrement the lease count and wake a draining close()."""
+        async with self._lifecycle:
+            self._active_operations -= 1
+            if self._active_operations == 0:
+                self._lifecycle.notify_all()
+
     @asynccontextmanager
     async def _operation_lease(self):
         """Prevent close() from retiring sessions during command readback."""
@@ -1383,10 +1443,11 @@ class AccessClient:
         try:
             yield
         finally:
-            async with self._lifecycle:
-                self._active_operations -= 1
-                if self._active_operations == 0:
-                    self._lifecycle.notify_all()
+            # The release must survive a cancellation delivered while waiting
+            # on the lifecycle lock — an abandoned decrement would leak the
+            # lease count and hang _close_impl's drain loop forever. shield()
+            # lets the inner task finish even if this awaiter is cancelled.
+            await asyncio.shield(self._release_operation_lease())
 
     async def _write_rule_and_confirm(
         self,
@@ -1819,8 +1880,20 @@ class AccessClient:
         """Fetch all visitors from UniFi Access."""
         resp = await self._request("GET", "/proxy/access/api/v2/visitors")
         async with resp:
-            data = await resp.json(content_type=None)
+            try:
+                data = await resp.json(content_type=None)
+            except (aiohttp.ClientError, TypeError, ValueError) as exc:
+                raise AccessClientError(
+                    "UniFi Access returned invalid JSON for visitor list"
+                ) from exc
+        # This API family answers with either a top-level list or a
+        # {"data": [...]} envelope (see fetch_users); null or any other
+        # shape must raise AccessClientError, not a raw AttributeError.
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("data", []), list):
             return data.get("data", [])
+        raise AccessClientError("UniFi Access returned an invalid visitor list")
 
     # ------------------------------------------------------------------
     # User management
@@ -1955,16 +2028,22 @@ class AccessClient:
         max_delay: float = 300.0  # 5 minutes max
         ws_401_count = 0  # consecutive WS-upgrade 401s; see _ws_connect
 
+        loop = asyncio.get_running_loop()
         while self._running:
             if self._auth_permanently_failed:
                 logger.error("Auth permanently failed — WebSocket will not reconnect")
                 break
             try:
+                attempt_started = loop.time()
                 await self._ws_connect()
                 # If we get here, connection was established and then closed normally
                 self._reconnect_count += 1  # connection closed normally, will reconnect
-                delay = float(WS_RECONNECT_DELAY)  # reset on success
-                ws_401_count = 0
+                # Only reset the backoff when the connection actually stayed
+                # up; an accept-then-immediate-close server must keep
+                # doubling toward the max, not churn at the 5s base forever.
+                if loop.time() - attempt_started >= _WS_STABLE_CONNECTION_SECS:
+                    delay = float(WS_RECONNECT_DELAY)  # reset on stable success
+                ws_401_count = 0  # successful upgrade — auth is fine
             except asyncio.CancelledError:
                 break
             except aiohttp.ClientResponseError as exc:
@@ -1981,12 +2060,17 @@ class AccessClient:
                         )
                         self._auth_permanently_failed = True
                         break
+                else:
+                    # A non-401 upstream error breaks any 401 streak — only
+                    # genuinely consecutive upgrade-401s may trip the latch.
+                    ws_401_count = 0
                 logger.warning(
                     "Access WebSocket returned HTTP %d — retrying in %.0fs",
                     exc.status,
                     delay,
                 )
             except Exception as exc:
+                ws_401_count = 0  # non-401 failure — the 401s were not consecutive
                 # Some aiohttp exception strings embed the complete request
                 # URL, whose query contains the Access CSRF credential.
                 logger.error(

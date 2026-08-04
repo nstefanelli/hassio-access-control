@@ -8,6 +8,7 @@ import secrets
 import re
 import ssl
 import struct
+import zlib
 from typing import Callable, List, Optional
 
 import aiohttp
@@ -19,6 +20,17 @@ API_CAMERAS = "/proxy/protect/api/cameras"
 API_WS = "/proxy/protect/ws/updates"
 
 WS_RECONNECT_DELAY = 5  # base delay, exponential backoff up to 300s
+
+# Only reset the reconnect backoff after the socket stayed up this long. A
+# server that accepts the upgrade and then immediately drops the connection
+# used to reset the delay to the 5s base on every cycle, churning forever at
+# a fixed cadence instead of backing off.
+_WS_STABLE_CONNECTION_SECS = 30.0
+
+# After this many un-parseable WS frames on one connection, escalate the
+# parse-error log from warning to error — a healthy-looking ws_connected with
+# every event dropped is otherwise invisible.
+_WS_PARSE_FAILURE_ESCALATE = 5
 
 # Bound REST calls — aiohttp defaults to no total timeout, so a half-open
 # socket to the UNVR would hang login()/get_cameras() indefinitely (login
@@ -45,6 +57,8 @@ class ProtectClient:
         self._login_lock: asyncio.Lock = asyncio.Lock()
         self._last_event_at: float = 0.0
         self._reconnect_count: int = 0
+        self._closed = False
+        self._ws_parse_failures: int = 0
 
         # See AccessClient.__init__ for the full TLS-trust trade-off
         # discussion. Short version: UNVR ships self-signed certs; we
@@ -70,6 +84,11 @@ class ProtectClient:
         return self._reconnect_count
 
     def _get_session(self) -> aiohttp.ClientSession:
+        # A concurrent REST call resuming after close() must not silently
+        # recreate the session (leaking it) and re-log-in with retired
+        # credentials. Mirrors AccessClient._get_session / HAClient.
+        if self._closed:
+            raise RuntimeError("UniFi Protect client is closed")
         if self._session is None or self._session.closed:
             jar = aiohttp.CookieJar(unsafe=True)
             connector = aiohttp.TCPConnector(ssl=self._ssl_ctx)
@@ -81,6 +100,8 @@ class ProtectClient:
 
     async def login(self) -> None:
         """Authenticate to the UNVR console (shared with Access)."""
+        if self._closed:
+            raise RuntimeError("UniFi Protect client is closed")
         async with self._login_lock:
             # Concurrent-login short-circuit (mirrors AccessClient.login). Two
             # callers can both find ``connected`` false and queue on the lock;
@@ -141,18 +162,44 @@ class ProtectClient:
             h["Cookie"] = f"TOKEN={self._auth_cookie}"
         return h
 
-    async def get_cameras(self) -> list[dict]:
-        """Fetch all cameras, return list of {id, name, type, is_doorbell, connected}."""
+    async def _rest_get(self, path: str):
+        """Authenticated REST GET with one 401 re-auth retry.
+
+        Mirrors AccessClient._request: ``connected`` only tracks the CSRF
+        token, which a REST 401 never clears, so an expired UNVR session
+        would otherwise return empty results forever without ever
+        re-authenticating. Returns the decoded JSON, or None on a non-200
+        response (logged with its status).
+        """
         if not self.connected:
             await self.login()
         session = self._get_session()
-        async with session.get(
-            self._base_url() + API_CAMERAS,
-            headers=self._headers(), ssl=self._ssl_ctx, timeout=_HTTP_TIMEOUT,
-        ) as resp:
-            if resp.status != 200:
-                return []
-            cameras = await resp.json(content_type=None)
+        for attempt in range(2):
+            async with session.get(
+                self._base_url() + path,
+                headers=self._headers(), ssl=self._ssl_ctx, timeout=_HTTP_TIMEOUT,
+            ) as resp:
+                if resp.status == 401 and attempt == 0:
+                    _LOGGER.warning(
+                        "Protect REST 401 from %s — re-authenticating", path
+                    )
+                    self._csrf_token = None
+                    self._auth_cookie = None
+                    await self.login()
+                    continue
+                if resp.status != 200:
+                    _LOGGER.warning(
+                        "Protect REST %s returned HTTP %d", path, resp.status
+                    )
+                    return None
+                return await resp.json(content_type=None)
+        return None  # unreachable — kept for symmetry with the retry loop
+
+    async def get_cameras(self) -> list[dict]:
+        """Fetch all cameras, return list of {id, name, type, is_doorbell, connected}."""
+        cameras = await self._rest_get(API_CAMERAS)
+        if cameras is None:
+            return []
 
         # Defensive: the endpoint normally returns a JSON array, but an error
         # object or {"data": [...]} wrapper (firmware change) would make the
@@ -217,15 +264,21 @@ class ProtectClient:
         max_delay: float = 300.0
         ws_401_count = 0  # consecutive WS-upgrade 401s; see _ws_connect
 
+        loop = asyncio.get_running_loop()
         while self._running:
             if self._auth_permanently_failed:
                 _LOGGER.error("Auth permanently failed — WebSocket will not reconnect")
                 break
             try:
+                attempt_started = loop.time()
                 await self._ws_connect()
                 self._reconnect_count += 1  # connection closed normally, will reconnect
-                delay = float(WS_RECONNECT_DELAY)
-                ws_401_count = 0  # successful connect — reset the counter
+                # Only reset the backoff when the connection actually stayed
+                # up; an accept-then-immediate-close server must keep
+                # doubling toward the max, not churn at the 5s base forever.
+                if loop.time() - attempt_started >= _WS_STABLE_CONNECTION_SECS:
+                    delay = float(WS_RECONNECT_DELAY)
+                ws_401_count = 0  # successful upgrade — auth is fine
             except asyncio.CancelledError:
                 break
             except aiohttp.ClientResponseError as exc:
@@ -244,8 +297,13 @@ class ProtectClient:
                         )
                         self._auth_permanently_failed = True
                         break
+                else:
+                    # A non-401 upstream error breaks any 401 streak — only
+                    # genuinely consecutive upgrade-401s may trip the latch.
+                    ws_401_count = 0
                 _LOGGER.exception("Protect WS error — retry in %.0fs", delay)
             except Exception:
+                ws_401_count = 0  # non-401 failure — the 401s were not consecutive
                 _LOGGER.exception("Protect WS error — retry in %.0fs", delay)
             finally:
                 self._ws_connected = False
@@ -274,6 +332,7 @@ class ProtectClient:
             raise
 
         self._ws_connected = True
+        self._ws_parse_failures = 0
         # Seed activity age for API diagnostics. aiohttp heartbeat and the
         # reconnect loop own protocol liveness; quiet doors are not failures.
         self._last_event_at = asyncio.get_running_loop().time()
@@ -296,28 +355,49 @@ class ProtectClient:
         finally:
             await ws.close()
 
+    @staticmethod
+    def _decode_ws_frame(data: bytes, offset: int):
+        """Decode one Protect WS frame starting at ``offset``.
+
+        Each frame carries an 8-byte header: packet type (0), payload format
+        (1), deflated flag (2), reserved (3), then the payload size as a
+        big-endian uint32 (4:8). Current Protect firmware zlib-compresses
+        action/data payloads and sets the deflated flag; feeding those raw
+        bytes to json.loads silently dropped every event.
+
+        Returns (payload, next_offset) or None for a truncated frame.
+        """
+        if offset + 8 > len(data):
+            return None
+        deflated = data[offset + 2]
+        payload_size = struct.unpack(">I", data[offset + 4:offset + 8])[0]
+        start = offset + 8
+        if payload_size <= 0 or start + payload_size > len(data):
+            return None
+        raw = data[start:start + payload_size]
+        if deflated:
+            raw = zlib.decompress(raw)
+        return json.loads(raw), start + payload_size
+
     def _parse_ws_message(self, data: bytes) -> None:
         """Parse Protect binary WS frame: action header + data payload."""
         try:
-            payload_size = struct.unpack(">I", data[4:8])[0]
-            if payload_size <= 0 or 8 + payload_size > len(data):
+            frame = self._decode_ws_frame(data, 0)
+            if frame is None:
                 return
-            action_payload = json.loads(data[8:8 + payload_size])
+            action_payload, data_offset = frame
 
             model = action_payload.get("modelKey", "")
             if model != "event":
+                self._ws_parse_failures = 0
                 return
 
             # Parse data frame
-            data_offset = 8 + payload_size
-            if data_offset + 8 > len(data):
+            frame = self._decode_ws_frame(data, data_offset)
+            if frame is None:
                 return
-            data_payload_size = struct.unpack(">I", data[data_offset + 4:data_offset + 8])[0]
-            data_start = data_offset + 8
-            if data_payload_size <= 0 or data_start + data_payload_size > len(data):
-                return
-
-            event_data = json.loads(data[data_start:data_start + data_payload_size])
+            event_data, _ = frame
+            self._ws_parse_failures = 0
             event_type = event_data.get("type", "")
             camera_id = event_data.get("camera", "")
             metadata = event_data.get("metadata", {})
@@ -381,14 +461,30 @@ class ProtectClient:
         except (
             json.JSONDecodeError,
             struct.error,
+            zlib.error,
             ValueError,
             IndexError,
             AttributeError,
             TypeError,
         ) as exc:
-            _LOGGER.warning("Protect WS frame parse error (%s): %d bytes", type(exc).__name__, len(data))
+            # Repeated failures mean every event is being dropped while
+            # ws_connected still reports healthy — escalate the log level.
+            self._ws_parse_failures += 1
+            log = (
+                _LOGGER.error
+                if self._ws_parse_failures >= _WS_PARSE_FAILURE_ESCALATE
+                else _LOGGER.warning
+            )
+            log(
+                "Protect WS frame parse error (%s): %d bytes "
+                "(%d consecutive failures)",
+                type(exc).__name__,
+                len(data),
+                self._ws_parse_failures,
+            )
 
     async def close(self) -> None:
+        self._closed = True
         await self.stop_websocket()
         if self._session and not self._session.closed:
             await self._session.close()

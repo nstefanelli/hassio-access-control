@@ -20,6 +20,11 @@ from .circuit_breaker import CircuitBreaker
 
 _LOGGER = logging.getLogger(__name__)
 
+# /api/states is a multi-MB dump of every HA entity. The settings page asks
+# for locks, cameras, and alarms back-to-back; a short shared cache turns
+# those three downloads into one without serving meaningfully stale data.
+_STATES_CACHE_TTL = 10.0
+
 
 class HAClientError(Exception):
     """HA client error."""
@@ -44,6 +49,10 @@ class HAClient:
         self._closing = False
         self._closed = False
         self._close_task: asyncio.Task | None = None
+        # Shared /api/states snapshot for the domain-entity getters.
+        self._states_cache: list | None = None
+        self._states_cache_at: float = 0.0
+        self._states_lock = asyncio.Lock()
 
     @property
     def connected(self) -> bool:
@@ -64,6 +73,13 @@ class HAClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
 
+    async def _release_operation_lease(self) -> None:
+        """Decrement the lease count and wake a draining close()."""
+        async with self._lifecycle:
+            self._active_operations -= 1
+            if self._active_operations == 0:
+                self._lifecycle.notify_all()
+
     @asynccontextmanager
     async def operation_lease(self):
         """Keep this exact client alive through a write and its readback."""
@@ -74,10 +90,11 @@ class HAClient:
         try:
             yield
         finally:
-            async with self._lifecycle:
-                self._active_operations -= 1
-                if self._active_operations == 0:
-                    self._lifecycle.notify_all()
+            # The release must survive a cancellation delivered while waiting
+            # on the lifecycle lock — an abandoned decrement would leak the
+            # lease count and hang _close_impl's drain loop forever. shield()
+            # lets the inner task finish even if this awaiter is cancelled.
+            await asyncio.shield(self._release_operation_lease())
 
     def _headers(self) -> dict[str, str]:
         # Resolve the token env-first on EVERY call. Supervisor rotates
@@ -105,6 +122,10 @@ class HAClient:
                 headers=self._headers(),
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
+                # Drain the (tiny) body so aiohttp returns the connection to
+                # the keep-alive pool instead of closing it — this probe runs
+                # every 30s and was paying a TCP/TLS handshake each time.
+                await resp.read()
                 # The health probe is an authenticated HA request too. A
                 # successful transport response must close a circuit opened by
                 # earlier service/state failures before the health loop runs
@@ -158,6 +179,9 @@ class HAClient:
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
+                # Status-only path: drain the body so the connection goes back
+                # to the keep-alive pool (every lock command hits this).
+                await resp.read()
                 if resp.status == 401:
                     _LOGGER.error("HA 401 on %s.%s — token may be revoked or expired", domain, service)
                     self._connected = False
@@ -238,30 +262,60 @@ class HAClient:
         finally:
             self._circuit.abort_probe()
 
+    async def _get_states(self) -> list | None:
+        """Fetch /api/states once and share the snapshot with a short TTL.
+
+        The full state dump is multi-MB; get_lock_entities,
+        get_camera_entities, and get_alarm_entities each only filter one
+        domain out of it, and the settings page calls all three
+        back-to-back. Returns the shared list, or None when HA is
+        unreachable or answered with something unusable.
+        """
+        loop = asyncio.get_running_loop()
+        async with self._states_lock:
+            if (
+                self._states_cache is not None
+                and loop.time() - self._states_cache_at < _STATES_CACHE_TTL
+            ):
+                return self._states_cache
+            if self._circuit.is_open():
+                _LOGGER.warning("HA circuit open — skipping /api/states fetch")
+                return None
+            try:
+                await self._ensure_session()
+                async with self._session.get(
+                    f"{self._url}/api/states",
+                    headers=self._headers(),
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        await resp.read()
+                        _LOGGER.warning("HA /api/states returned HTTP %s", resp.status)
+                        self._circuit.record_success()  # HA responded
+                        return None
+                    states = await resp.json()
+                    self._circuit.record_success()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                _LOGGER.warning("HA /api/states fetch failed: %s", err)
+                self._circuit.record_failure()
+                return None
+            finally:
+                self._circuit.abort_probe()
+
+            if not isinstance(states, list):
+                _LOGGER.warning(
+                    "HA /api/states returned %s, not a list", type(states).__name__
+                )
+                return None
+            self._states_cache = states
+            self._states_cache_at = loop.time()
+            return states
+
     async def get_lock_entities(self) -> list[dict]:
         """Fetch all lock.* entities from HA with friendly name and state."""
-        if self._circuit.is_open():
-            _LOGGER.warning("HA circuit open — skipping get_lock_entities")
+        states = await self._get_states()
+        if states is None:
             return []
-        try:
-            await self._ensure_session()
-            async with self._session.get(
-                f"{self._url}/api/states",
-                headers=self._headers(),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    _LOGGER.warning("HA get_lock_entities returned HTTP %s", resp.status)
-                    self._circuit.record_success()  # HA responded
-                    return []
-                states = await resp.json()
-                self._circuit.record_success()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            _LOGGER.warning("HA get_lock_entities failed: %s", err)
-            self._circuit.record_failure()
-            return []
-        finally:
-            self._circuit.abort_probe()
 
         locks = []
         for entity in states:
@@ -279,28 +333,9 @@ class HAClient:
 
     async def get_camera_entities(self) -> list[dict]:
         """Fetch all camera.* entities from HA (doorbells + cameras)."""
-        if self._circuit.is_open():
-            _LOGGER.warning("HA circuit open — skipping get_camera_entities")
+        states = await self._get_states()
+        if states is None:
             return []
-        try:
-            await self._ensure_session()
-            async with self._session.get(
-                f"{self._url}/api/states",
-                headers=self._headers(),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    _LOGGER.warning("HA get_camera_entities returned HTTP %s", resp.status)
-                    self._circuit.record_success()  # HA responded
-                    return []
-                states = await resp.json()
-                self._circuit.record_success()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            _LOGGER.warning("HA get_camera_entities failed: %s", err)
-            self._circuit.record_failure()
-            return []
-        finally:
-            self._circuit.abort_probe()
 
         cameras = []
         for entity in states:
@@ -318,28 +353,9 @@ class HAClient:
 
     async def get_alarm_entities(self) -> list[dict]:
         """Fetch all alarm_control_panel.* entities from HA."""
-        if self._circuit.is_open():
-            _LOGGER.warning("HA circuit open — skipping get_alarm_entities")
+        states = await self._get_states()
+        if states is None:
             return []
-        try:
-            await self._ensure_session()
-            async with self._session.get(
-                f"{self._url}/api/states",
-                headers=self._headers(),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    _LOGGER.warning("HA get_alarm_entities returned HTTP %s", resp.status)
-                    self._circuit.record_success()  # HA responded
-                    return []
-                states = await resp.json()
-                self._circuit.record_success()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            _LOGGER.warning("HA get_alarm_entities failed: %s", err)
-            self._circuit.record_failure()
-            return []
-        finally:
-            self._circuit.abort_probe()
 
         alarms = []
         for entity in states:
@@ -388,6 +404,9 @@ class HAClient:
                 json=data,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
+                # Status-only path: drain the body to keep the connection
+                # reusable.
+                await resp.read()
                 self._circuit.record_success()
                 if resp.status != 200:
                     _LOGGER.warning("HA fire_event %s returned HTTP %s", event_type, resp.status)
