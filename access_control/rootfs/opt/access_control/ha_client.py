@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import secrets
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 
 import aiohttp
@@ -24,6 +27,25 @@ _LOGGER = logging.getLogger(__name__)
 # for locks, cameras, and alarms back-to-back; a short shared cache turns
 # those three downloads into one without serving meaningfully stale data.
 _STATES_CACHE_TTL = 10.0
+
+# WebSocket reconnect backoff (CLI-6): base doubles toward the max on every
+# failed cycle.
+_WS_RECONNECT_DELAY = 5.0
+_WS_MAX_RECONNECT_DELAY = 300.0  # 5 minutes max
+
+# Only reset the reconnect backoff after the socket stayed up this long. A
+# server that accepts the upgrade and then immediately closes must keep
+# doubling toward the max, not churn at the 5s base forever (same pattern as
+# AccessClient/ProtectClient _ws_loop).
+_WS_STABLE_CONNECTION_SECS = 30.0
+
+# Fixed command id for the single subscribe_events request each connection
+# sends. HA requires ids to increase per-connection; we only ever send one.
+_WS_SUBSCRIBE_ID = 1
+
+# Bound the auth + subscribe exchange. A healthy HA answers immediately; a
+# half-open socket must not strand the loop before heartbeats even start.
+_WS_HANDSHAKE_TIMEOUT = 30.0
 
 
 class HAClientError(Exception):
@@ -53,6 +75,16 @@ class HAClient:
         self._states_cache: list | None = None
         self._states_cache_at: float = 0.0
         self._states_lock = asyncio.Lock()
+        # WebSocket push (state_changed events, CLI-6). Deliberately separate
+        # from the REST concerns: the circuit breaker guards command paths and
+        # the REST health probe owns self._connected — a WS disconnect must
+        # affect neither.
+        self._ws_task: asyncio.Task | None = None
+        self._ws_running = False
+        self._ws_connected = False
+        self._on_state_changed: (
+            Callable[[str, str | None, str | None], Awaitable[None]] | None
+        ) = None
 
     @property
     def connected(self) -> bool:
@@ -66,6 +98,12 @@ class HAClient:
     def circuit_state(self) -> str:
         """Current state of the HA-call circuit breaker (closed/open/half_open)."""
         return self._circuit.state
+
+    @property
+    def ws_connected(self) -> bool:
+        """True only while the socket is open, authenticated, AND the
+        state_changed subscription is active."""
+        return self._ws_connected
 
     async def _ensure_session(self) -> None:
         if self._closed:
@@ -418,7 +456,230 @@ class HAClient:
         finally:
             self._circuit.abort_probe()
 
+    # ------------------------------------------------------------------
+    # WebSocket push (state_changed events)
+    # ------------------------------------------------------------------
+
+    def _ws_url(self) -> str:
+        """Derive the WS endpoint from the configured REST base URL.
+
+        Supervisor proxy mode (``http://supervisor/core``) exposes the socket
+        at ``{url}/websocket``; a direct HA URL exposes it at
+        ``{url}/api/websocket``. http→ws, https→wss.
+        """
+        if self._url.endswith("/core"):
+            http_url = f"{self._url}/websocket"
+        else:
+            http_url = f"{self._url}/api/websocket"
+        if http_url.startswith("https://"):
+            return "wss://" + http_url[len("https://"):]
+        if http_url.startswith("http://"):
+            return "ws://" + http_url[len("http://"):]
+        return http_url
+
+    def start_websocket(
+        self,
+        on_state_changed: Callable[[str, str | None, str | None], Awaitable[None]],
+    ) -> None:
+        """Start the background state_changed listener.
+
+        Idempotent — re-registering replaces the callback; if the WS task is
+        already running it keeps running. Starting on a closed/closing client
+        is a no-op.
+        """
+        if self._closing or self._closed:
+            _LOGGER.debug("HA client is closed — ignoring start_websocket")
+            return
+        self._on_state_changed = on_state_changed
+        if self._ws_task is not None and not self._ws_task.done():
+            return
+        self._ws_running = True
+        self._ws_task = asyncio.create_task(self._ws_loop(), name="ha-ws-loop")
+        _LOGGER.debug("HA WebSocket listener task started")
+
+    async def stop_websocket(self) -> None:
+        """Stop the background WebSocket listener task. Idempotent."""
+        self._ws_running = False
+        task = self._ws_task
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                _LOGGER.exception("HA WebSocket task raised during shutdown")
+            self._ws_task = None
+        self._ws_connected = False
+        _LOGGER.debug("HA WebSocket listener task stopped")
+
+    async def _ws_loop(self) -> None:
+        """Outer reconnect loop for the HA WebSocket connection.
+
+        Exponential backoff (5s → 10s → … → 300s max) on repeated failures;
+        the delay resets to base only after a connection stayed up for
+        _WS_STABLE_CONNECTION_SECS. auth_invalid is a transient failure like
+        any other: the Supervisor rotates its token and run.sh re-exports it,
+        so there is deliberately NO permanent latch here.
+        """
+        delay = float(_WS_RECONNECT_DELAY)
+        loop = asyncio.get_running_loop()
+        while self._ws_running and not self._closing and not self._closed:
+            try:
+                attempt_started = loop.time()
+                await self._ws_connect()
+                if loop.time() - attempt_started >= _WS_STABLE_CONNECTION_SECS:
+                    delay = float(_WS_RECONNECT_DELAY)  # reset on stable success
+            except asyncio.CancelledError:
+                break
+            except (aiohttp.ClientError, asyncio.TimeoutError, HAClientError) as err:
+                # Per-cycle retries stay at debug — state transitions
+                # (connected / lost / auth failure) are logged where they
+                # happen, so reconnect churn cannot spam the log.
+                _LOGGER.debug("HA WebSocket cycle failed: %s", err)
+            except Exception:
+                _LOGGER.exception("Unexpected HA WebSocket failure")
+            finally:
+                self._ws_connected = False
+
+            if self._ws_running and not self._closing and not self._closed:
+                _LOGGER.debug("HA WebSocket reconnecting in %.0fs", delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, _WS_MAX_RECONNECT_DELAY) * (
+                    0.75 + secrets.SystemRandom().random() * 0.5
+                )
+
+    async def _ws_connect(self) -> None:
+        """Connect, authenticate, subscribe, and pump state_changed events.
+
+        Runs one connection to completion; the caller (_ws_loop) owns retry
+        policy. ws_connected is True only between a successful subscription
+        ack and the connection ending.
+        """
+        await self._ensure_session()
+        ws = await self._session.ws_connect(self._ws_url(), heartbeat=30)
+        try:
+            async with asyncio.timeout(_WS_HANDSHAKE_TIMEOUT):
+                await self._ws_handshake(ws)
+            self._ws_connected = True
+            _LOGGER.info("HA WebSocket connected — state_changed subscription active")
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    await self._ws_handle_text(msg.data)
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    _LOGGER.debug("HA WebSocket error frame: %r", msg.data)
+                    break
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.CLOSED,
+                ):
+                    _LOGGER.debug("HA WebSocket closed (type=%s)", msg.type)
+                    break
+        finally:
+            if self._ws_connected:
+                _LOGGER.warning("HA WebSocket connection lost")
+            self._ws_connected = False
+            await ws.close()
+
+    async def _ws_handshake(self, ws) -> None:
+        """Run the HA auth + subscribe_events exchange.
+
+        Protocol: server sends auth_required → client sends the token →
+        auth_ok/auth_invalid → client subscribes to state_changed → server
+        acks with {"id": 1, "type": "result", "success": true}. Anything
+        else mid-handshake is ignored.
+        """
+        # Resolve the token env-first on every connect — same rotation
+        # rationale as _headers().
+        token = os.environ.get("ACCESS_CONTROL_HA_TOKEN") or self._token
+        while True:
+            msg = await ws.receive()
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                raise HAClientError(
+                    f"HA WebSocket closed during handshake (type={msg.type})"
+                )
+            try:
+                payload = json.loads(msg.data)
+            except (TypeError, ValueError) as err:
+                raise HAClientError(
+                    "HA WebSocket sent non-JSON during handshake"
+                ) from err
+            if not isinstance(payload, dict):
+                raise HAClientError("HA WebSocket sent an invalid handshake message")
+            msg_type = payload.get("type")
+            if msg_type == "auth_required":
+                await ws.send_json({"type": "auth", "access_token": token})
+            elif msg_type == "auth_invalid":
+                # No permanent latch: the Supervisor can rotate the token and
+                # re-export it, so back off and retry with the freshest value.
+                _LOGGER.error(
+                    "HA WebSocket auth rejected (auth_invalid) — token may "
+                    "have been rotated; retrying with backoff"
+                )
+                raise HAClientError("HA WebSocket authentication failed")
+            elif msg_type == "auth_ok":
+                await ws.send_json(
+                    {
+                        "id": _WS_SUBSCRIBE_ID,
+                        "type": "subscribe_events",
+                        "event_type": "state_changed",
+                    }
+                )
+            elif msg_type == "result" and payload.get("id") == _WS_SUBSCRIBE_ID:
+                if payload.get("success") is not True:
+                    raise HAClientError(
+                        "HA rejected the state_changed subscription"
+                    )
+                return
+
+    @staticmethod
+    def _ws_plain_state(state_obj: object) -> str | None:
+        """Extract the plain state string from an event's old/new_state."""
+        if not isinstance(state_obj, dict):
+            return None  # null when the entity appeared/vanished
+        state = state_obj.get("state")
+        return state if isinstance(state, str) else None
+
+    async def _ws_handle_text(self, raw: str) -> None:
+        """Dispatch one TEXT frame; malformed payloads are skipped safely."""
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            _LOGGER.debug("Non-JSON HA WebSocket message: %r", raw)
+            return
+        if not isinstance(payload, dict) or payload.get("type") != "event":
+            return  # pong / result echoes / anything else — respond to nothing
+        event = payload.get("event")
+        if not isinstance(event, dict) or event.get("event_type") != "state_changed":
+            return
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return
+        entity_id = data.get("entity_id")
+        if not isinstance(entity_id, str) or not entity_id:
+            return
+        callback = self._on_state_changed
+        if callback is None:
+            return
+        try:
+            await callback(
+                entity_id,
+                self._ws_plain_state(data.get("old_state")),
+                self._ws_plain_state(data.get("new_state")),
+            )
+        except Exception:
+            # A broken consumer must never kill the push loop.
+            _LOGGER.exception("state_changed callback failed for %s", entity_id)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
     async def _close_impl(self) -> None:
+        # Stop push delivery first so no state_changed callback fires into an
+        # app that is tearing this client down, then drain leased operations.
+        await self.stop_websocket()
         async with self._lifecycle:
             if self._closed:
                 return
