@@ -157,12 +157,6 @@ CREATE TABLE IF NOT EXISTS rate_limits (
     PRIMARY KEY (scope, subject)
 );
 
-CREATE TABLE IF NOT EXISTS ui_cache (
-    key        TEXT PRIMARY KEY,
-    value_json TEXT NOT NULL,
-    expires_at REAL NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS pending_relocks (
     entity_id  TEXT PRIMARY KEY,
     lock_id    INTEGER,
@@ -201,7 +195,9 @@ CREATE INDEX IF NOT EXISTS idx_access_rules_lock   ON access_rules(lock_id);
 CREATE INDEX IF NOT EXISTS idx_access_log_timestamp ON access_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_access_log_lock_ts  ON access_log(lock_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_access_log_user_ts  ON access_log(user_id, timestamp);
-CREATE INDEX IF NOT EXISTS idx_ui_cache_expires_at ON ui_cache(expires_at);
+CREATE INDEX IF NOT EXISTS idx_entry_dev_type_device ON entry_devices(type, device_id) WHERE device_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_entry_dev_type_entity ON entry_devices(type, entity_id) WHERE entity_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
 CREATE INDEX IF NOT EXISTS idx_visitors_status ON visitors(status);
 CREATE INDEX IF NOT EXISTS idx_admin_log_timestamp ON admin_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_visitors_created_at ON visitors(created_at);
@@ -278,6 +274,11 @@ class Database:
         self._db = await aiosqlite.connect(self._path, isolation_level=None)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
+        # WAL + synchronous=FULL fsyncs the WAL on every commit — a real cost
+        # on the SD-card hosts most HA installs run on. NORMAL still keeps the
+        # database corruption-free and durable across an app/OS crash; only a
+        # power loss can lose the last transaction(s).
+        await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.execute("PRAGMA busy_timeout = 5000")
         await self._db.execute("PRAGMA secure_delete = ON")
@@ -289,11 +290,14 @@ class Database:
         """Run incremental migrations for schema changes."""
         await self._db.execute("BEGIN IMMEDIATE")
         try:
-            # Migration 1: add key_encrypted column to api_keys
-            async with self._db.execute("PRAGMA table_info(api_keys)") as cur:
-                cols = {row[1] for row in await cur.fetchall()}
-            if "key_encrypted" not in cols:
-                await self._db.execute("ALTER TABLE api_keys ADD COLUMN key_encrypted TEXT")
+            # Migration 1: (removed — it added api_keys.key_encrypted, which
+            # Migration 16 now unconditionally drops. Because there is no
+            # schema-version counter, keeping the ADD here made every startup
+            # re-add the column only for Migration 16 to DROP it again — a
+            # full api_keys table rewrite per boot, and a hard failure on
+            # SQLite < 3.35 which lacks DROP COLUMN. A database upgrading
+            # from a version where key_encrypted still holds data is
+            # unaffected: Migration 16 drops the column either way.)
 
             # Migration 2: add hidden column to users
             async with self._db.execute("PRAGMA table_info(users)") as cur:
@@ -653,6 +657,31 @@ class Database:
                     "INTEGER NOT NULL DEFAULT 0"
                 )
 
+            # Migration 28: retire the persisted UI cache. The cache moved to
+            # an in-process dict (see ``self._ui_cache``); the table was still
+            # being created for every new install and stale rows written by
+            # old versions were retained forever.
+            await self._db.execute("DROP INDEX IF EXISTS idx_ui_cache_expires_at")
+            await self._db.execute("DROP TABLE IF EXISTS ui_cache")
+
+            # Migration 29: hot read-path indexes. get_locks_by_entry_device
+            # filters entry_devices on (type, device_id)/(type, entity_id) but
+            # the unique indexes lead with lock_id, so every doorbell/NFC
+            # event was a full table scan; get_user_groups filters
+            # group_members on user_id, whose PK leads with group_id.
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entry_dev_type_device "
+                "ON entry_devices(type, device_id) WHERE device_id IS NOT NULL"
+            )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entry_dev_type_entity "
+                "ON entry_devices(type, entity_id) WHERE entity_id IS NOT NULL"
+            )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_group_members_user "
+                "ON group_members(user_id)"
+            )
+
             await self._db.commit()
         except Exception:
             await self._db.rollback()
@@ -705,6 +734,7 @@ class Database:
             return connection
         connection = await aiosqlite.connect(self._path)
         connection.row_factory = aiosqlite.Row
+        await connection.execute("PRAGMA synchronous=NORMAL")
         await connection.execute("PRAGMA foreign_keys=ON")
         await connection.execute("PRAGMA busy_timeout = 5000")
         await connection.execute("BEGIN IMMEDIATE")
@@ -794,6 +824,7 @@ class Database:
         try:
             isolated = await aiosqlite.connect(self._path)
             isolated.row_factory = aiosqlite.Row
+            await isolated.execute("PRAGMA synchronous=NORMAL")
             await isolated.execute("PRAGMA foreign_keys=ON")
             await isolated.execute("PRAGMA busy_timeout = 5000")
             await isolated.execute("BEGIN IMMEDIATE")
@@ -975,6 +1006,7 @@ class Database:
             isolated: Optional[aiosqlite.Connection] = None
             try:
                 isolated = await aiosqlite.connect(self._path)
+                await isolated.execute("PRAGMA synchronous=NORMAL")
                 await isolated.execute("PRAGMA busy_timeout = 5000")
                 await isolated.execute("BEGIN IMMEDIATE")
                 await isolated.executemany(
@@ -1710,6 +1742,7 @@ class Database:
                 close_after = False
             else:
                 connection = await aiosqlite.connect(self._path)
+                await connection.execute("PRAGMA synchronous=NORMAL")
                 await connection.execute("PRAGMA foreign_keys=ON")
                 await connection.execute("PRAGMA busy_timeout = 5000")
                 close_after = True
@@ -1938,10 +1971,21 @@ class Database:
         await self._db.commit()
         return cursor.lastrowid
 
-    async def get_all_visitors(self) -> list[dict[str, Any]]:
-        async with self._db.execute(
-            "SELECT * FROM visitors ORDER BY created_at DESC"
-        ) as cursor:
+    async def get_all_visitors(
+        self, limit: int | None = 500
+    ) -> list[dict[str, Any]]:
+        """Return visitors, newest first, bounded by ``limit``.
+
+        Expired visitors accumulate forever, so the default cap keeps the
+        /visitors page render bounded. Pass ``limit=None`` for the full
+        history.
+        """
+        query = "SELECT * FROM visitors ORDER BY created_at DESC"
+        params: tuple[Any, ...] = ()
+        if limit is not None:
+            query += " LIMIT ?"
+            params = (int(limit),)
+        async with self._db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
             return [_row_to_dict(r) for r in rows]
 
@@ -2212,8 +2256,27 @@ class Database:
         now = now if now is not None else time.time()
         self._ui_cache[key] = (json.dumps(value), now + ttl)
 
-    async def prune_runtime_state(self, now: float | None = None) -> None:
+    # Rows in rate_limits whose newest attempt is older than this are dead
+    # state no matter what limits the callers configured: it comfortably
+    # exceeds every configured window and lockout (largest is 300s). Without
+    # this, rows with lockout_until=0 — written for every *allowed* attempt
+    # and for sub-threshold failures — were never deleted, growing without
+    # bound keyed by client IP on exposed installs.
+    RATE_LIMIT_STALE_AFTER = 3600.0
+
+    async def prune_runtime_state(
+        self,
+        now: float | None = None,
+        *,
+        rate_limit_stale_after: float | None = None,
+    ) -> None:
         now = now if now is not None else time.time()
+        stale_after = (
+            rate_limit_stale_after
+            if rate_limit_stale_after is not None
+            else self.RATE_LIMIT_STALE_AFTER
+        )
+        stale_before = now - stale_after
         expired_cache_keys = [
             key for key, (_, expires_at) in self._ui_cache.items()
             if expires_at <= now
@@ -2221,22 +2284,32 @@ class Database:
         for key in expired_cache_keys:
             self._ui_cache.pop(key, None)
 
+        # Two prunable shapes, both guarded by `lockout_until <= now` so an
+        # active lockout is never dropped early:
+        #   1. an expired lockout (attempts were cleared when it was set);
+        #   2. a stale attempt log — its newest timestamp (last element of
+        #      attempts_json, `$[#-1]`; empty array coalesces to 0) is beyond
+        #      every window any caller could still count it against.
+        prune_where = """
+                   WHERE lockout_until <= ?
+                     AND (
+                          (lockout_until != 0 AND attempts_json = '[]')
+                          OR COALESCE(
+                                 CAST(json_extract(attempts_json, '$[#-1]')
+                                      AS REAL),
+                                 0) <= ?
+                     )"""
         async with self._rate_limit_lock:
             async with self._db.execute(
-                """SELECT 1 FROM rate_limits
-                   WHERE lockout_until != 0 AND lockout_until <= ?
-                     AND attempts_json = '[]'
-                   LIMIT 1""",
-                (now,),
+                "SELECT 1 FROM rate_limits" + prune_where + " LIMIT 1",
+                (now, stale_before),
             ) as cur:
                 has_expired_rows = await cur.fetchone() is not None
             if not has_expired_rows:
                 return
             await self._db.execute(
-                """DELETE FROM rate_limits
-                   WHERE lockout_until != 0 AND lockout_until <= ?
-                     AND attempts_json = '[]'""",
-                (now,),
+                "DELETE FROM rate_limits" + prune_where,
+                (now, stale_before),
             )
             await self._db.commit()
 
@@ -2261,6 +2334,11 @@ class Database:
             isolated: Optional[aiosqlite.Connection] = None
             try:
                 isolated = await aiosqlite.connect(self._path)
+                # Hub holds persist SAFETY intents. WAL + synchronous=NORMAL
+                # is still durable across an app crash (the commit is in the
+                # WAL); only a power loss can drop the very last transaction,
+                # and recovery then fail-safes from the surviving state.
+                await isolated.execute("PRAGMA synchronous=NORMAL")
                 await isolated.execute("PRAGMA busy_timeout = 5000")
                 await isolated.execute("BEGIN IMMEDIATE")
                 await isolated.execute(sql, params)
@@ -2425,6 +2503,11 @@ class Database:
             isolated: Optional[aiosqlite.Connection] = None
             try:
                 isolated = await aiosqlite.connect(self._path)
+                # Pending relocks are SAFETY intents (relock deadlines). As
+                # with hub holds, WAL + synchronous=NORMAL keeps the write
+                # durable across an app crash; only a power loss can lose the
+                # last transaction, which recovery fail-safes around.
+                await isolated.execute("PRAGMA synchronous=NORMAL")
                 await isolated.execute("PRAGMA busy_timeout = 5000")
                 await isolated.execute("BEGIN IMMEDIATE")
                 cursor = await isolated.execute(sql, params)
