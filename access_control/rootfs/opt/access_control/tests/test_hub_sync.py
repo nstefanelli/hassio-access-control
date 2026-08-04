@@ -3895,5 +3895,366 @@ class TestPushNotify(unittest.TestCase):
         _run(go())
 
 
+class TestShutdownStopsPushReconcile(unittest.TestCase):
+    """WIR-1: shutdown() owns the push-reconcile task. Once shutdown starts,
+    no new pass may be scheduled, a queued trailing pass may not run, and an
+    in-flight pass is cancelled so shutdown's release logic still completes
+    (a pass slipping in AFTER the release could re-apply keep_unlock and
+    leave a door physically held open by an exiting process)."""
+
+    def _converged_open(self):
+        db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+        access = _make_access()
+        mgr = _make_mgr(db, _make_ha({"lock.front": "unlocked"}), access)
+        return mgr, db, access
+
+    def test_notify_after_shutdown_schedules_nothing(self) -> None:
+        async def go():
+            mgr, db, access = self._converged_open()
+            await mgr.poll_once()
+            self.assertEqual(await mgr.shutdown(), 1)
+            mgr.poll_once = AsyncMock(return_value=0)
+            mgr.notify_ha_state_change("lock.front", "unlocked")
+            self.assertIsNone(mgr._push_reconcile_task)
+            self.assertFalse(mgr._push_reconcile_queued)
+            await asyncio.sleep(0)
+            mgr.poll_once.assert_not_awaited()
+        _run(go())
+
+    def test_request_reconcile_after_shutdown_schedules_nothing(self) -> None:
+        async def go():
+            mgr, db, access = self._converged_open()
+            await mgr.poll_once()
+            await mgr.shutdown()
+            mgr.poll_once = AsyncMock(return_value=0)
+            mgr.request_reconcile()
+            self.assertIsNone(mgr._push_reconcile_task)
+            await asyncio.sleep(0)
+            mgr.poll_once.assert_not_awaited()
+        _run(go())
+
+    def test_poll_once_is_inert_after_shutdown(self) -> None:
+        async def go():
+            mgr, db, access = self._converged_open()
+            await mgr.poll_once()
+            await mgr.shutdown()
+            db.get_all_locks.reset_mock()
+            access.unlock_persistent.reset_mock()
+            self.assertEqual(await mgr.poll_once(), 0)
+            # The inert pass performs no reads and re-drives nothing.
+            db.get_all_locks.assert_not_awaited()
+            access.unlock_persistent.assert_not_awaited()
+        _run(go())
+
+    def test_queued_trailing_pass_does_not_run_after_shutdown(self) -> None:
+        async def go():
+            mgr, db, access = self._converged_open()
+            await mgr.poll_once()
+            access.unlock_persistent.assert_awaited_once()
+
+            calls = []
+            release = asyncio.Event()
+
+            async def slow_poll():
+                calls.append(1)
+                await release.wait()
+                return 0
+
+            mgr.poll_once = slow_poll
+            mgr.notify_ha_state_change("lock.front", "unlocked")
+            task = mgr._push_reconcile_task
+            self.assertIsNotNone(task)
+            await asyncio.sleep(0)
+            self.assertEqual(len(calls), 1)
+            # Queue the trailing pass, then shut down before it can run.
+            mgr.notify_ha_state_change("lock.front", "unlocked")
+            self.assertTrue(mgr._push_reconcile_queued)
+
+            self.assertEqual(await mgr.shutdown(), 1)
+            self.assertTrue(task.done())
+            self.assertIsNone(mgr._push_reconcile_task)
+            self.assertFalse(mgr._push_reconcile_queued)
+            # Only the pre-shutdown pass ran; no pass re-applied keep_unlock
+            # after shutdown released the hold.
+            self.assertEqual(len(calls), 1)
+            access.unlock_persistent.assert_awaited_once()
+            access.lock.assert_awaited_once_with("dev-hub-1")
+        _run(go())
+
+    def test_shutdown_cancels_in_flight_push_pass_and_releases(self) -> None:
+        """A push pass blocked mid-poll holds ``_poll_lock``. shutdown()
+        must cancel it (not starve behind it) and still complete its
+        release logic. Without the fix this test hangs on the lock."""
+        async def go():
+            mgr, db, access = self._converged_open()
+            await mgr.poll_once()
+
+            entered = asyncio.Event()
+            blocker = asyncio.Event()
+
+            async def blocking_get_all_locks(include_hidden=False):
+                entered.set()
+                await blocker.wait()
+                return [HA_LOCK, HUB]
+
+            db.get_all_locks = AsyncMock(side_effect=blocking_get_all_locks)
+            mgr.notify_ha_state_change("lock.front", "unlocked")
+            task = mgr._push_reconcile_task
+            self.assertIsNotNone(task)
+            # The push pass now owns _poll_lock, blocked inside the poll.
+            await entered.wait()
+
+            # Shutdown itself needs working reads.
+            db.get_all_locks = AsyncMock(return_value=[HA_LOCK, HUB])
+            self.assertEqual(await mgr.shutdown(), 1)
+            self.assertTrue(task.done())
+            self.assertIsNone(mgr._push_reconcile_task)
+            # Release logic completed: the held hub was reset and the
+            # durable ownership row cleared.
+            access.lock.assert_awaited_once_with("dev-hub-1")
+            db.clear_hub_sync_hold.assert_awaited_once_with(
+                "lock.front", "dev-hub-1"
+            )
+            self.assertEqual(mgr._pending_release, {})
+        _run(go())
+
+
+class TestAppInitiatedUnlockTtl(unittest.TestCase):
+    """WIR-2a: the app-initiated marker must outlive the worst-case gap
+    until a pass first observes the unlock edge — one full backstop
+    interval (lost WS event) plus pass slack — or a deliberate operator
+    hold-open is misclassified as external and spuriously auto-relocked."""
+
+    def test_default_ttl_covers_backstop_plus_one_pass(self) -> None:
+        db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+        mgr = _make_mgr(db, _make_ha({}), _make_access())
+        before = _time.monotonic()
+        mgr.mark_app_initiated_unlock("lock.front")
+        ttl = mgr._app_initiated_until["lock.front"] - before
+        self.assertGreaterEqual(
+            ttl, HubSyncManager.BACKSTOP_POLL_INTERVAL + 14.0
+        )
+        # Still bounded: a genuine later external unlock stays covered.
+        self.assertLessEqual(
+            ttl, HubSyncManager.BACKSTOP_POLL_INTERVAL + 16.0
+        )
+
+    def _fixture(self):
+        lock = dict(HA_LOCK)
+        lock["relock_on_ha_origin"] = 1
+        ha_states = {"lock.front": "locked"}
+        access_rules = {"dev-hub-1": {"type": "reset"}}
+        access_states = {"dev-hub-1": "locked"}
+        db = _make_db([lock, HUB], location_map={"loc-1": [HUB]})
+        db.get_pending_relock = AsyncMock(return_value=None)
+        ha = _make_bidirectional_ha(ha_states)
+        access = _make_bidirectional_access(access_rules, access_states)
+        relock = MagicMock()
+        relock.schedule = AsyncMock()
+        mgr = HubSyncManager(
+            db=db,
+            ha_client_getter=lambda: ha,
+            access_client_getter=lambda: access,
+            relock_manager_getter=lambda: relock,
+        )
+        return mgr, ha, access, relock, ha_states
+
+    def test_marker_survives_a_full_backstop_delay(self) -> None:
+        """Unlock edge first observed 60s after the manual Unlock (lost WS
+        event + backstop poll): still app-initiated, no auto-relock."""
+        async def go():
+            mgr, ha, access, relock, ha_states = self._fixture()
+            clock = {"t": 1000.0}
+            with patch.object(
+                hs_module, "time", _MonotonicShim(lambda: clock["t"])
+            ):
+                await mgr.poll_once()  # confirmed locked baseline
+                mgr.mark_app_initiated_unlock("lock.front")
+                ha_states["lock.front"] = "unlocked"
+                clock["t"] += HubSyncManager.BACKSTOP_POLL_INTERVAL
+                self.assertEqual(await mgr.poll_once(), 1)
+                # Hold-open preserved, no spurious re-lock scheduled.
+                access.hold_unlocked.assert_awaited_once()
+                relock.schedule.assert_not_awaited()
+        _run(go())
+
+    def test_expired_marker_still_classifies_external(self) -> None:
+        """Past the TTL the marker no longer vouches: a genuinely external
+        unlock edge observed later still earns its durable re-lock."""
+        async def go():
+            mgr, ha, access, relock, ha_states = self._fixture()
+            clock = {"t": 1000.0}
+            with patch.object(
+                hs_module, "time", _MonotonicShim(lambda: clock["t"])
+            ):
+                await mgr.poll_once()
+                mgr.mark_app_initiated_unlock("lock.front")
+                ha_states["lock.front"] = "unlocked"
+                clock["t"] += HubSyncManager.BACKSTOP_POLL_INTERVAL + 20.0
+                self.assertEqual(await mgr.poll_once(), 1)
+                relock.schedule.assert_awaited_once()
+        _run(go())
+
+
+class TestHasPendingWork(unittest.TestCase):
+    """WIR-2b/2d: has_pending_work() must report exactly the deferred /
+    backoff state a poll pass would act on WITHOUT any external event, so
+    the main loop keeps the fast cadence instead of the 60s backstop."""
+
+    def _mgr(self) -> HubSyncManager:
+        db = _make_db([])
+        return _make_mgr(db, _make_ha({}), _make_access())
+
+    def test_idle_manager_reports_no_pending_work(self) -> None:
+        self.assertFalse(self._mgr().has_pending_work())
+
+    def test_tracked_but_converged_state_is_not_pending(self) -> None:
+        # Ordinary converged tracking must NOT hold the fast cadence —
+        # that would defeat the backstop entirely.
+        mgr = self._mgr()
+        mgr._applied["lock.front"] = "unlocked"
+        mgr._pairing_signature["lock.front"] = ("dev-hub-1",)
+        mgr._paired_hubs["lock.front"] = [dict(HUB)]
+        mgr._held_open["lock.front"] = [dict(HUB)]
+        mgr._last_converged["lock.front"] = "unlocked"
+        self.assertFalse(mgr.has_pending_work())
+
+    def test_pending_release_is_pending(self) -> None:
+        mgr = self._mgr()
+        mgr._pending_release["lock.front"] = [dict(HUB)]
+        self.assertTrue(mgr.has_pending_work())
+
+    def test_fail_safe_latch_is_pending(self) -> None:
+        mgr = self._mgr()
+        mgr._fail_safe_reset_eids.add("lock.front")
+        self.assertTrue(mgr.has_pending_work())
+
+    def test_live_failure_backoff_is_pending_expired_is_not(self) -> None:
+        mgr = self._mgr()
+        mgr._backoff_until["lock.front"] = _time.monotonic() + 10.0
+        self.assertTrue(mgr.has_pending_work())
+        mgr._backoff_until["lock.front"] = _time.monotonic() - 1.0
+        self.assertFalse(mgr.has_pending_work())
+
+    def test_live_flap_suspension_is_pending_expired_is_not(self) -> None:
+        mgr = self._mgr()
+        mgr._suspended_until["lock.front"] = _time.monotonic() + 300.0
+        self.assertTrue(mgr.has_pending_work())
+        mgr._suspended_until["lock.front"] = _time.monotonic() - 1.0
+        self.assertFalse(mgr.has_pending_work())
+
+    def test_momentary_lease_is_pending_even_after_expiry(self) -> None:
+        # Only a pass consumes an expired lease (locked-wins), so presence
+        # counts regardless of the deadline.
+        mgr = self._mgr()
+        mgr._access_momentary_until["lock.front"] = _time.monotonic() + 30.0
+        self.assertTrue(mgr.has_pending_work())
+        mgr._access_momentary_until["lock.front"] = _time.monotonic() - 1.0
+        self.assertTrue(mgr.has_pending_work())
+
+    def test_live_app_initiated_marker_is_pending_expired_is_not(self) -> None:
+        mgr = self._mgr()
+        mgr._app_initiated_until["lock.front"] = _time.monotonic() + 60.0
+        self.assertTrue(mgr.has_pending_work())
+        mgr._app_initiated_until["lock.front"] = _time.monotonic() - 1.0
+        self.assertFalse(mgr.has_pending_work())
+
+    def test_min_apply_deferral_window_is_pending_then_clears(self) -> None:
+        mgr = self._mgr()
+        mgr._last_applied_at["lock.front"] = _time.monotonic()
+        self.assertTrue(mgr.has_pending_work())
+        mgr._last_applied_at["lock.front"] = (
+            _time.monotonic() - hs_module._MIN_APPLY_INTERVAL - 1.0
+        )
+        self.assertFalse(mgr.has_pending_work())
+
+
+class TestRequestReconcile(unittest.TestCase):
+    """WIR-3: request_reconcile() wakes the coalesced reconcile for
+    configuration changes (e.g. sync_hub_state toggled at runtime) that
+    produce no HA push event — ignoring the tracked-entity filter."""
+
+    def _mgr(self, locks=None, ha_states=None, access=None):
+        db = _make_db(
+            locks if locks is not None else [],
+            location_map={"loc-1": [HUB]},
+        )
+        mgr = _make_mgr(
+            db, _make_ha(ha_states or {}), access or _make_access()
+        )
+        return mgr, db
+
+    def test_schedules_pass_without_any_tracked_state(self) -> None:
+        async def go():
+            mgr, db = self._mgr()
+            mgr.poll_once = AsyncMock(return_value=0)
+            mgr._idle_recheck_until = _time.monotonic() + 999.0
+            mgr.request_reconcile()
+            # Idle backoff invalidated synchronously; a pass is scheduled
+            # even though NOTHING is tracked yet (newly opted-in lock).
+            self.assertEqual(mgr._idle_recheck_until, 0.0)
+            task = mgr._push_reconcile_task
+            self.assertIsNotNone(task)
+            await task
+            mgr.poll_once.assert_awaited_once()
+        _run(go())
+
+    def test_converges_newly_enabled_lock_end_to_end(self) -> None:
+        async def go():
+            access = _make_access()
+            mgr, db = self._mgr(
+                locks=[HA_LOCK, HUB],
+                ha_states={"lock.front": "unlocked"},
+                access=access,
+            )
+            mgr._idle_recheck_until = _time.monotonic() + 999.0
+            mgr.request_reconcile()
+            task = mgr._push_reconcile_task
+            self.assertIsNotNone(task)
+            await task
+            access.unlock_persistent.assert_awaited_once_with("dev-hub-1")
+        _run(go())
+
+    def test_coalesces_with_running_pass(self) -> None:
+        async def go():
+            mgr, db = self._mgr()
+            calls = []
+            release = asyncio.Event()
+
+            async def slow_poll():
+                calls.append(1)
+                await release.wait()
+                return 0
+
+            mgr.poll_once = slow_poll
+            mgr.request_reconcile()
+            task = mgr._push_reconcile_task
+            await asyncio.sleep(0)
+            for _ in range(5):
+                mgr.request_reconcile()
+            self.assertIs(mgr._push_reconcile_task, task)
+            self.assertTrue(mgr._push_reconcile_queued)
+            release.set()
+            await task
+            self.assertEqual(len(calls), 2)
+        _run(go())
+
+    def test_never_raises_without_running_loop(self) -> None:
+        mgr, db = self._mgr()
+        mgr.request_reconcile()  # sync context: swallowed, no task
+        self.assertIsNone(mgr._push_reconcile_task)
+
+    def test_respects_stopping_flag(self) -> None:
+        async def go():
+            mgr, db = self._mgr()
+            mgr._stopping = True
+            mgr.poll_once = AsyncMock(return_value=0)
+            mgr.request_reconcile()
+            self.assertIsNone(mgr._push_reconcile_task)
+            await asyncio.sleep(0)
+            mgr.poll_once.assert_not_awaited()
+        _run(go())
+
+
 if __name__ == "__main__":
     unittest.main()

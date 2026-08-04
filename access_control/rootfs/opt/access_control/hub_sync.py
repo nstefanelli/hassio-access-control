@@ -353,6 +353,13 @@ class HubSyncManager:
         # reference keeps it from being garbage-collected mid-flight.
         self._push_reconcile_task: Optional[asyncio.Task] = None
         self._push_reconcile_queued = False
+        # Terminal shutdown latch. Set at the top of :meth:`shutdown` BEFORE
+        # it takes ``_poll_lock``: from that moment no new push-reconcile
+        # task may be scheduled and no poll pass may start, so a trailing
+        # pass queued moments before shutdown can never re-drive hubs (e.g.
+        # re-apply keep_unlock + write a fresh durable hold row) AFTER the
+        # shutdown pass released the app-owned rules of an exiting process.
+        self._stopping = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -378,6 +385,11 @@ class HubSyncManager:
         only a wake-up hint; the pass re-reads authenticated state itself).
         """
         try:
+            if self._stopping:
+                # Shutdown owns the endgame: a late WS event must not
+                # schedule work that could re-drive hubs after the shutdown
+                # pass released the app-owned rules.
+                return
             if not self._is_tracked_entity(entity_id):
                 return
             _LOGGER.debug(
@@ -386,26 +398,56 @@ class HubSyncManager:
                 entity_id,
                 new_state,
             )
-            # A push event is an explicit invalidation: even a manager whose
-            # lock-table reads are idle-backed-off must re-check immediately.
-            self._idle_recheck_until = 0.0
-            task = self._push_reconcile_task
-            if task is not None and not task.done():
-                # Single-flight with one trailing pass: the running pass may
-                # have sampled state from before this event, so queue exactly
-                # one follow-up; further events while either runs are served
-                # by that same trailing pass.
-                self._push_reconcile_queued = True
-                return
-            self._push_reconcile_queued = False
-            self._push_reconcile_task = asyncio.get_running_loop().create_task(
-                self._push_reconcile()
-            )
+            self._schedule_coalesced_reconcile()
         except Exception:
             # Contract: never raise into the event callback.
             _LOGGER.exception(
                 "Hub sync: failed to schedule push reconcile for %s", entity_id
             )
+
+    def request_reconcile(self) -> None:
+        """Wake reconciliation for an out-of-band configuration change.
+
+        Sync, cheap, never raises. Used by the settings save path so a
+        runtime ``sync_hub_state`` toggle converges within one coalesced
+        pass instead of waiting for the slow WS-healthy backstop poll.
+        Unlike :meth:`notify_ha_state_change` this deliberately ignores the
+        tracked-entity filter — a newly opted-in lock has no tracked state
+        yet — while still respecting the terminal ``_stopping`` latch.
+        """
+        try:
+            if self._stopping:
+                return
+            _LOGGER.debug(
+                "Hub sync: reconcile requested — waking reconciliation"
+            )
+            self._schedule_coalesced_reconcile()
+        except Exception:
+            # Same contract as notify_ha_state_change: never raise into the
+            # (sync) caller — the periodic poll still provides convergence.
+            _LOGGER.exception("Hub sync: failed to schedule reconcile request")
+
+    def _schedule_coalesced_reconcile(self) -> None:
+        """Schedule the shared single-flight reconcile task.
+
+        Requires a running event loop; exceptions propagate to the caller
+        (both public wake paths wrap this in their never-raise guard).
+        """
+        # A wake-up is an explicit invalidation: even a manager whose
+        # lock-table reads are idle-backed-off must re-check immediately.
+        self._idle_recheck_until = 0.0
+        task = self._push_reconcile_task
+        if task is not None and not task.done():
+            # Single-flight with one trailing pass: the running pass may
+            # have sampled state from before this event, so queue exactly
+            # one follow-up; further events while either runs are served
+            # by that same trailing pass.
+            self._push_reconcile_queued = True
+            return
+        self._push_reconcile_queued = False
+        self._push_reconcile_task = asyncio.get_running_loop().create_task(
+            self._push_reconcile()
+        )
 
     def _is_tracked_entity(self, entity_id: str) -> bool:
         """Return whether ``entity_id`` has any tracked/synced pairing state.
@@ -475,6 +517,59 @@ class HubSyncManager:
         """
         return tuple(sorted(self._fail_safe_reset_eids))
 
+    def has_pending_work(self) -> bool:
+        """Return whether a poll pass would act WITHOUT any external event.
+
+        Deferred/backoff work resumes only when a pass runs, and none of it
+        produces an HA ``state_changed`` push — so while any of it is live
+        the main-loop poll must stay on the fast :data:`POLL_INTERVAL`
+        cadence and may not relax to the WS-healthy backstop. Deliberately
+        cheap (dict emptiness / max-deadline checks, no DB or network) so
+        the loop can call it every iteration. Covered state, exhaustively:
+
+        - ``_pending_release`` non-empty: hubs still owed a reset/keep_lock
+          drive, retried each pass on ``_release_backoff`` spacing.
+        - ``_fail_safe_reset_eids`` non-empty: a live locked-wins latch is
+          re-asserted/released by passes, not by events.
+        - any ``_backoff_until`` deadline in the future: a failed drive is
+          retried by the first pass after the deadline (fast cadence is
+          engaged while the deadline runs so that pass is at most
+          POLL_INTERVAL late).
+        - any ``_suspended_until`` deadline in the future: a flap-suspended
+          hold-open resumes on the first pass after the suspension.
+        - ``_access_momentary_until`` non-empty (live OR expired): a live
+          lease's expiry must be consumed by a pass (an expired lease falls
+          into locked-wins with no event at the boundary), and only a pass
+          ever pops the entry — so presence, not deadline, is what counts.
+        - any live ``_app_initiated_until`` marker: a lost push event means
+          the app-initiated unlock edge must still be OBSERVED by a pass
+          before the marker expires, or ``relock_on_ha_origin`` would later
+          misclassify it as external. (Expired markers are inert — they are
+          only ever consulted, never consumed, so they do not count.)
+        - any ``_last_applied_at`` within :data:`_MIN_APPLY_INTERVAL`: the
+          min-apply damping may just have deferred a pending hold-open; the
+          first pass after the window applies it without any new event.
+        """
+        if (
+            self._pending_release
+            or self._fail_safe_reset_eids
+            or self._access_momentary_until
+        ):
+            return True
+        now = time.monotonic()
+        for deadlines in (
+            self._backoff_until,
+            self._suspended_until,
+            self._app_initiated_until,
+        ):
+            if deadlines and max(deadlines.values()) > now:
+                return True
+        if self._last_applied_at and (
+            max(self._last_applied_at.values()) + _MIN_APPLY_INTERVAL > now
+        ):
+            return True
+        return False
+
     @staticmethod
     def is_access_state_event(event_type: str) -> bool:
         """Return whether an Access event can change a persistent door rule."""
@@ -498,14 +593,23 @@ class HubSyncManager:
         )
 
     def mark_app_initiated_unlock(
-        self, entity_id: str, ttl: float = 15.0
+        self, entity_id: str, ttl: float = BACKSTOP_POLL_INTERVAL + 15.0
     ) -> None:
         """Mark an imminent HA unlock as app-initiated for ``ttl`` seconds.
 
         Used by the manual dashboard Unlock (a deliberate hold-open that cancels
         pending re-locks) so ``relock_on_ha_origin`` does not observe that HA
-        edge as an external thumb-turn. The short TTL covers the 5s poll edge
-        without leaving a genuine later external unlock uncovered.
+        edge as an external thumb-turn. The TTL must outlive the WORST-CASE
+        delay until a poll pass first observes the unlock edge: with the WS
+        push feed healthy the periodic poll relaxes to
+        ``BACKSTOP_POLL_INTERVAL`` (60s), so a lost/late push event means the
+        edge may only be seen by the next backstop pass — up to a full
+        backstop interval later, plus slack for that pass to sample HA
+        (confirm retries / command-barrier waits). Hence backstop + 15s;
+        a 15s-only TTL (sized for the old 5s cadence) expired first and made
+        ``_ensure_ha_origin_relock`` misclassify the deliberate hold-open as
+        an external unlock, scheduling a spurious auto-relock. Still bounded
+        so a genuine later external unlock is not left uncovered.
         """
         self._app_initiated_until[entity_id] = (
             time.monotonic() + max(0.0, float(ttl))
@@ -628,6 +732,37 @@ class HubSyncManager:
         ``backup: cold``) does not re-lock a door deliberately held open.
         :meth:`recover` validates the marker with readback before re-adopting.
         """
+        # Terminal: refuse all new push/poll work BEFORE waiting on the poll
+        # lock, then cancel any in-flight push-reconcile pass. Without this,
+        # (a) a trailing pass queued just before shutdown would acquire
+        # ``_poll_lock`` AFTER this method released the app-owned holds and
+        # run a full normal pass that can re-drive hubs (fresh keep_unlock +
+        # durable hold row) from an exiting process, and (b) a push pass
+        # holding ``_poll_lock`` could starve the bounded (15s) manager
+        # shutdown into exiting without releasing app-owned rules at all.
+        # Cancelling mid-pass is safe by the same contract as the cancelled
+        # hub-sync loop: passes are lock-serialized desired-state convergence
+        # and every partial effect is either durable-first or retried by
+        # recover() from the retained hold rows.
+        self._stopping = True
+        self._push_reconcile_queued = False
+        task = self._push_reconcile_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                # Suppress the push task's own cancellation, but preserve an
+                # outer cancellation (the bounded manager shutdown timing
+                # out) so the 15s bound is never silently exceeded.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+            except Exception:
+                _LOGGER.exception(
+                    "Hub sync: push reconcile task failed during shutdown"
+                )
+        self._push_reconcile_task = None
         async with self._poll_lock:
             await self._load_persisted_sync_state()
             # A release already pending at shutdown entry means something is
@@ -728,6 +863,12 @@ class HubSyncManager:
         One sync pass over all opted-in locks. Returns the number of
         state changes successfully applied to hubs.
         """
+        if self._stopping:
+            # shutdown() owns every remaining action. A pass that slipped in
+            # behind it (queued trailing push pass, a late poll_once) must
+            # not re-drive hubs after the shutdown release.
+            return 0
+
         if self._urgent_lockdown.is_set() and not enforcing_lockdown:
             return 0
 

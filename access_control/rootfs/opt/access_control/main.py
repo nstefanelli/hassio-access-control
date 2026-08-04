@@ -161,18 +161,42 @@ async def _persist_resolved_secret_key_metadata(
 # HA push wiring helpers
 # ---------------------------------------------------------------------------
 
-def _hub_sync_poll_interval(ha_client) -> float:
+def _hub_sync_poll_interval(ha_client, manager=None) -> float:
     """Choose the hub-sync loop's sleep for the next iteration.
 
-    While the HA websocket push feed is live (``ws_connected``), state
-    changes wake reconciliation via ``notify_ha_state_change`` and the
-    periodic poll is only a slow drift/missed-event backstop. Read via
-    getattr with a False default so older or injected clients without
-    websocket support degrade to the full 5s polling cadence.
+    The slow backstop cadence is safe only when EVERY faster signal is
+    healthy and nothing is waiting on a pass:
+
+    - ``ws_connected`` — state changes wake reconciliation via
+      ``notify_ha_state_change``, so the poll is only a drift/missed-event
+      backstop.
+    - ``connected`` (REST) — the manager's HA-outage fail-safe keys on the
+      REST client state (a 401/circuit-open can flip REST down while the
+      authenticated WS stays up); held-open doors must then fail safe on
+      the fast cadence, not once a minute.
+    - ``manager.has_pending_work()`` — deferred/backoff work (pending
+      releases, failure backoffs, flap suspensions, min-apply deferrals,
+      live momentary/app-initiated markers, fail-safe latches) resumes
+      only on a pass and produces no push event.
+
+    Everything is read via getattr with safe defaults so older or injected
+    clients/managers degrade to the full 5s polling cadence (fail fast,
+    never fail slow).
     """
-    if ha_client is not None and getattr(ha_client, "ws_connected", False):
-        return HubSyncManager.BACKSTOP_POLL_INTERVAL
-    return HubSyncManager.POLL_INTERVAL
+    if ha_client is None or not (
+        getattr(ha_client, "ws_connected", False)
+        and getattr(ha_client, "connected", False)
+    ):
+        return HubSyncManager.POLL_INTERVAL
+    has_pending_work = getattr(manager, "has_pending_work", None)
+    if callable(has_pending_work):
+        try:
+            if has_pending_work():
+                return HubSyncManager.POLL_INTERVAL
+        except Exception:
+            logger.exception("has_pending_work failed; polling fast")
+            return HubSyncManager.POLL_INTERVAL
+    return HubSyncManager.BACKSTOP_POLL_INTERVAL
 
 
 def _make_ha_state_changed_callback(app: FastAPI):
@@ -1740,13 +1764,18 @@ async def _lifespan_inner(app: FastAPI):
         # Access doors. Access events and HA state_changed push events wake
         # it early; polling authenticated HA state plus Access rule/relay
         # readback catches missed events, bounds drift, and confirms physical
-        # convergence. While the HA websocket is healthy the poll relaxes to
-        # the slow backstop cadence; the interval is re-chosen every
-        # iteration so a WS drop restores 5s polling within one sleep.
+        # convergence. Only while the HA websocket AND REST client are both
+        # healthy and the manager reports no pending deferred/backoff work
+        # does the poll relax to the slow backstop cadence; the interval is
+        # re-chosen every iteration so a WS/REST drop or newly pending work
+        # restores 5s polling within one sleep.
         async def _hub_sync_loop():
             while True:
                 await asyncio.sleep(
-                    _hub_sync_poll_interval(app.state.ha_client)
+                    _hub_sync_poll_interval(
+                        app.state.ha_client,
+                        getattr(app.state, "hub_sync_manager", None),
+                    )
                 )
                 mgr = app.state.hub_sync_manager
                 if mgr is None:

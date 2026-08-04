@@ -1429,6 +1429,14 @@ async def update_lock_settings(
         relock_on_ha_origin=bool(relock_on_ha_origin),
         preserve_hold_on_restart=bool(preserve_hold_on_restart),
     )
+    # A runtime sync_hub_state change must converge promptly. With the HA
+    # websocket healthy the periodic poll relaxes to a slow backstop, and a
+    # settings save produces no HA state_changed push — so kick a coalesced
+    # reconcile pass directly (never raises; a no-op while shutting down).
+    manager = getattr(request.app.state, "hub_sync_manager", None)
+    request_reconcile = getattr(manager, "request_reconcile", None)
+    if callable(request_reconcile):
+        request_reconcile()
     return _redirect(request, "/locks")
 
 
