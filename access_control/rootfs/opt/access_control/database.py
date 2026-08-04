@@ -2301,14 +2301,14 @@ class Database:
                      )"""
         async with self._rate_limit_lock:
             async with self._db.execute(
-                "SELECT 1 FROM rate_limits" + prune_where + " LIMIT 1",
+                "SELECT 1 FROM rate_limits" + prune_where + " LIMIT 1",  # nosec B608 — prune_where is a literal
                 (now, stale_before),
             ) as cur:
                 has_expired_rows = await cur.fetchone() is not None
             if not has_expired_rows:
                 return
             await self._db.execute(
-                "DELETE FROM rate_limits" + prune_where,
+                "DELETE FROM rate_limits" + prune_where,  # nosec B608 — prune_where is a literal
                 (now, stale_before),
             )
             await self._db.commit()
