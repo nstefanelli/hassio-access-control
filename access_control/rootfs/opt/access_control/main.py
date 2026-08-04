@@ -71,6 +71,11 @@ _HERE = Path(__file__).parent
 # Hub release and relock cleanup each get a bounded quarter of that budget so
 # client closure and SQLite still have time to complete.
 _MANAGER_SHUTDOWN_TIMEOUT_SECONDS = 15.0
+# Bring-up topology retry backoff: one flaky HTTP fetch during Access
+# bring-up must not black out door-event processing until the 15-minute
+# periodic resync. Module constants so tests can compress the schedule.
+_TOPOLOGY_RETRY_INITIAL_DELAY_SECONDS = 15.0
+_TOPOLOGY_RETRY_MAX_DELAY_SECONDS = 300.0
 
 # `_resolve_ha_creds` lives in `ha_creds.py` so the env-vs-DB precedence
 # logic can be unit-tested without dragging FastAPI (and main.py's whole
@@ -218,6 +223,7 @@ async def _lifespan_inner(app: FastAPI):
     app.state.topology_sync_lock = asyncio.Lock()
     app.state.visitor_operation_locks = {}
     app.state.access_data_lock = asyncio.Lock()
+    app.state.topology_retry_task = None
 
     # Door-event work is deliberately fire-and-forget during normal
     # operation, but it still needs an owner so shutdown can cancel and await
@@ -388,13 +394,62 @@ async def _lifespan_inner(app: FastAPI):
             app.state.event_topology_ready = True
             logger.info("Camera→location map: %d entries", len(new_map))
 
+    async def _topology_bringup_retry() -> None:
+        """Short-interval sync_users() retries after a failed bring-up sync.
+
+        While event_topology_ready is False every Access AND Protect door
+        event is hard-dropped (fail-closed). Waiting for the 900s periodic
+        resync would black out door-event processing for up to 15 minutes
+        after one flaky HTTP fetch at boot, so retry on a capped backoff
+        until the sync succeeds or the client is stopped.
+        """
+        delay = _TOPOLOGY_RETRY_INITIAL_DELAY_SECONDS
+        while True:
+            await asyncio.sleep(delay)
+            if app.state.event_topology_ready:
+                return
+            sync = app.state.sync_users
+            if sync is None or app.state.access_client is None:
+                # Client stopped/retired — the next bring-up schedules its
+                # own retry if its sync fails again.
+                return
+            try:
+                await sync()
+            except Exception:
+                delay = min(delay * 2, _TOPOLOGY_RETRY_MAX_DELAY_SECONDS)
+                logger.exception(
+                    "Topology sync retry failed — next attempt in %.0fs",
+                    delay,
+                )
+            else:
+                if app.state.event_topology_ready:
+                    logger.info("Topology sync retry succeeded")
+                    return
+                # sync() returned without publishing (e.g. a retired client
+                # was detected mid-apply) — keep retrying on the backoff.
+                delay = min(delay * 2, _TOPOLOGY_RETRY_MAX_DELAY_SECONDS)
+
+    def _schedule_topology_bringup_retry() -> None:
+        """Single-flight scheduling of the bring-up topology retry task."""
+        existing = app.state.topology_retry_task
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            _topology_bringup_retry(), name="topology-bringup-retry"
+        )
+        app.state.topology_retry_task = task
+        # Tracked like other event work so shutdown (and live-client
+        # publication swaps) cancel it before clients/SQLite close.
+        _track_event_task(task)
+
+    app.state.schedule_topology_bringup_retry = _schedule_topology_bringup_retry
+
     # Semaphore to cap concurrent process_event invocations during event floods
     _event_semaphore = asyncio.Semaphore(5)
 
     # Register WebSocket event callback
     def on_access_event(message: dict) -> None:
         """Dispatch relevant Access events to the auth engine."""
-        app.state.ws_last_event["access"] = datetime.now(timezone.utc).isoformat()
         if not app.state.event_topology_ready:
             logger.warning(
                 "Dropping Access event while topology is being refreshed"
@@ -527,6 +582,12 @@ async def _lifespan_inner(app: FastAPI):
                 ulp_id = "remote"
             else:
                 return
+
+        # Only a confirmed door-relevant event (credential or remote unlock)
+        # refreshes the scheduled-reboot "someone at the door" guard.
+        # Stamping on every WS message let periodic non-door chatter keep
+        # the guard perpetually fresh, so the maintenance reboot never fired.
+        app.state.ws_last_event["access"] = datetime.now(timezone.utc).isoformat()
 
         # Apply dedup before the remote-unlock early return too. Re-delivered
         # remote events used to replace the durable relock row and extend the
@@ -770,15 +831,21 @@ async def _lifespan_inner(app: FastAPI):
 
     def on_protect_event(message: dict) -> None:
         """Handle ring, NFC, fingerprint, and doorAccess events from Protect."""
+        event = message.get("event", "")
+        camera_id = message.get("camera_id", "")
+        if not camera_id:
+            return
+        if event not in ("door_access", "ring", "nfc", "fingerprint"):
+            # Periodic non-door chatter (motion, device status) must not be
+            # recorded as door activity — it kept the scheduled-reboot
+            # "someone at the door" guard perpetually fresh, so the
+            # maintenance reboot never fired.
+            return
         app.state.ws_last_event["protect"] = datetime.now(timezone.utc).isoformat()
         if not app.state.event_topology_ready:
             logger.warning(
                 "Dropping Protect event while topology is being refreshed"
             )
-            return
-        event = message.get("event", "")
-        camera_id = message.get("camera_id", "")
-        if not camera_id:
             return
 
         auth_engine = app.state.auth_engine
@@ -1119,16 +1186,33 @@ async def _lifespan_inner(app: FastAPI):
         # closed as enabled until an operator can explicitly clear it.
         await app.state.auth_engine.load_persisted_lockdown()
 
+        # Restore the last-known HA timezone before event processing starts —
+        # if HA Core is down at boot, schedules would otherwise evaluate in
+        # container-local time (UTC on stock HAOS) until the next successful
+        # health tick, granting/denying at the wrong local hours. A missing,
+        # unreadable, or invalid value keeps the TZ-env / container-local
+        # fallback; set_timezone() rejects invalid names itself.
+        try:
+            persisted_tz = await db.get_config("ha_timezone")
+        except Exception:
+            persisted_tz = None
+            logger.exception(
+                "Failed to read persisted HA timezone — schedules use %s",
+                app.state.auth_engine.tz,
+            )
+        if persisted_tz:
+            app.state.auth_engine.set_timezone(persisted_tz)
+
         # Align schedule evaluation with the site's local timezone. HA's
         # configured time_zone is authoritative; until it's available the
-        # engine falls back to TZ env / container-local time (see
-        # auth_engine._default_timezone). The HA health loop retries this
-        # on recovery if HA was down at boot.
+        # engine falls back to the persisted zone loaded above, then TZ env /
+        # container-local time (see auth_engine._default_timezone). The HA
+        # health loop retries this on recovery if HA was down at boot.
         if ha_ok:
             try:
                 tz_name = await ha_client.get_timezone()
                 if tz_name:
-                    app.state.auth_engine.set_timezone(tz_name)
+                    await app.state.auth_engine.apply_ha_timezone(tz_name)
             except Exception:
                 logger.exception("Failed to fetch HA timezone — schedules use %s",
                                  app.state.auth_engine.tz)
@@ -1260,12 +1344,14 @@ async def _lifespan_inner(app: FastAPI):
                     try:
                         await sync_users()
                     except Exception:
-                        # Keep event intake fail-closed until the periodic sync
-                        # succeeds and marks event_topology_ready.
+                        # Keep event intake fail-closed until a retry succeeds
+                        # and marks event_topology_ready — but retry on a short
+                        # backoff instead of waiting for the 900s resync loop.
                         app.state.event_topology_ready = False
                         logger.exception(
                             "Topology refresh failed during Access bring-up"
                         )
+                        _schedule_topology_bringup_retry()
 
                     candidate.register_callback(on_access_event)
                     await candidate.start_websocket()
@@ -1311,6 +1397,15 @@ async def _lifespan_inner(app: FastAPI):
                 if not creds:
                     return False
                 host, user, pwd = creds
+                if existing is not None:
+                    # Best-effort close of the stale disconnected client so
+                    # each recovery cycle does not leak its aiohttp session.
+                    try:
+                        await existing.close()
+                    except Exception:
+                        logger.exception(
+                            "Failed to close stale Protect client before replacement"
+                        )
                 protect_client = ProtectClient(host, user, pwd)
                 try:
                     await protect_client.login()
@@ -1429,7 +1524,19 @@ async def _lifespan_inner(app: FastAPI):
                         if access_client is None:
                             continue
                         unvr_visitors = await access_client.list_visitors()
-                    unvr_map = {v["unique_id"]: v for v in unvr_visitors}
+                    unvr_map: dict[str, dict] = {}
+                    for uv in unvr_visitors:
+                        uv_id = uv.get("unique_id")
+                        if not uv_id:
+                            # A malformed upstream row must not abort the
+                            # whole 5-minute sync pass with a KeyError.
+                            logger.warning(
+                                "Skipping upstream visitor row without "
+                                "unique_id (name=%r)",
+                                uv.get("name"),
+                            )
+                            continue
+                        unvr_map[uv_id] = uv
                     for lv in remaining_visitors:
                         uvid = lv["unvr_visitor_id"]
                         uv = unvr_map.get(uvid)
@@ -1510,14 +1617,15 @@ async def _lifespan_inner(app: FastAPI):
                         except Exception:
                             logger.exception("Relock rehydrate after HA recovery failed")
                     # Refresh the schedule timezone — covers HA being down
-                    # at boot (the engine would still be on its TZ-env /
-                    # container-local fallback).
+                    # at boot (the engine would still be on its persisted /
+                    # TZ-env / container-local fallback). apply_ha_timezone
+                    # also persists the zone for the next HA-down boot.
                     engine = app.state.auth_engine
                     if engine is not None:
                         try:
                             tz_name = await ha.get_timezone()
                             if tz_name:
-                                engine.set_timezone(tz_name)
+                                await engine.apply_ha_timezone(tz_name)
                         except Exception:
                             logger.exception("Timezone refresh after HA recovery failed")
                 elif previous_connected and not now_connected:
