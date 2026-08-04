@@ -37,7 +37,7 @@ The process listens on port `8080` inside its container.
 | `access_client.py` | UniFi Access login/site binding, private compatibility API, token-authenticated Open API, lock-rule/state confirmation, WebSocket events, retry, and reauthentication |
 | `protect_client.py` | UniFi Protect login and WebSocket events |
 | `auth_engine.py` | User, rule, schedule, alarm, lockdown, and unlock decisions |
-| `ha_client.py` | Home Assistant REST calls and circuit breaking |
+| `ha_client.py` | Home Assistant REST calls, circuit breaking, and the `state_changed` WebSocket push feed |
 | `relock_manager.py` | Durable timed re-locks, retry, rehydration, and failure events |
 | `hub_sync.py` | Optional bidirectional, origin-aware convergence between an HA lock and its paired Access door |
 | `database.py` | Schema, migrations, transactions, audit logs, rate limits, and durable runtime state |
@@ -187,8 +187,14 @@ only `locked`/`unlocked` changes propagate to Access. Access-only changes,
 including a verified unlock-schedule activation/deactivation, propagate to HA.
 The Access WebSocket's schedule/temporary-rule events only mark a location
 dirty and trigger an early pass; they are never accepted as proof of an open
-door. The regular five-second poll performs authenticated readback and catches
-dropped/unsupported events and out-of-band changes.
+door. HA-side lock changes arrive as `state_changed` push events over the HA
+WebSocket and wake the same reconciliation immediately — coalesced so an event
+burst across many locks collapses into one in-flight pass plus at most one
+trailing pass — and are likewise wake-up hints, never trusted state. The
+periodic poll performs authenticated readback and catches dropped/unsupported
+events and out-of-band changes; it relaxes to a 60-second reconciliation
+backstop while the HA WebSocket is connected, HA REST health is good, and no
+deferred work is pending, and returns to five-second polling otherwise.
 
 On a fresh mismatch, locked wins unless the Access rule is an active
 `schedule` and the relay is also confirmed unlocked. After a baseline, one-
@@ -336,8 +342,10 @@ is active is not a consistent backup.
 
 ## Resilience and efficiency
 
-- Access and Protect WebSockets reconnect with bounded jittered backoff and
-  reauthenticate on an expired session.
+- Access, Protect, and HA WebSockets reconnect with bounded jittered backoff;
+  Access and Protect reauthenticate on an expired session, and an HA
+  `auth_invalid` is treated as transient Supervisor token rotation rather than
+  a terminal failure.
 - Repeated upgrade authentication failures stop an infinite credential replay
   loop.
 - aiohttp heartbeats and supervised reconnect loops detect socket failure;
@@ -356,12 +364,16 @@ is active is not a consistent backup.
   on login and every reauthentication/reconnect.
 - Open API Bearer traffic uses an isolated cookieless session on port `12445`;
   configured-token failures cannot downgrade to the private API.
-- Access rule events reduce bidirectional-sync latency, while periodic
-  authenticated rule/relay reads remain authoritative and repair drift.
+- Access rule events and HA `state_changed` push events reduce bidirectional-
+  sync latency, while periodic authenticated rule/relay reads remain
+  authoritative and repair drift; the poll relaxes to a 60-second backstop
+  while push and HA REST health are good.
 - Event handling is deduplicated and concurrency-bounded.
-- UI cache refresh tasks are lifespan-owned. Hub-sync and re-lock manager
-  shutdown each have a 15-second bound inside the manifest's 60-second stop
-  timeout. The complete teardown does not yet have one aggregate deadline, so
+- UI cache refresh tasks are lifespan-owned. Hub-sync shutdown first refuses
+  new push wakes and cancels any in-flight push-driven pass, so a late HA
+  event cannot re-drive a hub after app-owned holds are released. Hub-sync and
+  re-lock manager shutdown each have a 15-second bound inside the manifest's
+  60-second stop timeout. The complete teardown does not yet have one aggregate deadline, so
   Supervisor force-stop remains possible if a later client or database close
   stalls.
 

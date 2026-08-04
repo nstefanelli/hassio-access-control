@@ -193,8 +193,10 @@ applicable unlocked baselines return to native scheduling; during lockdown,
 managed ownership remains `keep_lock`. A manual native-door **Unlock** is a
 separate persistent Access rule and remains until a later rule command replaces
 it; it is not hub-sync ownership.
-For opted-in pairs, Access rule events trigger an immediate authenticated
-reconcile and the five-second poll catches missed events or external drift.
+For opted-in pairs, Access rule events and HA `state_changed` WebSocket push
+events trigger an immediate authenticated reconcile; a periodic poll catches
+missed events or external drift, relaxing to a 60-second backstop while the
+push feed and HA REST health are good and returning to five seconds otherwise.
 HA-only changes flow to Access; Access-only changes, including verified native
 schedule activation/deactivation, flow to HA. Unreadable state, simultaneous
 opposing changes, and unbaselined disagreement resolve locked, except that a

@@ -251,8 +251,9 @@ boundaries:
   `keep_lock`, reports unresolved enforcement, and retries persistence;
 - restart treats durable hub-sync ownership as uncertain and first confirms
   the safe `keep_lock` direction;
-- Access rule events are wake-up hints only; authenticated polling/readback is
-  authoritative and repairs dropped events or drift;
+- Access rule events and HA `state_changed` push events are wake-up hints
+  only; authenticated polling/readback is authoritative and repairs dropped
+  events or drift;
 - an unbaselined mismatch, unreadable side, multi-hub disagreement, or opposing
   concurrent HA/Access changes resolves locked; only a verified active Access
   schedule with an unlocked relay can establish an unlocked startup baseline;

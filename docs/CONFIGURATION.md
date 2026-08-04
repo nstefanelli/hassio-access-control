@@ -283,10 +283,13 @@ both HA state and the Access rule/relay:
 - an HA-only `locked`/`unlocked` change is applied and confirmed on Access;
 - an Access-only lock/unlock or native schedule transition is applied and
   confirmed on HA;
-- Access schedule/temporary-rule events trigger an immediate readback pass;
-  they are wake-up hints, not trusted state assertions;
-- the normal five-second poll detects missed events, older firmware without
-  those events, and out-of-band drift;
+- Access schedule/temporary-rule events and HA `state_changed` WebSocket push
+  events trigger an immediate readback pass; they are wake-up hints, not
+  trusted state assertions;
+- a periodic poll detects missed events, older firmware without those events,
+  and out-of-band drift — a 60-second reconciliation backstop while the HA
+  WebSocket push feed and REST connection are healthy and no deferred work is
+  pending, five-second polling otherwise;
 - the last fully confirmed states, Access-rule fingerprint, origin, and pairing
   signature survive restart to prevent echo loops.
 

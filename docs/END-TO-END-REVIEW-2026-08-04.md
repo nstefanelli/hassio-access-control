@@ -63,13 +63,16 @@ are recorded below as open recommendations. The full test suite grew from
 - **DB-6 (historical):** migration 13's blanket `buzz_duration 5→30` rewrite
   already ran on upgraded installs; nothing to fix retroactively.
 
-## Open recommendations (not changed on this branch)
+## Open recommendations
 
-1. **CLI-6 — HA WebSocket push.** Hub sync polls HA lock state over REST every
-   5s per lock (~17k requests/day/lock). Subscribing to HA's `state_changed`
-   WebSocket events with a slow reconciliation poll as backstop would cut both
-   the load and the worst-case 5s reaction latency. Largest remaining
-   performance item; needs an HAClient WebSocket implementation.
+1. **CLI-6 — HA WebSocket push.** **RESOLVED on this branch.** Hub sync polled
+   HA lock state over REST every 5s per lock (~17k requests/day/lock).
+   Implemented in the follow-up commits on this same branch:
+   `HAClient.start_websocket` subscribes to `state_changed` and drives
+   `HubSyncManager.notify_ha_state_change`; the REST poll is now a 60s
+   reconciliation backstop (`BACKSTOP_POLL_INTERVAL`) that falls back to 5s
+   whenever the push feed is down, REST health is bad, or deferred work is
+   pending.
 2. **CORE-5 — relock cancellation semantics.** A granted credential tap on an
    HA lock with `relock_on_device_auth=0` (the default) cancels a pre-existing
    durable relock from an earlier buzz/remote unlock, converting a bounded
@@ -94,7 +97,9 @@ are recorded below as open recommendations. The full test suite grew from
 6. **HS-5 — event-burst coalescing.** A schedule transition across N doors
    queues N sequential full reconcile passes; coalescing to one trailing pass
    (or consuming `_dirty_locations` for scoped passes) would bound burst
-   latency.
+   latency. *Partially addressed on this branch:* HA-origin event bursts now
+   coalesce (`notify_ha_state_change` is single-flight with at most one
+   trailing pass); Access-event burst coalescing remains open.
 7. **DB-7 — legacy `commit=False` batch API.** An abandoned batch leaks an
    open `BEGIN IMMEDIATE` connection until shutdown. Production code no longer
    uses the path (tests only); remove it or add a task-done rollback callback.
@@ -107,3 +112,15 @@ are recorded below as open recommendations. The full test suite grew from
   reproductions of HS-1 (unlock revert), HS-2/HS-4 (write churn), and HS-3
   (stranded keep_lock).
 - `pip-audit` clean for the two bumped packages at the new pins.
+
+### Follow-up (same branch)
+
+After this report was written, the CLI-6 recommendation was implemented on the
+same branch (HA WebSocket push driving hub sync, with the 5s poll relaxed to a
+60s reconciliation backstop). The new feature was itself adversarially
+reviewed by two independent reviewers; their findings — shutdown ownership of
+the push-reconcile task, `mark_app_initiated_unlock` TTL sizing against the
+backstop interval, making the backstop REST-health- and pending-work-aware,
+and HA WebSocket lifecycle races (stop/start/close ordering, post-jitter
+backoff clamp) — were fixed with regression tests. Final suite after the
+follow-up work: **637 passed, 122 subtests passed**.

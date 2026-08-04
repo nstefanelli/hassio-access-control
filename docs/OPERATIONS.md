@@ -268,6 +268,11 @@ metadata.
   credentials.
 - Inspect `ha_last_error` and `ha_circuit_state`. After repeated failures the
   circuit opens, then admits a bounded recovery probe.
+- The hub-sync push feed (HA WebSocket) reconnects with jittered backoff and
+  treats `auth_invalid` as transient Supervisor token rotation. While it is
+  down — or while HA REST health is degraded — hub sync automatically returns
+  to the fast five-second polling cadence, so a broken push feed costs
+  latency headroom, not correctness.
 
 ### Access or Protect repeatedly returns 401
 
@@ -460,10 +465,13 @@ reusing the old policy.
   every other fresh mismatch is locked-wins. Later HA-only changes flow to
   Access and Access-only changes flow to HA. Opposing simultaneous changes
   resolve locked.
-- Access schedule/temporary-rule events trigger immediate reconciliation, but
-  the periodic five-second readback remains authoritative and repairs missed
-  events or drift. Check that the Access WebSocket is connected, then wait at
-  least one poll interval before diagnosing a missed event.
+- Access schedule/temporary-rule events and HA `state_changed` push events
+  trigger immediate reconciliation, but the periodic authenticated readback
+  remains authoritative and repairs missed events or drift. It runs as a
+  60-second backstop while the HA WebSocket push feed and HA REST health are
+  good and no deferred work is pending, and every five seconds otherwise.
+  Check that the Access WebSocket is connected, then wait at least one
+  backstop interval before diagnosing a missed event.
 - During lockdown, an unlocked value on either side cannot hold the hub open;
   fail-safe control uses `keep_lock`, not `reset`, so an active native schedule
   cannot reopen it. The pair stays in `lockdown_enforcement_pending` until every
