@@ -158,6 +158,66 @@ async def _persist_resolved_secret_key_metadata(
 
 
 # ---------------------------------------------------------------------------
+# HA push wiring helpers
+# ---------------------------------------------------------------------------
+
+def _hub_sync_poll_interval(ha_client) -> float:
+    """Choose the hub-sync loop's sleep for the next iteration.
+
+    While the HA websocket push feed is live (``ws_connected``), state
+    changes wake reconciliation via ``notify_ha_state_change`` and the
+    periodic poll is only a slow drift/missed-event backstop. Read via
+    getattr with a False default so older or injected clients without
+    websocket support degrade to the full 5s polling cadence.
+    """
+    if ha_client is not None and getattr(ha_client, "ws_connected", False):
+        return HubSyncManager.BACKSTOP_POLL_INTERVAL
+    return HubSyncManager.POLL_INTERVAL
+
+
+def _make_ha_state_changed_callback(app: FastAPI):
+    """Build the async HA ``state_changed`` callback for the hub sync manager.
+
+    Locks only: alarm panel state is read on demand by the auth engine via
+    its DB-configured panels and is deliberately NOT push-wired here. The
+    manager guard mirrors the existing ``_hub_sync_loop`` (manager absent =
+    unconfigured / feature not brought up yet). ``notify_ha_state_change``
+    itself never raises and treats the payload as a wake-up hint only.
+    """
+
+    async def _on_ha_state_changed(
+        entity_id: str, old_state: str | None, new_state: str | None
+    ) -> None:
+        if not isinstance(entity_id, str) or not entity_id.startswith("lock."):
+            return
+        manager = getattr(app.state, "hub_sync_manager", None)
+        if manager is None:
+            return
+        manager.notify_ha_state_change(entity_id, new_state)
+
+    return _on_ha_state_changed
+
+
+def _register_ha_websocket(ha_client, callback) -> None:
+    """Idempotently register the HA state_changed websocket, best-effort.
+
+    ``start_websocket`` is sync and idempotent per the HAClient contract; the
+    WS loop retries connection on its own, so this is called regardless of
+    current REST connectivity. Guarded with getattr so an older/injected
+    client without websocket support simply stays on 5s polling.
+    """
+    if ha_client is None or callback is None:
+        return
+    start_ws = getattr(ha_client, "start_websocket", None)
+    if not callable(start_ws):
+        return
+    try:
+        start_ws(callback)
+    except Exception:
+        logger.exception("HA WebSocket registration failed")
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
@@ -214,6 +274,9 @@ async def _lifespan_inner(app: FastAPI):
     app.state.protect_started_client = None
     app.state.seed_lock_states = None
     app.state.mark_ha_lock_states_unknown = None
+    # HA state_changed push callback — built in initialize_configured_state
+    # and reused by the HA health loop to (re-)register the websocket.
+    app.state.on_ha_state_changed = None
     app.state.physical_command_lock = asyncio.Lock()
     app.state.physical_entity_locks = {}
     app.state.setup_lock = asyncio.Lock()
@@ -1106,6 +1169,15 @@ async def _lifespan_inner(app: FastAPI):
             app.state.ha_unhealthy = False
         app.state.ha_client = ha_client
 
+        # Push wiring: HA lock state_changed events wake hub sync directly
+        # instead of waiting out the 5s poll (the poll then relaxes to a slow
+        # backstop while ws_connected). Registered regardless of the REST
+        # test_connection outcome above — the WS loop retries on its own.
+        # The callback resolves the hub sync manager lazily off app.state,
+        # so registering before the manager is constructed below is safe.
+        app.state.on_ha_state_changed = _make_ha_state_changed_callback(app)
+        _register_ha_websocket(ha_client, app.state.on_ha_state_changed)
+
         # RelockManager wraps the relock-task dict and persists pending relocks
         # to the DB. ha_client is fetched lazily via the getter so credential
         # updates from Settings transparently use the new client. The
@@ -1593,6 +1665,11 @@ async def _lifespan_inner(app: FastAPI):
                                 )
                     previous_connected = False
                     continue
+                # Keep the state_changed websocket registered — idempotent
+                # per the client contract, and covers a client swapped in by
+                # a Settings credential update or a registration that failed
+                # at boot. The WS loop handles reconnects itself.
+                _register_ha_websocket(ha, app.state.on_ha_state_changed)
                 try:
                     now_connected = await ha.test_connection()
                 except Exception:
@@ -1660,12 +1737,17 @@ async def _lifespan_inner(app: FastAPI):
         ))
 
         # Hub sync — bidirectionally reconciles opted-in HA locks and paired
-        # Access doors. Access events wake it early; polling authenticated HA
-        # state plus Access rule/relay readback catches missed events, bounds
-        # drift, and confirms physical convergence.
+        # Access doors. Access events and HA state_changed push events wake
+        # it early; polling authenticated HA state plus Access rule/relay
+        # readback catches missed events, bounds drift, and confirms physical
+        # convergence. While the HA websocket is healthy the poll relaxes to
+        # the slow backstop cadence; the interval is re-chosen every
+        # iteration so a WS drop restores 5s polling within one sleep.
         async def _hub_sync_loop():
             while True:
-                await asyncio.sleep(HubSyncManager.POLL_INTERVAL)
+                await asyncio.sleep(
+                    _hub_sync_poll_interval(app.state.ha_client)
+                )
                 mgr = app.state.hub_sync_manager
                 if mgr is None:
                     continue
@@ -1867,10 +1949,16 @@ async def _lifespan_inner(app: FastAPI):
 
         # Stop event intake before snapshotting fire-and-forget work. Otherwise
         # a final WS callback can enqueue a physical command after the gather
-        # and run against clients/SQLite while they are being closed.
+        # and run against clients/SQLite while they are being closed. HA is
+        # included so a late state_changed push cannot wake hub sync into
+        # re-driving a hub AFTER the manager's shutdown pass released its
+        # holds below; HAClient.close() would stop the websocket too, but it
+        # runs after that shutdown pass — stop_websocket is idempotent, so
+        # the later close() is a harmless no-op stop.
         for label, client in (
             ("Protect", app.state.protect_client),
             ("Access", app.state.access_client),
+            ("HA", app.state.ha_client),
         ):
             if client is None:
                 continue

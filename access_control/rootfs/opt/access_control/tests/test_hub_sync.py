@@ -3747,5 +3747,153 @@ class TestPairingChangePreservesTransitionStart(unittest.TestCase):
         self.assertEqual(mgr._ha_transition_started.get("lock.front"), 1000.0)
 
 
+class TestPushNotify(unittest.TestCase):
+    """notify_ha_state_change — event-driven wake with coalescing (CLI-6)."""
+
+    def _tracked_mgr(self):
+        db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+        mgr = _make_mgr(db, _make_ha({"lock.front": "locked"}), _make_access())
+        mgr._applied["lock.front"] = "locked"
+        return mgr
+
+    def test_backstop_interval_constant(self) -> None:
+        self.assertEqual(HubSyncManager.POLL_INTERVAL, 5.0)
+        self.assertEqual(HubSyncManager.BACKSTOP_POLL_INTERVAL, 60.0)
+
+    def test_untracked_entity_is_ignored(self) -> None:
+        async def go():
+            mgr = self._tracked_mgr()
+            mgr.poll_once = AsyncMock(return_value=0)
+            mgr.notify_ha_state_change("lock.never_seen", "unlocked")
+            self.assertIsNone(mgr._push_reconcile_task)
+            await asyncio.sleep(0)
+            mgr.poll_once.assert_not_awaited()
+        _run(go())
+
+    def test_tracked_entity_triggers_exactly_one_pass(self) -> None:
+        async def go():
+            mgr = self._tracked_mgr()
+            mgr.poll_once = AsyncMock(return_value=0)
+            mgr.notify_ha_state_change("lock.front", "unlocked")
+            task = mgr._push_reconcile_task
+            self.assertIsNotNone(task)
+            await task
+            mgr.poll_once.assert_awaited_once()
+            self.assertIsNone(mgr._push_reconcile_task)
+        _run(go())
+
+    def test_burst_coalesces_to_one_trailing_pass(self) -> None:
+        async def go():
+            mgr = self._tracked_mgr()
+            calls = []
+            release = asyncio.Event()
+
+            async def slow_poll():
+                calls.append(1)
+                await release.wait()
+                return 0
+
+            mgr.poll_once = slow_poll
+            mgr.notify_ha_state_change("lock.front", "unlocked")
+            task = mgr._push_reconcile_task
+            self.assertIsNotNone(task)
+            # Let the first pass start and block inside poll_once.
+            await asyncio.sleep(0)
+            self.assertEqual(len(calls), 1)
+            # A burst of events while the pass runs must queue exactly ONE
+            # trailing pass and never spawn a second task.
+            for _ in range(25):
+                mgr.notify_ha_state_change("lock.front", "unlocked")
+            self.assertIs(mgr._push_reconcile_task, task)
+            release.set()
+            await task
+            self.assertEqual(len(calls), 2)
+            self.assertIsNone(mgr._push_reconcile_task)
+            self.assertFalse(mgr._push_reconcile_queued)
+        _run(go())
+
+    def test_notify_never_raises_when_poll_raises(self) -> None:
+        async def go():
+            mgr = self._tracked_mgr()
+            mgr.poll_once = AsyncMock(side_effect=RuntimeError("boom"))
+            mgr.notify_ha_state_change("lock.front", "unlocked")
+            task = mgr._push_reconcile_task
+            self.assertIsNotNone(task)
+            # The reconcile task swallows the failure (never unhandled).
+            await task
+            self.assertIsNone(mgr._push_reconcile_task)
+            mgr.poll_once.assert_awaited_once()
+        _run(go())
+
+    def test_notify_never_raises_without_running_loop(self) -> None:
+        # Sync call with no event loop: task creation fails internally and
+        # must be swallowed, not raised into the event callback.
+        mgr = self._tracked_mgr()
+        mgr.notify_ha_state_change("lock.front", "unlocked")
+        self.assertIsNone(mgr._push_reconcile_task)
+
+    def test_notify_invalidates_idle_backoff_immediately(self) -> None:
+        async def go():
+            mgr = self._tracked_mgr()
+            mgr.poll_once = AsyncMock(return_value=0)
+            mgr._idle_recheck_until = _time.monotonic() + 999.0
+            mgr.notify_ha_state_change("lock.front", "unlocked")
+            # Invalidated synchronously, before the scheduled pass even runs.
+            self.assertEqual(mgr._idle_recheck_until, 0.0)
+            task = mgr._push_reconcile_task
+            self.assertIsNotNone(task)
+            await task
+            mgr.poll_once.assert_awaited_once()
+        _run(go())
+
+    def test_idle_manager_wakes_and_runs_full_pass(self) -> None:
+        """A backed-off manager runs a REAL full pass on push notify."""
+        async def go():
+            states = {"lock.front": "unlocked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            access = _make_access()
+            mgr = _make_mgr(db, _make_ha(states), access)
+            # Converge once so the entity is tracked.
+            self.assertEqual(await mgr.poll_once(), 1)
+            reads_before = db.get_all_locks.await_count
+            # Simulate an engaged idle backoff, then a push event: the pass
+            # must NOT be skipped by the idle fast-path.
+            mgr._idle_recheck_until = _time.monotonic() + 999.0
+            mgr.notify_ha_state_change("lock.front", "unlocked")
+            task = mgr._push_reconcile_task
+            self.assertIsNotNone(task)
+            await task
+            self.assertGreater(db.get_all_locks.await_count, reads_before)
+        _run(go())
+
+    def test_trailing_pass_observes_fresh_state(self) -> None:
+        """An event landing mid-pass is served by the trailing pass: a lock
+        flipping to unlocked WHILE a pass polls converges without waiting
+        for the periodic backstop."""
+        async def go():
+            states = {"lock.front": "locked"}
+            db = _make_db([HA_LOCK, HUB], location_map={"loc-1": [HUB]})
+            access = _make_access()
+            mgr = _make_mgr(db, _make_ha(states), access)
+            self.assertEqual(await mgr.poll_once(), 1)
+            _clear_damping(mgr)
+
+            # First push pass starts against the OLD (locked) state...
+            mgr.notify_ha_state_change("lock.front", "locked")
+            task = mgr._push_reconcile_task
+            await asyncio.sleep(0)
+            # ...then the real change lands mid-flight.
+            states["lock.front"] = "unlocked"
+            mgr.notify_ha_state_change("lock.front", "unlocked")
+            await task
+            # If the first pass had already finished, the second notify made
+            # a fresh task instead of a trailing pass — drain that one too.
+            follow_up = mgr._push_reconcile_task
+            if follow_up is not None:
+                await follow_up
+            access.unlock_persistent.assert_awaited_once_with("dev-hub-1")
+        _run(go())
+
+
 if __name__ == "__main__":
     unittest.main()

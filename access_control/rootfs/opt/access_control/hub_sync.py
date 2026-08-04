@@ -195,9 +195,14 @@ class HubSyncManager:
     calling :meth:`poll_once` every :data:`POLL_INTERVAL` seconds.
     """
 
-    # Poll cadence for the main.py loop — bounds reaction latency (the
-    # app has no HA websocket).
+    # Poll cadence for the main.py loop — bounds reaction latency while the
+    # HA websocket push feed is unavailable.
     POLL_INTERVAL = 5.0
+
+    # Poll cadence while HA ``state_changed`` push events are flowing
+    # (``ha.ws_connected``). Push handles reaction latency; the poll then only
+    # reconciles drift/missed events as a slow backstop.
+    BACKSTOP_POLL_INTERVAL = 60.0
 
     def __init__(
         self,
@@ -342,6 +347,12 @@ class HubSyncManager:
         # lockdown enforcement clear/bypass it so nothing safety-relevant
         # waits on the idle recheck cadence.
         self._idle_recheck_until = 0.0
+        # Push-event coalescing (HA websocket ``state_changed`` wake-ups).
+        # At most one reconcile task runs at a time; a burst of events while
+        # it runs collapses into a single queued trailing pass. The task
+        # reference keeps it from being garbage-collected mid-flight.
+        self._push_reconcile_task: Optional[asyncio.Task] = None
+        self._push_reconcile_queued = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -351,6 +362,101 @@ class HubSyncManager:
         """Serialize and execute one desired-state convergence pass."""
         async with self._poll_lock:
             return await self._poll_once()
+
+    def notify_ha_state_change(
+        self, entity_id: str, new_state: str | None
+    ) -> None:
+        """Wake reconciliation for a pushed HA ``state_changed`` event.
+
+        Sync, cheap, and safe to call straight from an event callback: it
+        never raises and never blocks. Entities that are not part of any
+        tracked/synced pairing are ignored — the periodic backstop poll
+        covers newly opted-in locks. For a tracked entity it schedules a
+        coalesced ``poll_once`` pass: at most one runs at a time and at most
+        one trailing pass is queued behind it, so any burst of events
+        collapses into a single follow-up reconcile (the pushed payload is
+        only a wake-up hint; the pass re-reads authenticated state itself).
+        """
+        try:
+            if not self._is_tracked_entity(entity_id):
+                return
+            _LOGGER.debug(
+                "Hub sync: HA push event for %s (new_state=%r) — waking "
+                "reconciliation",
+                entity_id,
+                new_state,
+            )
+            # A push event is an explicit invalidation: even a manager whose
+            # lock-table reads are idle-backed-off must re-check immediately.
+            self._idle_recheck_until = 0.0
+            task = self._push_reconcile_task
+            if task is not None and not task.done():
+                # Single-flight with one trailing pass: the running pass may
+                # have sampled state from before this event, so queue exactly
+                # one follow-up; further events while either runs are served
+                # by that same trailing pass.
+                self._push_reconcile_queued = True
+                return
+            self._push_reconcile_queued = False
+            self._push_reconcile_task = asyncio.get_running_loop().create_task(
+                self._push_reconcile()
+            )
+        except Exception:
+            # Contract: never raise into the event callback.
+            _LOGGER.exception(
+                "Hub sync: failed to schedule push reconcile for %s", entity_id
+            )
+
+    def _is_tracked_entity(self, entity_id: str) -> bool:
+        """Return whether ``entity_id`` has any tracked/synced pairing state.
+
+        Deliberately conservative (raw key presence across every per-entity
+        structure): a held, pending, backed-off, latched, or merely observed
+        entity always earns the push wake-up. Entities never seen by a poll
+        pass are unknown here and are covered by the periodic backstop.
+        """
+        if not entity_id:
+            return False
+        return any(
+            entity_id in collection
+            for collection in (
+                self._applied,
+                self._pairing_signature,
+                self._paired_hubs,
+                self._held_open,
+                self._held_locked,
+                self._pending_release,
+                self._last_converged,
+                self._last_ha_observed,
+                self._last_access_observed,
+                self._backoff_until,
+                self._suspended_until,
+                self._fail_safe_reset_eids,
+                self._lockdown_reset,
+                self._lockdown_unresolved,
+                self._ha_outage_locked,
+            )
+        )
+
+    async def _push_reconcile(self) -> None:
+        """Run one poll pass, plus the single queued trailing pass if set."""
+        try:
+            while True:
+                try:
+                    await self.poll_once()
+                except Exception:
+                    _LOGGER.exception(
+                        "Hub sync: push-driven reconcile pass failed"
+                    )
+                if not self._push_reconcile_queued:
+                    return
+                # Consume the queued marker and run exactly one more pass;
+                # events arriving during THAT pass may queue one more, so a
+                # continuous event stream still runs strictly serialized
+                # passes with at most one queued at any time.
+                self._push_reconcile_queued = False
+        finally:
+            self._push_reconcile_task = None
 
     @property
     def lockdown_unresolved(self) -> tuple[str, ...]:
