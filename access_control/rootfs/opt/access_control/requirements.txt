@@ -1,8 +1,8 @@
-fastapi==0.139.0
-uvicorn[standard]==0.50.0
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
 aiohttp==3.14.3
 aiosqlite==0.22.1
 jinja2==3.1.6
 python-multipart==0.0.32
-cryptography==50.0.0
+cryptography==50.0.1
 itsdangerous==2.2.0
