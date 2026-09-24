@@ -1,4 +1,4 @@
-FROM ghcr.io/home-assistant/base-python:3.12-alpine3.24
+FROM ghcr.io/home-assistant/base-python:3.14-alpine3.24
 
 ENV LANG=C.UTF-8 \
     PYTHONDONTWRITEBYTECODE=1 \
